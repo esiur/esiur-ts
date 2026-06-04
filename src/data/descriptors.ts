@@ -7,7 +7,7 @@ import { TruIdentifier } from "./TruIdentifier.js";
  * needs a type representation (typed lists/maps/tuples), e.g.
  * `t.list(t.i32)` or `t.map(t.string, t.f64)`. The codegen CLI emits these.
  */
-function tupleIdentifier(count: number): TruIdentifier {
+export function tupleIdentifier(count: number): TruIdentifier {
   switch (count) {
     case 2: return TruIdentifier.Tuple2;
     case 3: return TruIdentifier.Tuple3;
@@ -68,4 +68,48 @@ export class TypedList {
 /** Construct a {@link TypedList} value, e.g. `typedList(t.i32, [1, 2, 3])`. */
 export function typedList(element: Tru, values: readonly unknown[]): TypedList {
   return new TypedList(element, values);
+}
+
+/**
+ * An explicitly-typed map value. Composing it produces a Typed TDU with
+ * metadata `TypedMap<key, value>` whose payload is the keys array followed by
+ * the values array.
+ */
+export class TypedMap {
+  readonly entries: ReadonlyArray<readonly [unknown, unknown]>;
+  constructor(
+    readonly keyType: Tru,
+    readonly valueType: Tru,
+    entries: Map<unknown, unknown> | ReadonlyArray<readonly [unknown, unknown]>,
+  ) {
+    this.entries = entries instanceof Map ? [...entries.entries()] : entries;
+  }
+}
+
+/** Construct a {@link TypedMap}, e.g. `typedMap(t.string, t.i32, myMap)`. */
+export function typedMap(
+  keyType: Tru,
+  valueType: Tru,
+  entries: Map<unknown, unknown> | ReadonlyArray<readonly [unknown, unknown]>,
+): TypedMap {
+  return new TypedMap(keyType, valueType, entries);
+}
+
+/**
+ * An explicitly-typed tuple value (2-7 elements). Composing it produces a Typed
+ * TDU with metadata `TupleN<...elementTypes>`.
+ */
+export class TypedTuple {
+  constructor(
+    readonly elements: readonly Tru[],
+    readonly values: readonly unknown[],
+  ) {
+    if (elements.length !== values.length)
+      throw new RangeError("Tuple element-type count must match value count.");
+  }
+}
+
+/** Construct a {@link TypedTuple}, e.g. `typedTuple([t.i32, t.string], [1, "a"])`. */
+export function typedTuple(elements: readonly Tru[], values: readonly unknown[]): TypedTuple {
+  return new TypedTuple(elements, values);
 }

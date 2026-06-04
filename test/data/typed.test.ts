@@ -1,7 +1,7 @@
 import { describe, it, expect } from "vitest";
 import { compose, parse } from "../../src/data/Codec.js";
 import * as DC from "../../src/data/DC.js";
-import { t, typedList } from "../../src/data/descriptors.js";
+import { t, typedList, typedMap, typedTuple } from "../../src/data/descriptors.js";
 import { Tru, TruPrimitive, TruComposite } from "../../src/data/Tru.js";
 import { TruIdentifier } from "../../src/data/TruIdentifier.js";
 
@@ -51,5 +51,54 @@ describe("typed Int32 list (Gvwie)", () => {
   it("round-trips a typed string list via the per-element path", () => {
     const decoded = parse(compose(typedList(t.string, ["a", "bb", "ccc"])));
     expect(decoded).toEqual(["a", "bb", "ccc"]);
+  });
+
+  it("round-trips typed numeric lists of every Gvwie width", () => {
+    expect(parse(compose(typedList(t.i16, [1, -1, 32767, -32768])))).toEqual([
+      1, -1, 32767, -32768,
+    ]);
+    expect(parse(compose(typedList(t.u16, [0, 255, 256, 65535])))).toEqual([0, 255, 256, 65535]);
+    expect(parse(compose(typedList(t.u32, [0, 70000, 4294967295])))).toEqual([
+      0, 70000, 4294967295,
+    ]);
+    expect(parse(compose(typedList(t.i64, [1n, -1n, 9_000_000_000_000n])))).toEqual([
+      1n,
+      -1n,
+      9_000_000_000_000n,
+    ]);
+    expect(parse(compose(typedList(t.u64, [0n, 18_446_744_073_709_551_615n])))).toEqual([
+      0n,
+      18_446_744_073_709_551_615n,
+    ]);
+  });
+});
+
+describe("typed maps", () => {
+  it("round-trips a string->i32 map", () => {
+    const decoded = parse(
+      compose(typedMap(t.string, t.i32, [["a", 1], ["b", 2], ["c", 3]])),
+    ) as Map<string, number>;
+    expect(decoded).toBeInstanceOf(Map);
+    expect([...decoded.entries()]).toEqual([["a", 1], ["b", 2], ["c", 3]]);
+  });
+
+  it("round-trips an i32->i32 map (Gvwie keys and values)", () => {
+    const src = new Map<number, number>([[1, 10], [2, 20], [70000, 80000]]);
+    const decoded = parse(compose(typedMap(t.i32, t.i32, src))) as Map<number, number>;
+    expect([...decoded.entries()]).toEqual([...src.entries()]);
+  });
+});
+
+describe("typed tuples", () => {
+  it("round-trips a (i32, string, bool) tuple", () => {
+    const decoded = parse(compose(typedTuple([t.i32, t.string, t.bool], [1, "x", true])));
+    expect(decoded).toEqual([1, "x", true]);
+  });
+
+  it("round-trips a tuple with a nested typed list (TypeOfTarget stripping)", () => {
+    const decoded = parse(
+      compose(typedTuple([t.i32, t.list(t.i32)], [5, typedList(t.i32, [1, 2, 3])])),
+    );
+    expect(decoded).toEqual([5, [1, 2, 3]]);
   });
 });

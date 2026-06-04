@@ -1,0 +1,87 @@
+import type { Tru } from "../data/Tru.js";
+
+/**
+ * Lightweight type template describing a resource's exported members
+ * (the TypeScript analogue of C# `TypeDef`/`LocalTypeDef`, built from decorator
+ * metadata instead of reflection). Promoted to a full `TypeDef` when records and
+ * the protocol type-registry land later in the port.
+ */
+export enum MemberType {
+  Function = 0,
+  Property = 1,
+  Event = 2,
+}
+
+export class ArgumentTemplate {
+  constructor(
+    public name: string,
+    public type: Tru | undefined,
+    public optional = false,
+  ) {}
+}
+
+export class PropertyTemplate {
+  readonly memberType = MemberType.Property;
+  constructor(
+    public name: string,
+    public index: number,
+    public valueType: Tru | undefined,
+    public readOnly = false,
+  ) {}
+}
+
+export class FunctionTemplate {
+  readonly memberType = MemberType.Function;
+  constructor(
+    public name: string,
+    public index: number,
+    public returnType: Tru | undefined,
+    public args: ArgumentTemplate[] = [],
+    public isStatic = false,
+  ) {}
+}
+
+export class EventTemplate {
+  readonly memberType = MemberType.Event;
+  constructor(
+    public name: string,
+    public index: number,
+    public argType: Tru | undefined,
+  ) {}
+}
+
+export type MemberTemplate = PropertyTemplate | FunctionTemplate | EventTemplate;
+
+/** Describes the exported surface of a resource type. */
+export class TypeTemplate {
+  constructor(
+    public className: string,
+    public members: MemberTemplate[],
+  ) {}
+
+  get properties(): PropertyTemplate[] {
+    return this.members.filter((m): m is PropertyTemplate => m.memberType === MemberType.Property);
+  }
+  get functions(): FunctionTemplate[] {
+    return this.members.filter((m): m is FunctionTemplate => m.memberType === MemberType.Function);
+  }
+  get events(): EventTemplate[] {
+    return this.members.filter((m): m is EventTemplate => m.memberType === MemberType.Event);
+  }
+
+  getPropertyByName(name: string): PropertyTemplate | undefined {
+    return this.properties.find((p) => p.name === name);
+  }
+  getPropertyByIndex(index: number): PropertyTemplate | undefined {
+    return this.properties.find((p) => p.index === index);
+  }
+  getFunctionByName(name: string): FunctionTemplate | undefined {
+    return this.functions.find((f) => f.name === name);
+  }
+  getEventByName(name: string): EventTemplate | undefined {
+    return this.events.find((e) => e.name === name);
+  }
+  getEventByIndex(index: number): EventTemplate | undefined {
+    return this.events.find((e) => e.index === index);
+  }
+}

@@ -6,3 +6,7 @@ import "./internal/metadata.js";
 // Phase 1 — Foundation
 export * from "./core/index.js";
 export * from "./data/index.js";
+
+// Phase 3 — Resource model + stores
+export * from "./resource/index.js";
+export * from "./stores/index.js";

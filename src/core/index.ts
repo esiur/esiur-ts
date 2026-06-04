@@ -7,3 +7,4 @@ export * from "./IDestructible.js";
 export * from "./AsyncReply.js";
 export * from "./AsyncBag.js";
 export * from "./AsyncQueue.js";
+export * from "./EventHandler.js";

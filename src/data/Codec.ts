@@ -8,8 +8,15 @@ import { Uuid } from "./Uuid.js";
 import { merge } from "./DC.js";
 import { TruComposite, type Tru } from "./Tru.js";
 import { TruIdentifier } from "./TruIdentifier.js";
-import { TypedList } from "./descriptors.js";
-import { GroupInt32Codec } from "./gvwie/GroupInt32Codec.js";
+import { TypedList, TypedMap, TypedTuple, tupleIdentifier } from "./descriptors.js";
+import {
+  GroupInt16Codec,
+  GroupInt32Codec,
+  GroupInt64Codec,
+  GroupUInt16Codec,
+  GroupUInt32Codec,
+  GroupUInt64Codec,
+} from "./gvwie/index.js";
 import {
   Int8,
   UInt8,
@@ -76,17 +83,40 @@ export function composeInternal(
   if (value instanceof Decimal128) return S.decimal128Composer(value);
   if (value instanceof Uint8Array) return S.rawDataComposer(value);
   if (value instanceof TypedList) return typedListComposer(value, warehouse, connection);
+  if (value instanceof TypedMap) return typedMapComposer(value, warehouse, connection);
+  if (value instanceof TypedTuple) return tupleComposer(value, warehouse, connection);
 
   // A bare JS array becomes a dynamic, self-describing List (each element keeps
   // its own type tag). Typed Gvwie arrays are produced from explicit typed-list
-  // values, added with the Tru family in the Phase 2 continuation.
+  // values via the Tru family.
   if (Array.isArray(value))
     return listComposer(value, TduIdentifier.List, warehouse, connection);
 
+  // Records (and other registered structured types) are handled by the resource
+  // layer through a hook, keeping `data/` independent of the resource model.
+  const recordTdu = recordComposerHook(value, warehouse, connection);
+  if (recordTdu) return recordTdu;
+
   throw new Error(
-    `Codec.compose: serialization for ${describe(value)} is not yet implemented ` +
-      `(typed/collection support lands in the Phase 2 continuation).`,
+    `Codec.compose: serialization for ${describe(value)} is not supported.`,
   );
+}
+
+/**
+ * Hook for composing registered structured types (records). Installed by the
+ * resource layer; returns a {@link Tdu} for a recognized value, else undefined.
+ */
+let recordComposerHook: (
+  value: unknown,
+  warehouse: unknown,
+  connection: unknown,
+) => Tdu | undefined = () => undefined;
+
+/** Register the record composer hook (called by the resource layer). */
+export function registerRecordComposer(
+  fn: (value: unknown, warehouse: unknown, connection: unknown) => Tdu | undefined,
+): void {
+  recordComposerHook = fn;
 }
 
 /** Encode a value to its self-describing TDU bytes (leading identifier included). */
@@ -147,21 +177,75 @@ function typedArrayComposer(
   connection: unknown,
 ): Uint8Array {
   switch (element.identifier) {
+    case TruIdentifier.Int16:
+      return GroupInt16Codec.encode(values as number[]);
     case TruIdentifier.Int32:
       return GroupInt32Codec.encode(values as number[]);
-    case TruIdentifier.Int16:
     case TruIdentifier.Int64:
+      return GroupInt64Codec.encode(values as bigint[]);
     case TruIdentifier.UInt16:
+      return GroupUInt16Codec.encode(values as number[]);
     case TruIdentifier.UInt32:
+      return GroupUInt32Codec.encode(values as number[]);
     case TruIdentifier.UInt64:
-      throw new Error(
-        `Gvwie codec for ${TruIdentifier[element.identifier]} arrays is not yet ported (follow-up).`,
-      );
-    default:
-      return merge(
-        ...values.map((v) => composeInternal(v, warehouse, connection).composed),
-      );
+      return GroupUInt64Codec.encode(values as bigint[]);
+    default: {
+      const parts: Uint8Array[] = [];
+      let previous: Tdu | null = null;
+      for (const v of values) {
+        const tdu = composeInternal(v, warehouse, connection);
+        if (tdu.tduClass === TduClass.Typed && tdu.metadata && element.match(tdu.metadata as Tru)) {
+          // Element's type matches the declared element type: strip its metadata.
+          const d = tdu.composed.subarray(tdu.contentOffset);
+          parts.push(new Tdu(TduIdentifier.TypeOfTarget, d, d.length).composed);
+        } else if (previous && tdu.matchType(previous)) {
+          const d = tdu.composed.subarray(tdu.contentOffset);
+          parts.push(new Tdu(TduIdentifier.TypeContinuation, d, d.length).composed);
+        } else {
+          parts.push(tdu.composed);
+        }
+        previous = tdu;
+      }
+      return merge(...parts);
+    }
   }
+}
+
+/** Compose an explicitly-typed map as a Typed TDU (`TypedMap<key,value>`). */
+function typedMapComposer(value: TypedMap, warehouse: unknown, connection: unknown): Tdu {
+  const keys = value.entries.map((e) => e[0]);
+  const values = value.entries.map((e) => e[1]);
+  const composedKeys = typedArrayComposer(keys, value.keyType, warehouse, connection);
+  const composedValues = typedArrayComposer(values, value.valueType, warehouse, connection);
+
+  const keysTdu = new Tdu(TduIdentifier.TypeOfTarget, composedKeys, composedKeys.length).composed;
+  const valuesTdu = new Tdu(TduIdentifier.TypeOfTarget, composedValues, composedValues.length).composed;
+  const all = merge(keysTdu, valuesTdu);
+
+  const metadata = new TruComposite(TruIdentifier.TypedMap, false, [value.keyType, value.valueType]);
+  return new Tdu(TduIdentifier.Typed, all, all.length, metadata, connection);
+}
+
+/** Compose an explicitly-typed tuple as a Typed TDU (`TupleN<...>`). */
+function tupleComposer(value: TypedTuple, warehouse: unknown, connection: unknown): Tdu {
+  const parts: Uint8Array[] = [];
+  for (let i = 0; i < value.values.length; i++) {
+    const target = value.elements[i];
+    const tdu = composeInternal(value.values[i], warehouse, connection);
+    if (tdu.tduClass === TduClass.Typed && tdu.metadata && target.match(tdu.metadata as Tru)) {
+      const d = tdu.composed.subarray(tdu.contentOffset);
+      parts.push(new Tdu(TduIdentifier.TypeOfTarget, d, d.length).composed);
+    } else {
+      parts.push(tdu.composed);
+    }
+  }
+  const all = merge(...parts);
+  const metadata = new TruComposite(
+    tupleIdentifier(value.elements.length),
+    false,
+    value.elements as Tru[],
+  );
+  return new Tdu(TduIdentifier.Typed, all, all.length, metadata, connection);
 }
 
 function describe(value: unknown): string {

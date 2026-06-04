@@ -10,9 +10,17 @@ import { ResourceId } from "./ResourceId.js";
 import { ResourceLink } from "./ResourceLink.js";
 import * as DC from "./DC.js";
 import { parseSyncTdu } from "./Codec.js";
-import { Tru, TruComposite } from "./Tru.js";
+import { Tru, TruComposite, TruTypeDef } from "./Tru.js";
 import { TruIdentifier } from "./TruIdentifier.js";
-import { GroupInt32Codec } from "./gvwie/GroupInt32Codec.js";
+import { TypeDefKind, type ITypeDef } from "./types/ITypeDef.js";
+import {
+  GroupInt16Codec,
+  GroupInt32Codec,
+  GroupInt64Codec,
+  GroupUInt16Codec,
+  GroupUInt32Codec,
+  GroupUInt64Codec,
+} from "./gvwie/index.js";
 
 /**
  * Sync value parsers (port of the sync parsers in C# `DataDeserializer`). Each
@@ -114,19 +122,72 @@ export const typedParser: Parser = (tdu, warehouse) => {
       case TruIdentifier.TypedList:
         return typedArrayParser(tdu, tru.subTypes[0], warehouse);
       case TruIdentifier.TypedMap:
+        return typedMapParser(tdu, tru.subTypes[0], tru.subTypes[1], warehouse);
       case TruIdentifier.Tuple2:
       case TruIdentifier.Tuple3:
       case TruIdentifier.Tuple4:
       case TruIdentifier.Tuple5:
       case TruIdentifier.Tuple6:
       case TruIdentifier.Tuple7:
-        throw new Error("Typed map/tuple parsing is a follow-up.");
+        return tupleParser(tdu, tru.subTypes, warehouse);
       default:
         throw new Error("Unsupported type for typed parser.");
     }
   }
-  throw new Error("Unknown TRU (TypeDef references need Phase 3).");
+  if (tru instanceof TruTypeDef) return typedObjectParser(tdu, tru.typeDef, warehouse);
+  throw new Error("Unknown TRU.");
 };
+
+/** Dispatch a TypeDef-described typed value to the record/enum parser. */
+function typedObjectParser(tdu: ParsedTdu, typeDef: ITypeDef, warehouse: unknown): unknown {
+  if (typeDef.kind === TypeDefKind.Record) return recordParser(tdu, typeDef, warehouse);
+  if (typeDef.kind === TypeDefKind.Enum) return enumParser(tdu, typeDef);
+  throw new Error("Typed resource parsing is not supported yet.");
+}
+
+/** Decode a record TDU: parse each property in template order, then build the instance. */
+function recordParser(tdu: ParsedTdu, typeDef: ITypeDef, warehouse: unknown): object {
+  const values: unknown[] = [];
+  let offset = tdu.payloadOffset;
+  let length = tdu.payloadLength;
+  const ends = offset + length;
+  let previous: ParsedTdu | null = null;
+
+  for (let i = 0; i < typeDef.properties.length; i++) {
+    const current = ParsedTdu.parseSync(tdu.data, offset, ends, warehouse);
+    if (current.tduClass === TduClass.Invalid) throw new Error("Unknown type.");
+
+    if (current.identifier === TduIdentifier.TypeContinuation && previous) {
+      current.tduClass = previous.tduClass;
+      current.identifier = previous.identifier;
+      current.metadata = previous.metadata;
+    } else if (current.identifier === TduIdentifier.TypeOfTarget) {
+      current.tduClass = TduClass.Typed;
+      current.identifier = TduIdentifier.Typed;
+      current.metadata = typeDef.properties[i].valueType ?? null;
+      current.index = TduIdentifier.Typed & 0x7;
+    }
+
+    values.push(parseSyncTdu(current, warehouse));
+
+    if (current.totalLength <= 0)
+      throw new Error("Error while parsing structured data.");
+    offset += current.totalLength;
+    length -= current.totalLength;
+    previous = current;
+  }
+
+  const instance = typeDef.createInstance();
+  for (let i = 0; i < typeDef.properties.length; i++)
+    typeDef.setProperty(instance, typeDef.properties[i].name, values[i]);
+  return instance;
+}
+
+/** Decode an enum TDU: a single constant-index byte resolved via the typedef. */
+function enumParser(tdu: ParsedTdu, typeDef: ITypeDef): unknown {
+  const index = tdu.data[tdu.payloadOffset];
+  return typeDef.constants?.[index]?.value;
+}
 
 /** Decode the payload of a `TypedList<element>` TDU into a JS array. */
 function typedArrayParser(tdu: ParsedTdu, element: Tru, warehouse: unknown): unknown[] {
@@ -134,16 +195,18 @@ function typedArrayParser(tdu: ParsedTdu, element: Tru, warehouse: unknown): unk
   const end = start + tdu.payloadLength;
 
   switch (element.identifier) {
+    case TruIdentifier.Int16:
+      return GroupInt16Codec.decode(tdu.data, start, end);
     case TruIdentifier.Int32:
       return GroupInt32Codec.decode(tdu.data, start, end);
-    case TruIdentifier.Int16:
     case TruIdentifier.Int64:
+      return GroupInt64Codec.decode(tdu.data, start, end);
     case TruIdentifier.UInt16:
+      return GroupUInt16Codec.decode(tdu.data, start, end);
     case TruIdentifier.UInt32:
+      return GroupUInt32Codec.decode(tdu.data, start, end);
     case TruIdentifier.UInt64:
-      throw new Error(
-        `Gvwie codec for ${TruIdentifier[element.identifier]} arrays is not yet ported (follow-up).`,
-      );
+      return GroupUInt64Codec.decode(tdu.data, start, end);
     default: {
       const list: unknown[] = [];
       let offset = start;
@@ -176,4 +239,61 @@ function typedArrayParser(tdu: ParsedTdu, element: Tru, warehouse: unknown): unk
       return list;
     }
   }
+}
+
+/** Decode a `TypedMap<key,value>` TDU (two TypeOfTarget-wrapped arrays) to a JS Map. */
+function typedMapParser(
+  tdu: ParsedTdu,
+  keyTru: Tru,
+  valueTru: Tru,
+  warehouse: unknown,
+): Map<unknown, unknown> {
+  const keysTdu = ParsedTdu.parseSync(
+    tdu.data,
+    tdu.payloadOffset,
+    tdu.payloadOffset + tdu.payloadLength,
+    warehouse,
+  );
+  const valuesTdu = ParsedTdu.parseSync(
+    tdu.data,
+    keysTdu.payloadOffset + keysTdu.payloadLength,
+    tdu.ends,
+    warehouse,
+  );
+
+  const keys = typedArrayParser(keysTdu, keyTru, warehouse);
+  const values = typedArrayParser(valuesTdu, valueTru, warehouse);
+
+  const map = new Map<unknown, unknown>();
+  for (let i = 0; i < keys.length; i++) map.set(keys[i], values[i]);
+  return map;
+}
+
+/** Decode a `TupleN<...>` TDU to a JS array (in element order). */
+function tupleParser(tdu: ParsedTdu, subTrus: Tru[], warehouse: unknown): unknown[] {
+  const results: unknown[] = [];
+  let offset = tdu.payloadOffset;
+  let length = tdu.payloadLength;
+  const ends = offset + length;
+
+  for (let i = 0; i < subTrus.length; i++) {
+    const current = ParsedTdu.parseSync(tdu.data, offset, ends, warehouse);
+    if (current.tduClass === TduClass.Invalid) throw new Error("Unknown type.");
+
+    if (current.identifier === TduIdentifier.TypeOfTarget) {
+      current.tduClass = TduClass.Typed;
+      current.identifier = TduIdentifier.Typed;
+      current.metadata = subTrus[i];
+      current.index = TduIdentifier.Typed & 0x7;
+    }
+
+    results.push(parseSyncTdu(current, warehouse));
+
+    if (current.totalLength <= 0)
+      throw new Error("Error while parsing structured data.");
+    offset += current.totalLength;
+    length -= current.totalLength;
+  }
+
+  return results;
 }
