@@ -4,10 +4,11 @@ import type { IResource, IResourceContext, IStore } from "./IResource.js";
 import { Instance } from "./Instance.js";
 import { ResourceOperation } from "./ResourceOperation.js";
 import { getTemplate } from "./decorators.js";
-import type { TypeTemplate } from "./template.js";
+import { TypeTemplate } from "./template.js";
 import { TypeDefKind, type ITypeDef } from "../data/types/ITypeDef.js";
 import { LocalTypeDef } from "./typedef.js";
 import { Record } from "./records.js";
+import type { EnumType } from "./enums.js";
 
 /** Duck-typed check for an {@link IStore}. */
 function isStore(resource: IResource): resource is IStore {
@@ -41,6 +42,7 @@ export class Warehouse {
   private readonly typeDefs = new Map<number, ITypeDef>();
   // eslint-disable-next-line @typescript-eslint/ban-types
   private readonly typeDefsByCtor = new Map<Function, ITypeDef>();
+  private readonly typeDefsByEnum = new Map<EnumType, ITypeDef>();
   private typeDefCounter = 0;
 
   /** Build (cached) the type template for a resource class. */
@@ -69,6 +71,25 @@ export class Warehouse {
     );
     this.typeDefs.set(id, typeDef);
     this.typeDefsByCtor.set(ctor, typeDef);
+    return typeDef;
+  }
+
+  /** Get (or lazily create) the type definition for an enum descriptor. */
+  getLocalTypeDefByEnum(enumType: EnumType): ITypeDef {
+    const existing = this.typeDefsByEnum.get(enumType);
+    if (existing) return existing;
+
+    const id = ++this.typeDefCounter;
+    const typeDef = new LocalTypeDef(
+      id,
+      TypeDefKind.Enum,
+      enumType.name,
+      new TypeTemplate(enumType.name, []),
+      undefined,
+      enumType.constants,
+    );
+    this.typeDefs.set(id, typeDef);
+    this.typeDefsByEnum.set(enumType, typeDef);
     return typeDef;
   }
 

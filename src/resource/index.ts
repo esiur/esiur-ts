@@ -6,4 +6,5 @@ export * from "./Instance.js";
 export * from "./Resource.js";
 export * from "./typedef.js";
 export * from "./records.js";
+export * from "./enums.js";
 export * from "./Warehouse.js";

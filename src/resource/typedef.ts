@@ -19,7 +19,7 @@ export class LocalTypeDef implements ITypeDef {
     readonly kind: TypeDefKind,
     readonly name: string,
     readonly template: TypeTemplate,
-    private readonly ctor: new () => object,
+    private readonly ctor?: new () => object,
     readonly constants?: TypeDefConstant[],
   ) {}
 
@@ -31,6 +31,7 @@ export class LocalTypeDef implements ITypeDef {
   }
 
   createInstance(): object {
+    if (!this.ctor) throw new Error(`TypeDef '${this.name}' has no constructor.`);
     return new this.ctor();
   }
 

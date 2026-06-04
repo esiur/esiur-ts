@@ -2,7 +2,7 @@ import { Tdu } from "../data/Tdu.js";
 import { TduClass } from "../data/TduClass.js";
 import { TduIdentifier } from "../data/TduIdentifier.js";
 import { TruTypeDef, type Tru, registerTypeDefResolver } from "../data/Tru.js";
-import { composeInternal, registerRecordComposer } from "../data/Codec.js";
+import { composeInternal, registerComposer } from "../data/Codec.js";
 import { merge } from "../data/DC.js";
 import type { ITypeDef } from "../data/types/ITypeDef.js";
 import type { LocalTypeDef } from "./typedef.js";
@@ -50,7 +50,7 @@ export function recordCompose(value: object, warehouse: Warehouse, connection: u
 // Wire records into the serializer:
 //  - compose: recognize record instances and produce their Typed TDU.
 //  - decode: resolve a TypeDef id to its definition via the warehouse.
-registerRecordComposer((value, warehouse, connection) =>
+registerComposer((value, warehouse, connection) =>
   isRecord(value) ? recordCompose(value, warehouse as Warehouse, connection) : undefined,
 );
 registerTypeDefResolver((warehouse, id): ITypeDef =>

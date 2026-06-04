@@ -92,10 +92,12 @@ export function composeInternal(
   if (Array.isArray(value))
     return listComposer(value, TduIdentifier.List, warehouse, connection);
 
-  // Records (and other registered structured types) are handled by the resource
-  // layer through a hook, keeping `data/` independent of the resource model.
-  const recordTdu = recordComposerHook(value, warehouse, connection);
-  if (recordTdu) return recordTdu;
+  // Records, enums and other registered structured types are handled by the
+  // resource layer through hooks, keeping `data/` independent of it.
+  for (const fn of structuredComposers) {
+    const tdu = fn(value, warehouse, connection);
+    if (tdu) return tdu;
+  }
 
   throw new Error(
     `Codec.compose: serialization for ${describe(value)} is not supported.`,
@@ -103,20 +105,19 @@ export function composeInternal(
 }
 
 /**
- * Hook for composing registered structured types (records). Installed by the
- * resource layer; returns a {@link Tdu} for a recognized value, else undefined.
+ * Hooks for composing registered structured types (records, enums). Installed by
+ * the resource layer; each returns a {@link Tdu} for a recognized value or
+ * undefined. They are tried in registration order.
  */
-let recordComposerHook: (
-  value: unknown,
-  warehouse: unknown,
-  connection: unknown,
-) => Tdu | undefined = () => undefined;
+const structuredComposers: Array<
+  (value: unknown, warehouse: unknown, connection: unknown) => Tdu | undefined
+> = [];
 
-/** Register the record composer hook (called by the resource layer). */
-export function registerRecordComposer(
+/** Register a structured-type composer hook (called by the resource layer). */
+export function registerComposer(
   fn: (value: unknown, warehouse: unknown, connection: unknown) => Tdu | undefined,
 ): void {
-  recordComposerHook = fn;
+  structuredComposers.push(fn);
 }
 
 /** Encode a value to its self-describing TDU bytes (leading identifier included). */
