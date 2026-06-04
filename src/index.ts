@@ -10,3 +10,6 @@ export * from "./data/index.js";
 // Phase 3 — Resource model + stores
 export * from "./resource/index.js";
 export * from "./stores/index.js";
+
+// Phase 4 — Networking
+export * from "./net/index.js";
