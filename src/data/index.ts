@@ -8,6 +8,7 @@ export * from "./TduClass.js";
 export * from "./TduIdentifier.js";
 export * from "./Tdu.js";
 export * from "./ParsedTdu.js";
+export * from "./PlainTdu.js";
 export * from "./NotModified.js";
 export * from "./ResourceId.js";
 export * from "./ResourceLink.js";
