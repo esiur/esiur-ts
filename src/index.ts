@@ -16,3 +16,6 @@ export * from "./net/index.js";
 
 // Phase 5 — IIP/Ep protocol
 export * from "./protocol/index.js";
+
+// Phase 6 — Security / auth
+export * from "./security/index.js";

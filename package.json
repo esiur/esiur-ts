@@ -41,6 +41,14 @@
   "engines": {
     "node": ">=18"
   },
+  "peerDependencies": {
+    "ws": "^8.0.0"
+  },
+  "peerDependenciesMeta": {
+    "ws": {
+      "optional": true
+    }
+  },
   "devDependencies": {
     "@types/node": "^22.10.0",
     "@types/ws": "^8.18.1",

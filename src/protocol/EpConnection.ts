@@ -12,7 +12,19 @@ import { EpPacketReply } from "../net/packets/EpPacketReply.js";
 import { EpPacketNotification } from "../net/packets/EpPacketNotification.js";
 import type { PlainTdu } from "../data/PlainTdu.js";
 import { compose, parse } from "../data/Codec.js";
+import { typedMap } from "../data/descriptors.js";
+import { t } from "../data/descriptors.js";
+import { u8 } from "../data/widths.js";
+import { WSocket } from "../net/sockets/WSocket.js";
+import { EpAuthPacket } from "../net/packets/EpAuthPacket.js";
+import { EpAuthPacketCommand } from "../net/packets/EpAuthPacketCommand.js";
+import { EpAuthPacketMethod } from "../net/packets/EpAuthPacketMethod.js";
+import { EpAuthPacketHeader } from "../net/packets/EpAuthPacketHeader.js";
+import { AuthenticationMode } from "../security/AuthenticationMode.js";
+import { EncryptionMode } from "../security/EncryptionMode.js";
 import type { Warehouse } from "../resource/Warehouse.js";
+import type { TypeTemplate } from "../resource/template.js";
+import { EpResource } from "./EpResource.js";
 
 /** Handles an inbound request packet (server-side dispatch). */
 export type RequestHandler = (
@@ -52,6 +64,100 @@ export class EpConnection extends NetworkConnection {
   private callbackCounter = 0;
   private readonly packet = new EpPacket();
 
+  /** Remote resources attached through this connection (instance id → proxy state). */
+  private readonly attachedResources = new Map<number, EpResource>();
+  /** Server-side notification subscriptions (instance id → unsubscribe). */
+  private readonly subscriptions = new Map<number, () => void>();
+
+  // ---- handshake --------------------------------------------------------------
+
+  /**
+   * True once the connection is past the auth phase. Defaults to true so a
+   * directly-`assign`ed connection processes packets immediately; `connect` and
+   * `EpServer` switch it off to run the (anonymous) handshake first.
+   */
+  private authenticated = true;
+  private direction: "initiator" | "responder" | null = null;
+  private readonly authPacket = new EpAuthPacket();
+  private readyReply?: AsyncReply;
+  private domain = "";
+  /** Responder: accept unauthenticated (anonymous, None-mode) peers. */
+  allowUnauthorized = true;
+
+  /** Begin the client-side handshake; resolves via {@link whenReady}. */
+  startInitiatorHandshake(domain = ""): void {
+    this.authenticated = false;
+    this.direction = "initiator";
+    this.domain = domain;
+    this.readyReply = new AsyncReply();
+  }
+
+  /** Begin the server-side handshake (waits for the peer's Initialize). */
+  startResponderHandshake(): void {
+    this.authenticated = false;
+    this.direction = "responder";
+  }
+
+  /** Resolves when the handshake completes (initiator side). */
+  whenReady(): AsyncReply {
+    return this.readyReply ?? AsyncReply.fromResult(true);
+  }
+
+  /**
+   * Open a client connection to `url` over WebSocket, run the anonymous
+   * handshake, and resolve once the session is established.
+   */
+  static async connect(url: string, warehouse?: Warehouse): Promise<EpConnection> {
+    const connection = new EpConnection();
+    if (warehouse) connection.warehouse = warehouse;
+    try {
+      connection.domain = new URL(url).hostname;
+    } catch {
+      /* leave domain empty */
+    }
+    connection.startInitiatorHandshake(connection.domain);
+
+    const socket = new WSocket();
+    connection.assign(socket);
+    await socket.connect(url);
+    await connection.whenReady();
+    return connection;
+  }
+
+  /** Send the initiator's Initialize packet (anonymous, None auth/encryption). */
+  private declare(): void {
+    const headers = compose(
+      typedMap(t.u8, t.dynamic, [[u8(EpAuthPacketHeader.Domain), this.domain]]),
+      this.warehouse,
+      this,
+    );
+    this.send(
+      EpAuthPacket.composeInitialize(AuthenticationMode.None, EncryptionMode.None, headers),
+    );
+  }
+
+  /** Handle an auth-phase packet (anonymous handshake only). */
+  private handleAuthPacket(packet: EpAuthPacket): void {
+    if (packet.command === EpAuthPacketCommand.Initialize) {
+      // Responder: accept an anonymous peer and establish the session.
+      if (packet.authMode === AuthenticationMode.None && this.allowUnauthorized) {
+        const headers = compose(typedMap(t.u8, t.dynamic, []), this.warehouse, this);
+        this.send(EpAuthPacket.composeMethod(EpAuthPacketMethod.SessionEstablished, headers));
+        this.authenticated = true;
+      } else {
+        this.send(EpAuthPacket.composeMethod(EpAuthPacketMethod.ErrorTerminate));
+        this.close();
+      }
+    } else if (
+      packet.command === EpAuthPacketCommand.Acknowledge &&
+      packet.method === EpAuthPacketMethod.SessionEstablished
+    ) {
+      // Initiator: the session is established.
+      this.authenticated = true;
+      this.readyReply?.trigger(true);
+    }
+  }
+
   // ---- outbound ---------------------------------------------------------------
 
   /** Send a request and return a reply that settles when the peer responds. */
@@ -71,6 +177,22 @@ export class EpConnection extends NetworkConnection {
   /** Set property `index` on the resource with `instanceId`. */
   set(instanceId: number, index: number, value: unknown): AsyncReply {
     return this.sendRequest(EpPacketRequest.SetProperty, instanceId, index, value);
+  }
+
+  /**
+   * Attach to a remote resource, returning a dynamic {@link EpResource} proxy
+   * primed with current property values and kept fresh by notifications. The
+   * caller supplies the resource's {@link TypeTemplate} (e.g. from generated
+   * stubs); a server build resolves it from the warehouse.
+   */
+  attach(instanceId: number, template: TypeTemplate): AsyncReply {
+    return this.sendRequest(EpPacketRequest.AttachResource, instanceId).then((values) => {
+      const resource = new EpResource(this, instanceId, template);
+      const vals = (values as unknown[]) ?? [];
+      template.properties.forEach((p, i) => resource.cache.set(p.index, vals[i]));
+      this.attachedResources.set(instanceId, resource);
+      return EpResource.createProxy(resource);
+    });
   }
 
   /** Send a reply to a peer request. */
@@ -112,6 +234,20 @@ export class EpConnection extends NetworkConnection {
     let offset = 0;
     const ends = msg.length;
     while (offset < ends) {
+      // Auth phase: consume auth packets until the session is established; the
+      // handshake may finish mid-buffer and the rest continues as Ep packets.
+      if (!this.authenticated) {
+        const consumed = this.authPacket.parse(msg, offset, ends);
+        if (consumed <= 0) {
+          const size = ends - offset;
+          buffer.holdFor(msg, offset, size, size + -consumed);
+          return;
+        }
+        offset += consumed;
+        this.handleAuthPacket(this.authPacket);
+        continue;
+      }
+
       const consumed = this.packet.parse(msg, offset, ends);
       if (consumed <= 0) {
         const size = ends - offset;
@@ -132,7 +268,7 @@ export class EpConnection extends NetworkConnection {
         this.processRequest(packet.request, packet.callbackId, packet.tdu);
         break;
       case EpPacketMethod.Notification:
-        this.onNotification?.(this, packet.notification, packet.tdu);
+        this.processNotification(packet.notification, packet.tdu);
         break;
       case EpPacketMethod.Extension:
         break;
@@ -149,9 +285,56 @@ export class EpConnection extends NetworkConnection {
         case EpPacketRequest.SetProperty:
           this.epRequestSetProperty(callbackId, tdu);
           return;
+        case EpPacketRequest.AttachResource:
+          this.epRequestAttachResource(callbackId, tdu);
+          return;
       }
     }
     this.onRequest?.(this, action, callbackId, tdu);
+  }
+
+  /** Server handler: send current property values and subscribe the peer to changes. */
+  private epRequestAttachResource(callbackId: number, tdu: PlainTdu | null): void {
+    if (!tdu || !this.warehouse) {
+      this.sendError(ErrorType.Management, callbackId, ExceptionCode.ParseError);
+      return;
+    }
+
+    const instanceId = Number(this.decode(tdu));
+    const resource = this.warehouse.getById(instanceId);
+    if (!resource?.instance) {
+      this.sendError(ErrorType.Management, callbackId, ExceptionCode.ResourceNotFound);
+      return;
+    }
+
+    const instance = resource.instance;
+    const bag = resource as unknown as Record<string, unknown>;
+    const values = instance.definition.properties.map((p) => bag[p.name]);
+
+    if (!this.subscriptions.has(instanceId)) {
+      const onProp = (info: { property: { index: number }; value: unknown }): void =>
+        this.sendNotification(
+          EpPacketNotification.PropertyModified,
+          instanceId,
+          info.property.index,
+          info.value,
+        );
+      const onEvent = (info: { event: { index: number }; value: unknown }): void =>
+        this.sendNotification(
+          EpPacketNotification.EventOccurred,
+          instanceId,
+          info.event.index,
+          info.value,
+        );
+      instance.propertyModified.add(onProp);
+      instance.eventOccurred.add(onEvent);
+      this.subscriptions.set(instanceId, () => {
+        instance.propertyModified.remove(onProp);
+        instance.eventOccurred.remove(onEvent);
+      });
+    }
+
+    this.sendReply(EpPacketReply.Completed, callbackId, values);
   }
 
   /** Server handler: resolve the resource, invoke the function by index, reply with its result. */
@@ -234,6 +417,25 @@ export class EpConnection extends NetworkConnection {
     this.sendReply(EpPacketReply.Completed, callbackId);
   }
 
+  /** Route an inbound notification to a built-in handler, or fall back to {@link onNotification}. */
+  private processNotification(action: EpPacketNotification, tdu: PlainTdu | null): void {
+    switch (action) {
+      case EpPacketNotification.PropertyModified: {
+        const a = (this.decode(tdu) as unknown[]) ?? [];
+        this.attachedResources
+          .get(Number(a[0]))
+          ?.updateProperty(Number(a[1]), a[2]);
+        return;
+      }
+      case EpPacketNotification.EventOccurred: {
+        const a = (this.decode(tdu) as unknown[]) ?? [];
+        this.attachedResources.get(Number(a[0]))?.applyEvent(Number(a[1]), a[2]);
+        return;
+      }
+    }
+    this.onNotification?.(this, action, tdu);
+  }
+
   private dispatchReply(packet: EpPacket): void {
     const { callbackId, tdu } = packet;
     switch (packet.reply) {
@@ -285,9 +487,19 @@ export class EpConnection extends NetworkConnection {
       ?.triggerProgress(ProgressType.Execution, Number(args[0] ?? 0), Number(args[1] ?? 0));
   }
 
-  protected override connected(): void {}
+  protected override connected(): void {
+    if (this.direction === "initiator" && !this.authenticated) this.declare();
+  }
+
   protected override disconnected(): void {
-    // Fail any in-flight requests when the connection drops.
+    // Fail a pending handshake.
+    this.readyReply?.triggerError(
+      new AsyncException(ErrorType.Management, 1, "Connection closed during handshake."),
+    );
+    // Drop notification subscriptions and fail any in-flight requests.
+    for (const unsubscribe of this.subscriptions.values()) unsubscribe();
+    this.subscriptions.clear();
+
     const pending = [...this.requests.values()];
     this.requests.clear();
     for (const req of pending)
