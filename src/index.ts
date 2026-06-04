@@ -1,0 +1,8 @@
+// Public entry point for the `esiur` package.
+// Re-exports are added phase-by-phase as the port progresses.
+
+import "./internal/metadata.js";
+
+// Phase 1 — Foundation
+export * from "./core/index.js";
+export * from "./data/index.js";

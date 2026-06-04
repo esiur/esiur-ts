@@ -1,0 +1,50 @@
+{
+  "name": "esiur",
+  "version": "3.0.0",
+  "description": "Distributed Object Framework — real-time properties, async invocation and events across the network (IIP/Ep protocol, v3).",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    }
+  },
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsup",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "lint": "eslint ."
+  },
+  "keywords": [
+    "esiur",
+    "iip",
+    "distributed",
+    "rpc",
+    "realtime",
+    "websocket",
+    "iot"
+  ],
+  "author": "Ahmed Kh. Zamil",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/esiur/esiur-ts.git"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "tsup": "^8.3.5",
+    "typescript": "^5.7.2",
+    "vitest": "^2.1.8"
+  }
+}
