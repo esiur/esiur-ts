@@ -78,6 +78,9 @@ export class TypeTemplate {
   getFunctionByName(name: string): FunctionTemplate | undefined {
     return this.functions.find((f) => f.name === name);
   }
+  getFunctionByIndex(index: number): FunctionTemplate | undefined {
+    return this.functions.find((f) => f.index === index);
+  }
   getEventByName(name: string): EventTemplate | undefined {
     return this.events.find((e) => e.name === name);
   }

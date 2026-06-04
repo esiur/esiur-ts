@@ -13,3 +13,6 @@ export * from "./stores/index.js";
 
 // Phase 4 — Networking
 export * from "./net/index.js";
+
+// Phase 5 — IIP/Ep protocol
+export * from "./protocol/index.js";
