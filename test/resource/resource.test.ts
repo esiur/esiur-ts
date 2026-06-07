@@ -58,6 +58,23 @@ describe("warehouse put/get and notifications", () => {
     expect(hello.instance!.age).toBe(1);
   });
 
+  it("moves and removes resources by store path", async () => {
+    const wh = new Warehouse();
+    const store = await wh.put("sys", new MemoryStore());
+    const hello = await wh.put("sys/hello", new HelloResource());
+    await wh.open();
+
+    expect(await store.move(hello, "sys/nested/renamed")).toBe(true);
+    expect(hello.instance!.name).toBe("renamed");
+    expect(hello.instance!.link).toBe("sys/nested/renamed");
+    expect(await wh.get("sys/hello")).toBeUndefined();
+    expect(await wh.get("sys/nested/renamed")).toBe(hello);
+
+    expect(await store.remove("nested/renamed")).toBe(true);
+    expect(await wh.get("sys/nested/renamed")).toBeUndefined();
+    expect(wh.getById(hello.instance!.id)).toBe(hello);
+  });
+
   it("rejects a non-store resource at the root path", async () => {
     const wh = new Warehouse();
     await expect(wh.put("hello", new HelloResource()) as PromiseLike<unknown>).rejects.toThrow(

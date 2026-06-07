@@ -29,21 +29,33 @@ export class WSocket implements ISocket {
 
   connect(url: string): AsyncReply<boolean> {
     const reply = new AsyncReply<boolean>();
-    const ws = new WebSocket(url);
     this.state = SocketState.Connecting;
-    this.attach(ws);
 
-    ws.addEventListener("open", () => {
-      this.state = SocketState.Established;
-      reply.trigger(true);
-      this.receiver?.networkConnect(this);
-    });
-    ws.addEventListener("error", () => {
-      if (this.state === SocketState.Connecting)
-        reply.triggerError(
-          new AsyncException(new Error(`WebSocket connection to ${url} failed.`)),
-        );
-    });
+    (async () => {
+      try {
+        const ws = await createWebSocket(url);
+        if (this.state !== SocketState.Connecting) {
+          ws.close();
+          return;
+        }
+
+        this.attach(ws);
+        ws.addEventListener("open", () => {
+          this.state = SocketState.Established;
+          reply.trigger(true);
+          this.receiver?.networkConnect(this);
+        });
+        ws.addEventListener("error", () => {
+          if (this.state === SocketState.Connecting)
+            reply.triggerError(
+              new AsyncException(new Error(`WebSocket connection to ${url} failed.`)),
+            );
+        });
+      } catch (error) {
+        this.state = SocketState.Closed;
+        reply.triggerError(AsyncException.from(error));
+      }
+    })();
 
     return reply;
   }
@@ -63,7 +75,7 @@ export class WSocket implements ISocket {
       this.receiver?.networkClose(this);
     });
 
-    if (ws.readyState === WebSocket.OPEN) this.state = SocketState.Established;
+    if (ws.readyState === 1) this.state = SocketState.Established;
   }
 
   send(message: Uint8Array): void {
@@ -99,4 +111,31 @@ function toBytes(data: unknown): Uint8Array {
     return new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
   if (typeof data === "string") return textEncoder.encode(data);
   return new Uint8Array(0);
+}
+
+type WebSocketConstructor = new (url: string) => WebSocket;
+
+async function createWebSocket(url: string): Promise<WebSocket> {
+  const ctor = await getWebSocketConstructor();
+  return new ctor(url);
+}
+
+async function getWebSocketConstructor(): Promise<WebSocketConstructor> {
+  if (typeof globalThis.WebSocket === "function")
+    return globalThis.WebSocket as WebSocketConstructor;
+
+  try {
+    const ws = await import("ws");
+    const ctor = ws.WebSocket ?? ws.default;
+    if (typeof ctor === "function") return ctor as unknown as WebSocketConstructor;
+  } catch (error) {
+    throw new Error(
+      "No WebSocket implementation is available. In Node.js 18-20, install the optional peer dependency 'ws'.",
+      { cause: error },
+    );
+  }
+
+  throw new Error(
+    "No WebSocket implementation is available. In Node.js 18-20, install the optional peer dependency 'ws'.",
+  );
 }

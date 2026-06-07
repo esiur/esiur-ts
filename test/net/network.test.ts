@@ -68,4 +68,44 @@ describe("WSocket loopback (via ws echo server)", () => {
     sock.close();
     await new Promise<void>((r) => wss.close(() => r()));
   });
+
+  it("falls back to the ws peer when global WebSocket is unavailable", async () => {
+    const descriptor = Object.getOwnPropertyDescriptor(globalThis, "WebSocket");
+    Object.defineProperty(globalThis, "WebSocket", {
+      configurable: true,
+      writable: true,
+      value: undefined,
+    });
+
+    const wss = new WebSocketServer({ port: 0 });
+    try {
+      await new Promise<void>((r) => wss.on("listening", () => r()));
+      const port = (wss.address() as { port: number }).port;
+      wss.on("connection", (ws) => ws.on("message", (data: Buffer) => ws.send(data)));
+
+      const sock = new WSocket();
+      let resolveMsg!: (v: number[]) => void;
+      const gotMsg = new Promise<number[]>((r) => (resolveMsg = r));
+
+      sock.receiver = {
+        networkConnect() {},
+        networkClose() {},
+        networkReceive(_s: ISocket, buffer) {
+          const m = buffer.read();
+          if (m) resolveMsg([...m]);
+        },
+      };
+
+      await sock.connect(`ws://127.0.0.1:${port}`);
+      expect(sock.state).toBe(SocketState.Established);
+
+      sock.send(Uint8Array.of(5, 6, 7, 8));
+      expect(await gotMsg).toEqual([5, 6, 7, 8]);
+      sock.close();
+    } finally {
+      await new Promise<void>((r) => wss.close(() => r()));
+      if (descriptor) Object.defineProperty(globalThis, "WebSocket", descriptor);
+      else Reflect.deleteProperty(globalThis, "WebSocket");
+    }
+  });
 });

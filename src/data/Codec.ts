@@ -274,6 +274,8 @@ const dynamicParsers: D.Parser[] = [
   D.resourceListParser,
   D.recordListParser,
   D.resourceLinkParser,
+  D.mapParser,
+  D.mapListParser,
 ];
 
 const typedParsers: D.Parser[] = [D.typedParser];

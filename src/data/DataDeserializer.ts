@@ -114,6 +114,14 @@ function parseDynamicArray(tdu: ParsedTdu, warehouse: unknown): unknown[] {
 export const listParser: Parser = (t, w) => parseDynamicArray(t, w);
 export const resourceListParser: Parser = (t, w) => parseDynamicArray(t, w);
 export const recordListParser: Parser = (t, w) => parseDynamicArray(t, w);
+export const mapParser: Parser = (t, w) => {
+  const flat = parseDynamicArray(t, w);
+  const map = new Map<unknown, unknown>();
+  for (let i = 0; i + 1 < flat.length; i += 2)
+    map.set(flat[i], flat[i + 1]);
+  return map;
+};
+export const mapListParser: Parser = (t, w) => parseDynamicArray(t, w);
 
 export const typedParser: Parser = (tdu, warehouse) => {
   const tru = tdu.metadata;

@@ -1,6 +1,5 @@
 import { describe, it, expect } from "vitest";
 import * as DC from "../../src/data/DC.js";
-import { Endian } from "../../src/data/Endian.js";
 import { Uuid } from "../../src/data/Uuid.js";
 import { Decimal128 } from "../../src/data/Decimal128.js";
 import { Int128 } from "../../src/data/Int128.js";

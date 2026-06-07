@@ -32,6 +32,8 @@ export interface IStore extends IResource {
     date: Date | undefined,
   ): boolean;
   remove(resource: IResource): AsyncReply<boolean>;
+  remove(path: string): AsyncReply<boolean>;
+  move(resource: IResource, newPath: string): AsyncReply<boolean>;
   children<T extends IResource>(resource: IResource, name?: string): AsyncBag<T>;
   parents<T extends IResource>(resource: IResource, name?: string): AsyncBag<T>;
 }

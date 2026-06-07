@@ -1,7 +1,7 @@
 {
   "name": "esiur",
   "version": "3.0.0",
-  "description": "Distributed Object Framework — real-time properties, async invocation and events across the network (IIP/Ep protocol, v3).",
+  "description": "Distributed Object Framework for TypeScript - real-time properties, async invocation and events over the Esiur EP protocol.",
   "type": "module",
   "exports": {
     ".": {
@@ -18,10 +18,13 @@
   ],
   "scripts": {
     "build": "tsup",
+    "check": "npm run typecheck && npm run lint && npm test",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
-    "lint": "eslint ."
+    "lint": "eslint .",
+    "prepack": "npm run build",
+    "prepublishOnly": "npm run check"
   },
   "keywords": [
     "esiur",
@@ -38,6 +41,13 @@
     "type": "git",
     "url": "git+https://github.com/esiur/esiur-ts.git"
   },
+  "bugs": {
+    "url": "https://github.com/esiur/esiur-ts/issues"
+  },
+  "homepage": "https://github.com/esiur/esiur-ts#readme",
+  "publishConfig": {
+    "access": "public"
+  },
   "engines": {
     "node": ">=18"
   },
@@ -50,11 +60,14 @@
     }
   },
   "devDependencies": {
+    "@eslint/js": "^9.39.4",
     "@types/node": "^22.10.0",
     "@types/ws": "^8.18.1",
+    "eslint": "^9.39.4",
     "tsup": "^8.3.5",
     "typescript": "^5.7.2",
-    "vitest": "^2.1.8",
+    "typescript-eslint": "^8.60.1",
+    "vitest": "^3.2.6",
     "ws": "^8.21.0"
   }
 }

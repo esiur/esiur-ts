@@ -49,17 +49,19 @@ export abstract class NetworkConnection
   }
 
   networkConnect(_socket: ISocket): void {
+    if (_socket !== this.socket) return;
     this.connected();
     this.onConnect.emit(this);
   }
 
   networkClose(_socket: ISocket): void {
+    if (_socket !== this.socket) return;
     this.disconnected();
     this.onClose.emit(this);
   }
 
   networkReceive(_sender: ISocket, buffer: NetworkBuffer): void {
-    if (!this.socket || this.socket.state === SocketState.Closed) return;
+    if (_sender !== this.socket || this.socket.state === SocketState.Closed) return;
 
     // Drain once; re-entrant callbacks return and let the active drain continue.
     if (this.receivingFlag) return;

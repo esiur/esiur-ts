@@ -11,10 +11,12 @@ import { EpPacketRequest } from "../net/packets/EpPacketRequest.js";
 import { EpPacketReply } from "../net/packets/EpPacketReply.js";
 import { EpPacketNotification } from "../net/packets/EpPacketNotification.js";
 import type { PlainTdu } from "../data/PlainTdu.js";
-import { compose, parse } from "../data/Codec.js";
+import { compose, parse, parseSync } from "../data/Codec.js";
+import { merge } from "../data/DC.js";
 import { typedMap } from "../data/descriptors.js";
 import { t } from "../data/descriptors.js";
 import { u8 } from "../data/widths.js";
+import { ResourceId } from "../data/ResourceId.js";
 import { WSocket } from "../net/sockets/WSocket.js";
 import { EpAuthPacket } from "../net/packets/EpAuthPacket.js";
 import { EpAuthPacketCommand } from "../net/packets/EpAuthPacketCommand.js";
@@ -24,7 +26,8 @@ import { AuthenticationMode } from "../security/AuthenticationMode.js";
 import { EncryptionMode } from "../security/EncryptionMode.js";
 import type { Warehouse } from "../resource/Warehouse.js";
 import type { TypeTemplate } from "../resource/template.js";
-import { EpResource } from "./EpResource.js";
+import { EpResource, type RemotePropertyValue } from "./EpResource.js";
+import { RemoteTypeDef } from "./RemoteTypeDef.js";
 
 /** Handles an inbound request packet (server-side dispatch). */
 export type RequestHandler = (
@@ -40,6 +43,21 @@ export type NotificationHandler = (
   action: EpPacketNotification,
   tdu: PlainTdu | null,
 ) => void;
+
+export interface EpConnectionOptions {
+  /** Reconnect automatically after an unexpected client-side disconnect. */
+  autoReconnect?: boolean;
+  /** Delay between reconnect attempts, in milliseconds. */
+  reconnectInterval?: number;
+}
+
+export interface EpReconnectMetrics {
+  connectMs: number;
+  reattachMs: number;
+  recoveryMs: number;
+  restoredResources: number;
+  failedResources: number;
+}
 
 /**
  * IIP/Ep connection — request/reply correlation and packet dispatch
@@ -83,6 +101,18 @@ export class EpConnection extends NetworkConnection {
   private domain = "";
   /** Responder: accept unauthenticated (anonymous, None-mode) peers. */
   allowUnauthorized = true;
+  /** Reconnect automatically after an unexpected client-side disconnect. */
+  autoReconnect = false;
+  /** Delay between reconnect attempts, in milliseconds. */
+  reconnectInterval = 5000;
+  /** Metrics from the most recent reconnect attempt. */
+  lastReconnectMetrics?: EpReconnectMetrics;
+
+  private reconnectUrl?: string;
+  private reconnectTimer?: ReturnType<typeof setTimeout>;
+  private reconnectReply?: AsyncReply<boolean>;
+  private manualClose = false;
+  private lastRestoreStats = { restored: 0, failed: 0 };
 
   /** Begin the client-side handshake; resolves via {@link whenReady}. */
   startInitiatorHandshake(domain = ""): void {
@@ -107,21 +137,40 @@ export class EpConnection extends NetworkConnection {
    * Open a client connection to `url` over WebSocket, run the anonymous
    * handshake, and resolve once the session is established.
    */
-  static async connect(url: string, warehouse?: Warehouse): Promise<EpConnection> {
+  static async connect(
+    url: string,
+    warehouseOrOptions?: Warehouse | EpConnectionOptions,
+    options?: EpConnectionOptions,
+  ): Promise<EpConnection> {
     const connection = new EpConnection();
-    if (warehouse) connection.warehouse = warehouse;
+    const config = isConnectionOptions(warehouseOrOptions) ? warehouseOrOptions : options;
+    if (!isConnectionOptions(warehouseOrOptions) && warehouseOrOptions)
+      connection.warehouse = warehouseOrOptions;
+    connection.applyOptions(config);
+    await connection.openClientSocket(url);
+    return connection;
+  }
+
+  private applyOptions(options?: EpConnectionOptions): void {
+    if (!options) return;
+    if (options.autoReconnect != null) this.autoReconnect = options.autoReconnect;
+    if (options.reconnectInterval != null) this.reconnectInterval = options.reconnectInterval;
+  }
+
+  private async openClientSocket(url: string): Promise<void> {
+    this.reconnectUrl = url;
+    this.manualClose = false;
     try {
-      connection.domain = new URL(url).hostname;
+      this.domain = new URL(url).hostname;
     } catch {
       /* leave domain empty */
     }
-    connection.startInitiatorHandshake(connection.domain);
+    this.startInitiatorHandshake(this.domain);
 
     const socket = new WSocket();
-    connection.assign(socket);
+    this.assign(socket);
     await socket.connect(url);
-    await connection.whenReady();
-    return connection;
+    await this.whenReady();
   }
 
   /** Send the initiator's Initialize packet (anonymous, None auth/encryption). */
@@ -171,12 +220,96 @@ export class EpConnection extends NetworkConnection {
 
   /** Invoke function `index` on the resource with `instanceId`, resolving its result. */
   invoke(instanceId: number, index: number, ...args: unknown[]): AsyncReply {
-    return this.sendRequest(EpPacketRequest.InvokeFunction, instanceId, index, args);
+    // The member index is a byte (UInt8) on the wire — C# casts it as `(byte)`.
+    return this.sendRequest(EpPacketRequest.InvokeFunction, instanceId, u8(index), args);
   }
 
   /** Set property `index` on the resource with `instanceId`. */
   set(instanceId: number, index: number, value: unknown): AsyncReply {
-    return this.sendRequest(EpPacketRequest.SetProperty, instanceId, index, value);
+    return this.sendRequest(EpPacketRequest.SetProperty, instanceId, u8(index), value);
+  }
+
+  /** Resolve a resource path to a {@link ResourceId} reference. */
+  getResourceIdByLink(link: string): AsyncReply {
+    return this.sendRequest(EpPacketRequest.GetResourceIdByLink, link);
+  }
+
+  /** Fetch and parse the runtime TypeDef for a remote resource id. */
+  fetchTypeDefByResourceId(instanceId: number): AsyncReply<RemoteTypeDef> {
+    return this.sendRequest(EpPacketRequest.TypeDefByResourceId, instanceId).then((reply) => {
+      if (!(reply instanceof Uint8Array))
+        throw new AsyncException(
+          ErrorType.Management,
+          ExceptionCode.ParseError,
+          "TypeDefByResourceId did not return a raw TypeDef payload.",
+        );
+      return RemoteTypeDef.parse(reply, this.warehouse);
+    });
+  }
+
+  /** Fetch and parse a runtime TypeDef by its remote TypeDef id. */
+  fetchTypeDefById(typeDefId: number): AsyncReply<RemoteTypeDef> {
+    return this.sendRequest(EpPacketRequest.TypeDefById, typeDefId).then((reply) => {
+      if (!(reply instanceof Uint8Array))
+        throw new AsyncException(
+          ErrorType.Management,
+          ExceptionCode.ParseError,
+          "TypeDefById did not return a raw TypeDef payload.",
+        );
+      return RemoteTypeDef.parse(reply, this.warehouse);
+    });
+  }
+
+  /** Resolve and attach a remote resource by its path on this connection. */
+  get(path: string, template?: TypeTemplate): AsyncReply {
+    return this.getResourceIdByLink(path).then((resourceRef) => {
+      const instanceId = toInstanceId(resourceRef);
+      if (instanceId == null)
+        throw new AsyncException(
+          ErrorType.Management,
+          ExceptionCode.ResourceNotFound,
+          `Remote resource '${path}' was not found.`,
+        );
+      if (!template) return resourceRef;
+      return this.attach(instanceId, template);
+    });
+  }
+
+  /** Reopen the WebSocket session and reattach all known remote resources. */
+  reconnect(): AsyncReply<boolean> {
+    if (!this.reconnectUrl) {
+      const reply = new AsyncReply<boolean>();
+      reply.triggerError(
+        new AsyncException(ErrorType.Management, ExceptionCode.HostNotReachable, "No reconnect URL."),
+      );
+      return reply;
+    }
+    if (this.reconnectReply) return this.reconnectReply;
+
+    const reply = new AsyncReply<boolean>();
+    this.reconnectReply = reply;
+    (async () => {
+      const started = nowMs();
+      try {
+        await this.openClientSocket(this.reconnectUrl!);
+        const connected = nowMs();
+        await this.restoreAttachedResources();
+        const finished = nowMs();
+        this.lastReconnectMetrics = {
+          connectMs: connected - started,
+          reattachMs: finished - connected,
+          recoveryMs: finished - started,
+          restoredResources: this.lastRestoreStats.restored,
+          failedResources: this.lastRestoreStats.failed,
+        };
+        reply.trigger(true);
+      } catch (e) {
+        reply.triggerError(AsyncException.from(e));
+      } finally {
+        if (this.reconnectReply === reply) this.reconnectReply = undefined;
+      }
+    })();
+    return reply;
   }
 
   /**
@@ -186,12 +319,56 @@ export class EpConnection extends NetworkConnection {
    * stubs); a server build resolves it from the warehouse.
    */
   attach(instanceId: number, template: TypeTemplate): AsyncReply {
-    return this.sendRequest(EpPacketRequest.AttachResource, instanceId).then((values) => {
-      const resource = new EpResource(this, instanceId, template);
-      const vals = (values as unknown[]) ?? [];
-      template.properties.forEach((p, i) => resource.cache.set(p.index, vals[i]));
+    return this.sendRequest(EpPacketRequest.AttachResource, instanceId).then((reply) => {
+      // Reply: [typeDefId, age, link, hops, propertyValues] (matches C#). The
+      // 5th element is a RawData blob of (age, date, value) self-describing TDUs,
+      // one triple per property in index order.
+      const list = reply as unknown[];
+      const typeDefId = asNumber(list[0]);
+      const age = asNumber(list[1]);
+      const link = String(list[2] ?? "");
+      const hops = asNumber(list[3]);
+      const raw = list[4] as Uint8Array | undefined;
+
+      const resource = new EpResource(this, instanceId, template, {
+        typeDefId,
+        age,
+        link,
+        hops,
+      });
+      if (raw) {
+        const snapshots = this.parsePropertyValueArray(raw, template);
+        for (const pv of snapshots)
+          resource.setPropertySnapshot(pv.index, pv.age, pv.date, pv.value);
+      }
+
       this.attachedResources.set(instanceId, resource);
       return EpResource.createProxy(resource);
+    });
+  }
+
+  /**
+   * Reattach an already-known resource by sending its last-known age. The peer
+   * returns only properties modified after that age.
+   */
+  reattach(instanceId: number, age: number, resource: EpResource): AsyncReply<EpResource> {
+    return this.sendRequest(EpPacketRequest.ReattachResource, instanceId, age).then((reply) => {
+      const list = reply as unknown[];
+      const oldId = resource.instanceId;
+      resource.setRemoteIdentity({
+        instanceId,
+        typeDefId: asNumber(list[0]),
+        age: asNumber(list[1]),
+        link: String(list[2] ?? ""),
+        hops: asNumber(list[3]),
+      });
+
+      const raw = list[4] as Uint8Array | undefined;
+      if (raw) resource.applyDelta(this.parsePropertyValueMap(raw));
+
+      if (oldId !== instanceId) this.attachedResources.delete(oldId);
+      this.attachedResources.set(instanceId, resource);
+      return resource;
     });
   }
 
@@ -223,6 +400,117 @@ export class EpConnection extends NetworkConnection {
     if (args.length === 0) return undefined;
     if (args.length === 1) return compose(args[0], this.warehouse, this);
     return compose(args, this.warehouse, this);
+  }
+
+  private parsePropertyValueArray(raw: Uint8Array, template: TypeTemplate): RemotePropertyValue[] {
+    const values: RemotePropertyValue[] = [];
+    let offset = 0;
+    for (const p of template.properties) {
+      const age = parseSync(raw, offset, this.warehouse);
+      offset += age.length;
+      const date = parseSync(raw, offset, this.warehouse);
+      offset += date.length;
+      const value = parseSync(raw, offset, this.warehouse);
+      offset += value.length;
+      values.push({
+        index: p.index,
+        age: asNumber(age.value),
+        date: asDate(date.value),
+        value: value.value,
+      });
+    }
+    return values;
+  }
+
+  private parsePropertyValueMap(raw: Uint8Array): RemotePropertyValue[] {
+    const values: RemotePropertyValue[] = [];
+    let offset = 0;
+    while (offset < raw.length) {
+      const index = parseSync(raw, offset, this.warehouse);
+      offset += index.length;
+      const age = parseSync(raw, offset, this.warehouse);
+      offset += age.length;
+      const date = parseSync(raw, offset, this.warehouse);
+      offset += date.length;
+      const value = parseSync(raw, offset, this.warehouse);
+      offset += value.length;
+      values.push({
+        index: asNumber(index.value),
+        age: asNumber(age.value),
+        date: asDate(date.value),
+        value: value.value,
+      });
+    }
+    return values;
+  }
+
+  private composePropertyValueArray(instanceId: number): Uint8Array {
+    const resource = this.warehouse?.getById(instanceId);
+    if (!resource?.instance) return new Uint8Array(0);
+
+    const instance = resource.instance;
+    const bag = resource as unknown as Record<string, unknown>;
+    const parts: Uint8Array[] = [];
+    for (const p of instance.definition.properties) {
+      parts.push(compose(instance.getAge(p.index) ?? 0, this.warehouse, this));
+      parts.push(compose(instance.getModificationDate(p.index) ?? new Date(0), this.warehouse, this));
+      parts.push(compose(bag[p.name], this.warehouse, this));
+    }
+    return merge(...parts);
+  }
+
+  private composePropertyValueMap(instanceId: number, sinceAge: number): Uint8Array {
+    const resource = this.warehouse?.getById(instanceId);
+    if (!resource?.instance) return new Uint8Array(0);
+
+    const instance = resource.instance;
+    const bag = resource as unknown as Record<string, unknown>;
+    const parts: Uint8Array[] = [];
+    for (const p of instance.definition.properties) {
+      const propertyAge = instance.getAge(p.index) ?? 0;
+      if (propertyAge <= sinceAge) continue;
+      parts.push(compose(u8(p.index), this.warehouse, this));
+      parts.push(compose(propertyAge, this.warehouse, this));
+      parts.push(compose(instance.getModificationDate(p.index) ?? new Date(0), this.warehouse, this));
+      parts.push(compose(bag[p.name], this.warehouse, this));
+    }
+    return merge(...parts);
+  }
+
+  private async restoreAttachedResources(): Promise<void> {
+    const resources = [...this.attachedResources.values()];
+    const stats = { restored: 0, failed: 0 };
+    for (const resource of resources) {
+      let instanceId = resource.instanceId;
+      if (resource.link) {
+        try {
+          const resolved = await this.getResourceIdByLink(resource.link);
+          instanceId = toInstanceId(resolved) ?? instanceId;
+        } catch (e) {
+          if (AsyncException.from(e).code === ExceptionCode.ResourceNotFound) {
+            stats.failed++;
+            continue;
+          }
+          throw e;
+        }
+      }
+
+      try {
+        if (instanceId !== resource.instanceId) {
+          this.attachedResources.delete(resource.instanceId);
+          resource.instanceId = instanceId;
+        }
+        await this.reattach(instanceId, resource.age, resource);
+        stats.restored++;
+      } catch (e) {
+        if (AsyncException.from(e).code === ExceptionCode.ResourceNotFound) {
+          stats.failed++;
+          continue;
+        }
+        throw e;
+      }
+    }
+    this.lastRestoreStats = stats;
   }
 
   // ---- inbound ----------------------------------------------------------------
@@ -288,6 +576,12 @@ export class EpConnection extends NetworkConnection {
         case EpPacketRequest.AttachResource:
           this.epRequestAttachResource(callbackId, tdu);
           return;
+        case EpPacketRequest.ReattachResource:
+          this.epRequestReattachResource(callbackId, tdu);
+          return;
+        case EpPacketRequest.GetResourceIdByLink:
+          this.epRequestGetResourceIdByLink(callbackId, tdu);
+          return;
       }
     }
     this.onRequest?.(this, action, callbackId, tdu);
@@ -308,33 +602,107 @@ export class EpConnection extends NetworkConnection {
     }
 
     const instance = resource.instance;
-    const bag = resource as unknown as Record<string, unknown>;
-    const values = instance.definition.properties.map((p) => bag[p.name]);
+    const propertyValues = this.composePropertyValueArray(instanceId);
 
-    if (!this.subscriptions.has(instanceId)) {
-      const onProp = (info: { property: { index: number }; value: unknown }): void =>
-        this.sendNotification(
-          EpPacketNotification.PropertyModified,
-          instanceId,
-          info.property.index,
-          info.value,
-        );
-      const onEvent = (info: { event: { index: number }; value: unknown }): void =>
-        this.sendNotification(
-          EpPacketNotification.EventOccurred,
-          instanceId,
-          info.event.index,
-          info.value,
-        );
-      instance.propertyModified.add(onProp);
-      instance.eventOccurred.add(onEvent);
-      this.subscriptions.set(instanceId, () => {
-        instance.propertyModified.remove(onProp);
-        instance.eventOccurred.remove(onEvent);
-      });
+    const typeDef = this.warehouse.getLocalTypeDefByType(resource.constructor);
+
+    this.subscribeToInstance(instanceId);
+
+    this.sendReply(
+      EpPacketReply.Completed,
+      callbackId,
+      typeDef.id,
+      instance.age,
+      instance.link ?? "",
+      0, // hops
+      propertyValues,
+    );
+  }
+
+  /** Server handler: send only properties modified after the caller's known age. */
+  private epRequestReattachResource(callbackId: number, tdu: PlainTdu | null): void {
+    if (!tdu || !this.warehouse) {
+      this.sendError(ErrorType.Management, callbackId, ExceptionCode.ParseError);
+      return;
     }
 
-    this.sendReply(EpPacketReply.Completed, callbackId, values);
+    let parsed: unknown[];
+    try {
+      parsed = this.decode(tdu) as unknown[];
+    } catch {
+      this.sendError(ErrorType.Management, callbackId, ExceptionCode.ParseError);
+      return;
+    }
+
+    const instanceId = Number(parsed[0]);
+    const sinceAge = asNumber(parsed[1]);
+    const resource = this.warehouse.getById(instanceId);
+    if (!resource?.instance) {
+      this.sendError(ErrorType.Management, callbackId, ExceptionCode.ResourceNotFound);
+      return;
+    }
+
+    const instance = resource.instance;
+    const typeDef = this.warehouse.getLocalTypeDefByType(resource.constructor);
+    const propertyValues = this.composePropertyValueMap(instanceId, sinceAge);
+    this.subscribeToInstance(instanceId);
+
+    this.sendReply(
+      EpPacketReply.Completed,
+      callbackId,
+      typeDef.id,
+      instance.age,
+      instance.link ?? "",
+      0,
+      propertyValues,
+    );
+  }
+
+  /** Server handler: resolve a resource path to an instance id. */
+  private epRequestGetResourceIdByLink(callbackId: number, tdu: PlainTdu | null): void {
+    if (!tdu || !this.warehouse) {
+      this.sendError(ErrorType.Management, callbackId, ExceptionCode.ParseError);
+      return;
+    }
+
+    const link = String(this.decode(tdu) ?? "");
+    this.warehouse.query(link).then(
+      (resource) => {
+        if (!resource?.instance) {
+          this.sendError(ErrorType.Management, callbackId, ExceptionCode.ResourceNotFound);
+          return;
+        }
+        this.sendReply(EpPacketReply.Completed, callbackId, resource.instance.id);
+      },
+      () => this.sendError(ErrorType.Management, callbackId, ExceptionCode.ResourceNotFound),
+    );
+  }
+
+  private subscribeToInstance(instanceId: number): void {
+    const resource = this.warehouse?.getById(instanceId);
+    if (!resource?.instance || this.subscriptions.has(instanceId)) return;
+
+    const instance = resource.instance;
+    const onProp = (info: { property: { index: number }; value: unknown }): void =>
+      this.sendNotification(
+        EpPacketNotification.PropertyModified,
+        instanceId,
+        info.property.index,
+        info.value,
+      );
+    const onEvent = (info: { event: { index: number }; value: unknown }): void =>
+      this.sendNotification(
+        EpPacketNotification.EventOccurred,
+        instanceId,
+        info.event.index,
+        info.value,
+      );
+    instance.propertyModified.add(onProp);
+    instance.eventOccurred.add(onEvent);
+    this.subscriptions.set(instanceId, () => {
+      instance.propertyModified.remove(onProp);
+      instance.eventOccurred.remove(onEvent);
+    });
   }
 
   /** Server handler: resolve the resource, invoke the function by index, reply with its result. */
@@ -491,6 +859,18 @@ export class EpConnection extends NetworkConnection {
     if (this.direction === "initiator" && !this.authenticated) this.declare();
   }
 
+  override close(): void {
+    this.manualClose = true;
+    this.clearReconnectTimer();
+    super.close();
+  }
+
+  override destroy(): void {
+    this.manualClose = true;
+    this.clearReconnectTimer();
+    super.destroy();
+  }
+
   protected override disconnected(): void {
     // Fail a pending handshake.
     this.readyReply?.triggerError(
@@ -506,6 +886,34 @@ export class EpConnection extends NetworkConnection {
       req.triggerError(
         new AsyncException(ErrorType.Management, 1, "Connection closed."),
       );
+
+    if (this.shouldAutoReconnect()) this.scheduleReconnect();
+  }
+
+  private shouldAutoReconnect(): boolean {
+    return (
+      this.autoReconnect &&
+      !this.manualClose &&
+      this.direction === "initiator" &&
+      this.reconnectUrl != null
+    );
+  }
+
+  private scheduleReconnect(): void {
+    if (this.reconnectTimer || this.reconnectReply || !this.shouldAutoReconnect()) return;
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = undefined;
+      this.reconnect().then(
+        () => undefined,
+        () => this.scheduleReconnect(),
+      );
+    }, Math.max(0, this.reconnectInterval));
+  }
+
+  private clearReconnectTimer(): void {
+    if (!this.reconnectTimer) return;
+    clearTimeout(this.reconnectTimer);
+    this.reconnectTimer = undefined;
   }
 }
 
@@ -515,4 +923,41 @@ function isThenable(value: unknown): value is PromiseLike<unknown> {
     (typeof value === "object" || typeof value === "function") &&
     typeof (value as { then?: unknown }).then === "function"
   );
+}
+
+function isConnectionOptions(value: unknown): value is EpConnectionOptions {
+  if (value == null || typeof value !== "object") return false;
+  const keys = value as Record<string, unknown>;
+  return "autoReconnect" in keys || "reconnectInterval" in keys;
+}
+
+function asNumber(value: unknown): number {
+  if (typeof value === "number") return value;
+  if (typeof value === "bigint") return Number(value);
+  if (value instanceof Number) return Number(value.valueOf());
+  return Number(value ?? 0);
+}
+
+function asDate(value: unknown): Date | undefined {
+  return value instanceof Date ? value : undefined;
+}
+
+function toInstanceId(value: unknown): number | undefined {
+  if (value instanceof ResourceId) return value.id;
+  if (typeof value === "number") return value;
+  if (typeof value === "bigint") return Number(value);
+  if (value instanceof EpResource) return value.instanceId;
+
+  const maybe = value as
+    | { id?: unknown; instanceId?: unknown; instance?: { id?: unknown } }
+    | undefined;
+  if (!maybe || typeof maybe !== "object") return undefined;
+  if (maybe.instanceId != null) return asNumber(maybe.instanceId);
+  if (maybe.id != null) return asNumber(maybe.id);
+  if (maybe.instance?.id != null) return asNumber(maybe.instance.id);
+  return undefined;
+}
+
+function nowMs(): number {
+  return globalThis.performance?.now() ?? Date.now();
 }

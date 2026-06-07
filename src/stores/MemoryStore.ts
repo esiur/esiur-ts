@@ -3,7 +3,6 @@ import { AsyncBag } from "../core/AsyncBag.js";
 import type { DestroyedEvent } from "../core/IDestructible.js";
 import type { IResource, IStore } from "../resource/IResource.js";
 import type { Instance } from "../resource/Instance.js";
-import type { PropertyTemplate } from "../resource/template.js";
 import { ResourceOperation } from "../resource/ResourceOperation.js";
 
 /**
@@ -51,13 +50,34 @@ export class MemoryStore implements IStore {
     return true;
   }
 
-  remove(resource: IResource): AsyncReply<boolean> {
-    if (resource.instance) this.resources.delete(resource.instance.id);
-    return AsyncReply.fromResult(true);
+  remove(resource: IResource): AsyncReply<boolean>;
+  remove(path: string): AsyncReply<boolean>;
+  remove(resourceOrPath: IResource | string): AsyncReply<boolean> {
+    if (typeof resourceOrPath === "string") {
+      const path = normalizeStorePath(resourceOrPath, this.instance?.name);
+      for (const r of this.resources.values()) {
+        if (this.link(r) === path) {
+          this.resources.delete(r.instance!.id);
+          return AsyncReply.fromResult(true);
+        }
+      }
+      return AsyncReply.fromResult(false);
+    }
+
+    if (resourceOrPath.instance?.store !== this) return AsyncReply.fromResult(false);
+    return AsyncReply.fromResult(this.resources.delete(resourceOrPath.instance.id));
   }
 
-  move(): AsyncReply<boolean> {
-    throw new Error("MemoryStore.move is not implemented.");
+  move(resource: IResource, newPath: string): AsyncReply<boolean> {
+    if (resource.instance?.store !== this) return AsyncReply.fromResult(false);
+
+    const path = normalizeStorePath(newPath, this.instance?.name);
+    resource.instance.variables.set("link", path);
+
+    const parts = path.split("/").filter((p) => p.length > 0);
+    if (parts.length > 0) resource.instance.name = parts[parts.length - 1];
+
+    return AsyncReply.fromResult(true);
   }
 
   children<T extends IResource>(resource: IResource): AsyncBag<T> {
@@ -85,4 +105,12 @@ export class MemoryStore implements IStore {
   destroy(): void {
     for (const h of this.destroyHandlers.slice()) h(this);
   }
+}
+
+function normalizeStorePath(path: string, storeName?: string): string {
+  const normalized = path.trim().replace(/^\/+|\/+$/g, "");
+  if (!storeName) return normalized;
+  if (normalized === storeName) return "";
+  const prefix = `${storeName}/`;
+  return normalized.startsWith(prefix) ? normalized.slice(prefix.length) : normalized;
 }

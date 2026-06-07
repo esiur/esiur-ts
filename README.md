@@ -1,36 +1,77 @@
-# Esiur (TypeScript)
+# Esiur for TypeScript
 
-TypeScript port of [Esiur](https://github.com/esiur/esiur-dotnet) **v3** — a distributed object /
-resource framework with real-time property modification, asynchronous function invocation and event
-handling over the IIP/Ep binary protocol.
+TypeScript implementation of Esiur v3, a distributed resource framework for
+real-time properties, asynchronous function invocation, and events over the
+Esiur EP protocol.
 
-This package is a fresh, isomorphic (browser + Node.js) implementation that is **wire-compatible
-with esiur-dotnet v3**. It is *not* compatible with the legacy `esiur` v2 / `esiur-dart`.
+This package targets browser and Node.js clients, and includes Node.js server
+support through the optional `ws` package.
 
-> Status: **early development.** Being ported phase-by-phase from the C# reference
-> (`esiur-dotnet/Libraries/Esiur`). See `PORTING.md` for the mapping and progress.
+## Install
 
-## Design notes
+```bash
+npm install esiur
+```
 
-- **Standard TS 5 decorators** (`@Resource`, `@Export`, …) replace C#'s `[Resource] partial class`
-  source generator. No `reflect-metadata`; member element types / numeric widths are declared
-  explicitly via small type descriptors (`t.u32`, `t.list(t.string)`), which the codegen CLI emits.
-- **`AsyncReply<T>`** is `PromiseLike` (works with `await`) while keeping Esiur's extra channels
-  (progress / chunk / propagation / warning).
-- **Numerics:** `number` for ≤32-bit ints and floats, `bigint` for 64/128-bit, explicit width
-  wrappers where the wire width can't be inferred from a bare JS number.
-- **Binary I/O** on `Uint8Array` / `DataView` (little-endian wire), so the same code runs in the
-  browser and Node.
+For Node.js 18-20 clients or Node.js servers, install the optional WebSocket
+peer dependency as well:
 
-## Develop
+```bash
+npm install esiur ws
+```
+
+Node.js 21+ and browsers can use the native `WebSocket` implementation for
+clients. `EpServer` is Node-only and always uses `ws`.
+
+## Use
+
+```ts
+import { EpConnection, Warehouse } from "esiur";
+
+const connection = await EpConnection.connect("ws://127.0.0.1:10901");
+```
+
+`Warehouse.get` accepts local paths and EP URLs. A bare EP URL returns a
+connection:
+
+```ts
+const connection = await Warehouse.default.get("ep://127.0.0.1:10901");
+```
+
+An EP URL with a path returns an attached remote proxy when you provide a
+decorated resource class or `TypeTemplate`:
+
+```ts
+const resource = await Warehouse.default.get(
+  "ep://127.0.0.1:10901/sys/recovery",
+  RecoveryTestResource,
+);
+```
+
+`ep://` is transported as `ws://`; `eps://` is transported as `wss://`.
+
+## Build
 
 ```bash
 npm install
-npm run typecheck
-npm test
+npm run check
 npm run build
 ```
 
+`npm run check` runs type checking, ESLint, and the test suite. The runtime
+package supports Node.js 18+. The dev toolchain requires Node.js 18.18+.
+
+## Status
+
+The v3 TypeScript port is in active development. The current package includes
+the core async primitives, binary codec, resource model, in-memory store,
+WebSocket EP client/server transport, anonymous handshake, resource attach,
+function invocation, property updates, reconnect/reattach support, runtime
+TypeDef parsing, and `Warehouse.get` for EP URLs.
+
+Known incomplete areas include full authentication/encryption modes, direct raw
+TCP transport, persistent stores, and typed remote resource value decoding.
+
 ## License
 
-MIT © Ahmed Kh. Zamil
+MIT

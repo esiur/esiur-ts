@@ -23,7 +23,6 @@ export class EpServer {
   /** Live client connections. */
   readonly connections = new Set<EpConnection>();
 
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   private wss: any;
   private constructor(readonly warehouse: Warehouse) {}
 

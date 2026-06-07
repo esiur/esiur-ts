@@ -6,3 +6,22 @@ coverage/
 .DS_Store
 .vscode/
 .idea/
+
+# Private keys
+*.pem
+
+# .NET build artifacts
+bin/
+obj/
+*.dll
+*.exe
+*.pdb
+*.deps.json
+*.runtimeconfig.json
+*.nupkg
+*.snupkg
+TestResults/
+.vs/
+packages/
+*.user
+*.suo

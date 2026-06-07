@@ -35,7 +35,6 @@ type MetaBag = Record<symbol, unknown>;
 export function Export(type?: Tru, args?: Tru[]) {
   // Returns `any`: one decorator serves accessor/method/field positions, each of
   // which expects a different result type.
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   return function (value: unknown, context: ClassMemberDecoratorContext): any {
     const meta = context.metadata as MetaBag;
     const members = (meta[MEMBERS] ??= []) as PendingMember[];
@@ -72,7 +71,6 @@ export function Export(type?: Tru, args?: Tru[]) {
 }
 
 /** Build (and cache) the {@link TypeTemplate} for a resource class from its decorator metadata. */
-// eslint-disable-next-line @typescript-eslint/ban-types
 export function getTemplate(ctor: Function): TypeTemplate {
   const meta = (ctor as { [Symbol.metadata]?: MetaBag })[Symbol.metadata];
   if (!meta) return new TypeTemplate(ctor.name, []);

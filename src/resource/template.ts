@@ -17,6 +17,7 @@ export class ArgumentTemplate {
     public name: string,
     public type: Tru | undefined,
     public optional = false,
+    public annotations?: Map<string, string>,
   ) {}
 }
 
@@ -27,6 +28,7 @@ export class PropertyTemplate {
     public index: number,
     public valueType: Tru | undefined,
     public readOnly = false,
+    public annotations?: Map<string, string>,
   ) {}
 }
 
@@ -38,6 +40,7 @@ export class FunctionTemplate {
     public returnType: Tru | undefined,
     public args: ArgumentTemplate[] = [],
     public isStatic = false,
+    public annotations?: Map<string, string>,
   ) {}
 }
 
@@ -47,6 +50,8 @@ export class EventTemplate {
     public name: string,
     public index: number,
     public argType: Tru | undefined,
+    public annotations?: Map<string, string>,
+    public subscribable = false,
   ) {}
 }
 
@@ -57,6 +62,7 @@ export class TypeTemplate {
   constructor(
     public className: string,
     public members: MemberTemplate[],
+    public annotations?: Map<string, string>,
   ) {}
 
   get properties(): PropertyTemplate[] {

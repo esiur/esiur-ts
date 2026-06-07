@@ -1,4 +1,7 @@
 import { AsyncReply } from "../core/AsyncReply.js";
+import { AsyncException } from "../core/AsyncException.js";
+import { ErrorType } from "../core/ErrorType.js";
+import { ExceptionCode } from "../core/ExceptionCode.js";
 import { EventHandler } from "../core/EventHandler.js";
 import type { IResource, IResourceContext, IStore } from "./IResource.js";
 import { Instance } from "./Instance.js";
@@ -9,6 +12,19 @@ import { TypeDefKind, type ITypeDef } from "../data/types/ITypeDef.js";
 import { LocalTypeDef } from "./typedef.js";
 import { Record } from "./records.js";
 import type { EnumType } from "./enums.js";
+import { EpConnection, type EpConnectionOptions } from "../protocol/EpConnection.js";
+
+export interface WarehouseRemoteGetOptions extends EpConnectionOptions {
+  /** Template for the remote resource proxy. Required when the URL includes a resource path. */
+  template?: TypeTemplate;
+  /** Resource/stub constructor used to derive {@link template}. */
+  type?: Function;
+}
+
+export type WarehouseGetOptions =
+  | WarehouseRemoteGetOptions
+  | TypeTemplate
+  | Function;
 
 /** Duck-typed check for an {@link IStore}. */
 function isStore(resource: IResource): resource is IStore {
@@ -25,8 +41,9 @@ function isStore(resource: IResource): resource is IStore {
  * Central resource manager (port of C# `Warehouse`). Holds stores and active
  * resources, resolves `*nix`-style paths, and drives the resource lifecycle.
  *
- * The remote URL/protocol branch of `get` (e.g. `iip://host/path`) is added with
- * the protocol layer in Phase 5; this build resolves local paths only.
+ * `get` resolves local paths and EP URLs. A bare EP URL returns an
+ * {@link EpConnection}; an EP URL with a resource path returns an attached
+ * remote proxy when a template/stub type is supplied.
  */
 export class Warehouse {
   static readonly default = new Warehouse();
@@ -40,19 +57,16 @@ export class Warehouse {
   private opened = false;
 
   private readonly typeDefs = new Map<number, ITypeDef>();
-  // eslint-disable-next-line @typescript-eslint/ban-types
   private readonly typeDefsByCtor = new Map<Function, ITypeDef>();
   private readonly typeDefsByEnum = new Map<EnumType, ITypeDef>();
   private typeDefCounter = 0;
 
   /** Build (cached) the type template for a resource class. */
-  // eslint-disable-next-line @typescript-eslint/ban-types
   getTemplate(ctor: Function): TypeTemplate {
     return getTemplate(ctor);
   }
 
   /** Get (or lazily create) the type definition for a resource/record class. */
-  // eslint-disable-next-line @typescript-eslint/ban-types
   getLocalTypeDefByType(ctor: Function): ITypeDef {
     const existing = this.typeDefsByCtor.get(ctor);
     if (existing) return existing;
@@ -132,7 +146,7 @@ export class Warehouse {
         throw new Error("Resource is not a store; a root-level path is not allowed.");
       store = resource;
     } else {
-      const parent = await this.get(location.slice(0, -1).join("/"));
+      const parent = await this.query(location.slice(0, -1).join("/"));
       if (!parent) throw new Error("Can't find parent.");
       store = parent.instance!.store;
     }
@@ -158,11 +172,18 @@ export class Warehouse {
     return resource;
   }
 
-  /** Resolve a resource by path (local stores only for now). */
-  get<T extends IResource = IResource>(path: string): AsyncReply<T | undefined> {
-    const reply = new AsyncReply<T | undefined>();
-    this.queryAsync(path).then(
-      (r) => reply.trigger(r as T | undefined),
+  /**
+   * Resolve a local resource path or an EP URL. `ep://host:port` returns an
+   * {@link EpConnection}; `ep://host:port/path` returns an attached remote proxy
+   * when `options` supplies a {@link TypeTemplate} or resource/stub constructor.
+   */
+  get<T = IResource>(
+    path: string,
+    options?: WarehouseGetOptions,
+  ): AsyncReply<T | EpConnection | undefined> {
+    const reply = new AsyncReply<T | EpConnection | undefined>();
+    this.getAsync<T>(path, options).then(
+      (r) => reply.trigger(r),
       (e) => reply.triggerError(e),
     );
     return reply;
@@ -170,7 +191,37 @@ export class Warehouse {
 
   /** Resolve a resource by path, returning the raw resource. */
   query(path: string): AsyncReply<IResource | undefined> {
-    return this.get(path);
+    const reply = new AsyncReply<IResource | undefined>();
+    this.queryAsync(path).then(
+      (r) => reply.trigger(r),
+      (e) => reply.triggerError(e),
+    );
+    return reply;
+  }
+
+  private async getAsync<T>(
+    path: string,
+    options?: WarehouseGetOptions,
+  ): Promise<T | EpConnection | undefined> {
+    const remote = parseRemoteEpUrl(path);
+    if (remote) {
+      if (!this.opened) await this.open();
+
+      const remoteOptions = normalizeRemoteOptions(options, this);
+      const connection = await EpConnection.connect(remote.socketUrl, this, remoteOptions);
+      if (!remote.resourcePath) return connection;
+
+      if (!remoteOptions.template)
+        throw new AsyncException(
+          ErrorType.Management,
+          ExceptionCode.NotSupported,
+          "Remote Warehouse.get(path) requires a TypeTemplate or resource constructor.",
+        );
+
+      return (await connection.get(remote.resourcePath, remoteOptions.template)) as T;
+    }
+
+    return (await this.queryAsync(path)) as T | undefined;
   }
 
   private async queryAsync(path: string): Promise<IResource | undefined> {
@@ -224,4 +275,41 @@ export class Warehouse {
     }
     return true;
   }
+}
+
+interface RemoteEpUrl {
+  socketUrl: string;
+  resourcePath: string;
+}
+
+function parseRemoteEpUrl(path: string): RemoteEpUrl | undefined {
+  let url: URL;
+  try {
+    url = new URL(path);
+  } catch {
+    return undefined;
+  }
+
+  const scheme = url.protocol.slice(0, -1).toLowerCase();
+  let socketScheme: "ws" | "wss";
+  if (scheme === "ep" || scheme === "ws") socketScheme = "ws";
+  else if (scheme === "eps" || scheme === "wss") socketScheme = "wss";
+  else return undefined;
+
+  const resourcePath = decodeURIComponent(url.pathname.replace(/^\/+/, ""));
+  return {
+    socketUrl: `${socketScheme}://${url.host}`,
+    resourcePath,
+  };
+}
+
+function normalizeRemoteOptions(
+  options: WarehouseGetOptions | undefined,
+  warehouse: Warehouse,
+): WarehouseRemoteGetOptions {
+  if (!options) return {};
+  if (options instanceof TypeTemplate) return { template: options };
+  if (typeof options === "function") return { type: options, template: warehouse.getTemplate(options) };
+  const template = options.template ?? (options.type ? warehouse.getTemplate(options.type) : undefined);
+  return { ...options, template };
 }
