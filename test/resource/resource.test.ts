@@ -17,14 +17,14 @@ class HelloResource extends Resource {
   }
 }
 
-describe("resource template from decorators", () => {
+describe("resource TypeDef from decorators", () => {
   it("describes properties, functions and events", () => {
-    const tmpl = new Warehouse().getTemplate(HelloResource);
-    expect(tmpl.properties.map((p) => p.name)).toEqual(["counts"]);
-    expect(tmpl.functions.map((f) => f.name)).toEqual(["sayHi"]);
-    expect(tmpl.events.map((e) => e.name)).toEqual(["greetingReceived"]);
-    expect(tmpl.getPropertyByName("counts")?.valueType).toBeDefined();
-    expect(tmpl.getFunctionByName("sayHi")?.args.length).toBe(1);
+    const typeDef = new Warehouse().getTypeDef(HelloResource);
+    expect(typeDef.properties.map((p) => p.name)).toEqual(["counts"]);
+    expect(typeDef.functions.map((f) => f.name)).toEqual(["sayHi"]);
+    expect(typeDef.events.map((e) => e.name)).toEqual(["greetingReceived"]);
+    expect(typeDef.getPropertyByName("counts")?.valueType).toBeDefined();
+    expect(typeDef.getFunctionByName("sayHi")?.args.length).toBe(1);
   });
 });
 

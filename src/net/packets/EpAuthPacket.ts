@@ -45,7 +45,7 @@ export class EpAuthPacket {
 
     if (this.command === EpAuthPacketCommand.Initialize) {
       this.authMode = ((b >> 2) & 0x3) as AuthenticationMode;
-      this.encryptionMode = (b & 0x7) as EncryptionMode;
+      this.encryptionMode = (b & 0x3) as EncryptionMode;
     } else {
       this.method = (b & 0xdf) as EpAuthPacketMethod;
     }
@@ -73,7 +73,7 @@ export class EpAuthPacket {
       ((EpAuthPacketCommand.Initialize << 6) |
         (headersTdu ? 0x20 : 0) |
         ((authMode & 0x3) << 2) |
-        (encryptionMode & 0x7)) &
+        (encryptionMode & 0x3)) &
       0xff;
     return headersTdu ? merge(Uint8Array.of(header), headersTdu) : Uint8Array.of(header);
   }

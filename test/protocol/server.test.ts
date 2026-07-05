@@ -25,11 +25,11 @@ describe("EpServer + EpConnection.connect (end-to-end API)", () => {
     await wh.open();
 
     const server = await EpServer.listen({ port: 0, warehouse: wh });
-    const template = wh.getTemplate(Greeter);
+    const typeDef = wh.getTypeDef(Greeter);
     const greeterId = greeter.instance!.id;
 
     const client = await EpConnection.connect(`ws://127.0.0.1:${server.port}`);
-    const res = (await client.attach(greeterId, template)) as Record<string, unknown> & {
+    const res = (await client.attach(greeterId, typeDef)) as Record<string, unknown> & {
       visits: number;
       greet: (n: string) => PromiseLike<string>;
     };

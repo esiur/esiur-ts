@@ -34,7 +34,7 @@ describe("Warehouse remote EP get", () => {
     await server.close();
   });
 
-  it("returns an attached remote proxy for ep://host/path when a template is supplied", async () => {
+  it("returns an attached remote proxy for ep://host/path when a TypeDef is supplied", async () => {
     const serverWh = new Warehouse();
     await serverWh.put("sys", new MemoryStore());
     const greeter = await serverWh.put("sys/greeter", new RemoteGreeter());
@@ -42,9 +42,9 @@ describe("Warehouse remote EP get", () => {
 
     const server = await EpServer.listen({ port: 0, warehouse: serverWh });
     const clientWh = new Warehouse();
-    const template = serverWh.getTemplate(RemoteGreeter);
+    const typeDef = serverWh.getTypeDef(RemoteGreeter);
 
-    const res = (await clientWh.get(`ep://127.0.0.1:${server.port}/sys/greeter`, template)) as {
+    const res = (await clientWh.get(`ep://127.0.0.1:${server.port}/sys/greeter`, typeDef)) as {
       connection: EpConnection;
       visits: number;
       greet(name: string): PromiseLike<string>;

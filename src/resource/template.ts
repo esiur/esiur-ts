@@ -1,10 +1,8 @@
 import type { Tru } from "../data/Tru.js";
 
 /**
- * Lightweight type template describing a resource's exported members
- * (the TypeScript analogue of C# `TypeDef`/`LocalTypeDef`, built from decorator
- * metadata instead of reflection). Promoted to a full `TypeDef` when records and
- * the protocol type-registry land later in the port.
+ * Lightweight TypeDef describing a resource's exported members, built from
+ * decorator metadata instead of reflection.
  */
 export enum MemberType {
   Function = 0,
@@ -58,7 +56,7 @@ export class EventTemplate {
 export type MemberTemplate = PropertyTemplate | FunctionTemplate | EventTemplate;
 
 /** Describes the exported surface of a resource type. */
-export class TypeTemplate {
+export class TypeDef {
   constructor(
     public className: string,
     public members: MemberTemplate[],
@@ -94,3 +92,6 @@ export class TypeTemplate {
     return this.events.find((e) => e.index === index);
   }
 }
+
+/** @deprecated Use {@link TypeDef}. */
+export { TypeDef as TypeTemplate };

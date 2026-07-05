@@ -31,6 +31,37 @@ import { EpConnection, Warehouse } from "esiur";
 const connection = await EpConnection.connect("ws://127.0.0.1:10901");
 ```
 
+Password authentication uses the same `"hash"` provider model as Esiur for .NET:
+
+```ts
+import {
+  AuthenticationMode,
+  EpConnection,
+  EpConnectionContext,
+  PasswordAuthenticationProvider,
+  Warehouse,
+} from "esiur";
+
+const warehouse = new Warehouse();
+warehouse.RegisterAuthenticationProvider(new MyPasswordProvider());
+
+const connection = await warehouse.Get<EpConnection>(
+  "ep://localhost:10901",
+  new EpConnectionContext({
+    AuthenticationMode: AuthenticationMode.InitializerIdentity,
+    Identity: "alice",
+    AuthenticationProtocol: "hash",
+    Domain: "test",
+  }),
+);
+```
+
+Servers register password providers on the served warehouse:
+
+```ts
+warehouse.RegisterAuthenticationProvider(new MyPasswordProvider());
+```
+
 `Warehouse.get` accepts local paths and EP URLs. A bare EP URL returns a
 connection:
 
@@ -39,7 +70,7 @@ const connection = await Warehouse.default.get("ep://127.0.0.1:10901");
 ```
 
 An EP URL with a path returns an attached remote proxy when you provide a
-decorated resource class or `TypeTemplate`:
+decorated resource class or `TypeDef`:
 
 ```ts
 const resource = await Warehouse.default.get(
@@ -65,12 +96,13 @@ package supports Node.js 18+. The dev toolchain requires Node.js 18.18+.
 
 The v3 TypeScript port is in active development. The current package includes
 the core async primitives, binary codec, resource model, in-memory store,
-WebSocket EP client/server transport, anonymous handshake, resource attach,
-function invocation, property updates, reconnect/reattach support, runtime
-TypeDef parsing, and `Warehouse.get` for EP URLs.
+WebSocket EP client/server transport, anonymous and password-hash
+authentication handshakes, resource attach, function invocation, property
+updates, reconnect/reattach support, runtime TypeDef parsing, and
+`Warehouse.get` for EP URLs.
 
-Known incomplete areas include full authentication/encryption modes, direct raw
-TCP transport, persistent stores, and typed remote resource value decoding.
+Known incomplete areas include encrypted sessions, direct raw TCP transport,
+persistent stores, and typed remote resource value decoding.
 
 ## License
 

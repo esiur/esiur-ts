@@ -6,24 +6,27 @@ import { EventHandler } from "../core/EventHandler.js";
 import type { IResource, IResourceContext, IStore } from "./IResource.js";
 import { Instance } from "./Instance.js";
 import { ResourceOperation } from "./ResourceOperation.js";
-import { getTemplate } from "./decorators.js";
-import { TypeTemplate } from "./template.js";
+import { getTypeDef } from "./decorators.js";
+import { TypeDef } from "./template.js";
 import { TypeDefKind, type ITypeDef } from "../data/types/ITypeDef.js";
 import { LocalTypeDef } from "./typedef.js";
 import { Record } from "./records.js";
 import type { EnumType } from "./enums.js";
 import { EpConnection, type EpConnectionOptions } from "../protocol/EpConnection.js";
+import type { IAuthenticationProvider } from "../security/IAuthenticationProvider.js";
 
 export interface WarehouseRemoteGetOptions extends EpConnectionOptions {
-  /** Template for the remote resource proxy. Required when the URL includes a resource path. */
-  template?: TypeTemplate;
-  /** Resource/stub constructor used to derive {@link template}. */
+  /** TypeDef for the remote resource proxy. Required when the URL includes a resource path. */
+  typeDef?: TypeDef;
+  /** @deprecated Use {@link typeDef}. */
+  template?: TypeDef;
+  /** Resource/stub constructor used to derive {@link typeDef}. */
   type?: Function;
 }
 
 export type WarehouseGetOptions =
   | WarehouseRemoteGetOptions
-  | TypeTemplate
+  | TypeDef
   | Function;
 
 /** Duck-typed check for an {@link IStore}. */
@@ -43,7 +46,7 @@ function isStore(resource: IResource): resource is IStore {
  *
  * `get` resolves local paths and EP URLs. A bare EP URL returns an
  * {@link EpConnection}; an EP URL with a resource path returns an attached
- * remote proxy when a template/stub type is supplied.
+ * remote proxy when a TypeDef/stub type is supplied.
  */
 export class Warehouse {
   static readonly default = new Warehouse();
@@ -60,10 +63,65 @@ export class Warehouse {
   private readonly typeDefsByCtor = new Map<Function, ITypeDef>();
   private readonly typeDefsByEnum = new Map<EnumType, ITypeDef>();
   private typeDefCounter = 0;
+  private readonly authenticationProviders = new Map<string, IAuthenticationProvider>();
 
-  /** Build (cached) the type template for a resource class. */
-  getTemplate(ctor: Function): TypeTemplate {
-    return getTemplate(ctor);
+  /** Register an authentication provider under its default protocol name. */
+  registerAuthenticationProvider(provider: IAuthenticationProvider): void;
+  /** Register an authentication provider under an explicit protocol name. */
+  registerAuthenticationProvider(name: string, provider: IAuthenticationProvider): void;
+  registerAuthenticationProvider(
+    nameOrProvider: string | IAuthenticationProvider,
+    provider?: IAuthenticationProvider,
+  ): void {
+    const name = typeof nameOrProvider === "string" ? nameOrProvider : nameOrProvider.defaultName;
+    const resolved = provider ?? (nameOrProvider as IAuthenticationProvider);
+    this.authenticationProviders.set(name, resolved);
+  }
+
+  /** .NET-compatible alias for {@link registerAuthenticationProvider}. */
+  RegisterAuthenticationProvider(provider: IAuthenticationProvider): void;
+  /** .NET-compatible alias for {@link registerAuthenticationProvider}. */
+  RegisterAuthenticationProvider(name: string, provider: IAuthenticationProvider): void;
+  RegisterAuthenticationProvider(
+    nameOrProvider: string | IAuthenticationProvider,
+    provider?: IAuthenticationProvider,
+  ): void {
+    if (typeof nameOrProvider === "string")
+      this.registerAuthenticationProvider(nameOrProvider, provider!);
+    else
+      this.registerAuthenticationProvider(nameOrProvider);
+  }
+
+  /** Resolve an authentication provider by protocol name, throwing when missing. */
+  getAuthenticationProvider(name: string): IAuthenticationProvider {
+    const provider = this.tryGetAuthenticationProvider(name);
+    if (!provider) throw new Error("Authentication provider not found.");
+    return provider;
+  }
+
+  /** .NET-compatible alias for {@link getAuthenticationProvider}. */
+  GetAuthenticationProvider(name: string): IAuthenticationProvider {
+    return this.getAuthenticationProvider(name);
+  }
+
+  /** Try to resolve an authentication provider by protocol name. */
+  tryGetAuthenticationProvider(name: string): IAuthenticationProvider | undefined {
+    return this.authenticationProviders.get(name);
+  }
+
+  /** .NET-compatible alias for {@link tryGetAuthenticationProvider}. */
+  TryGetAuthenticationProvider(name: string): IAuthenticationProvider | undefined {
+    return this.tryGetAuthenticationProvider(name);
+  }
+
+  /** Build (cached) the decorated TypeDef surface for a resource class. */
+  getTypeDef(ctor: Function): TypeDef {
+    return getTypeDef(ctor);
+  }
+
+  /** @deprecated Use {@link getTypeDef}. */
+  getTemplate(ctor: Function): TypeDef {
+    return this.getTypeDef(ctor);
   }
 
   /** Get (or lazily create) the type definition for a resource/record class. */
@@ -71,7 +129,7 @@ export class Warehouse {
     const existing = this.typeDefsByCtor.get(ctor);
     if (existing) return existing;
 
-    const template = getTemplate(ctor);
+    const template = getTypeDef(ctor);
     const kind = (ctor.prototype instanceof Record)
       ? TypeDefKind.Record
       : TypeDefKind.Resource;
@@ -98,7 +156,7 @@ export class Warehouse {
       id,
       TypeDefKind.Enum,
       enumType.name,
-      new TypeTemplate(enumType.name, []),
+      new TypeDef(enumType.name, []),
       undefined,
       enumType.constants,
     );
@@ -175,7 +233,7 @@ export class Warehouse {
   /**
    * Resolve a local resource path or an EP URL. `ep://host:port` returns an
    * {@link EpConnection}; `ep://host:port/path` returns an attached remote proxy
-   * when `options` supplies a {@link TypeTemplate} or resource/stub constructor.
+   * when `options` supplies a {@link TypeDef} or resource/stub constructor.
    */
   get<T = IResource>(
     path: string,
@@ -187,6 +245,14 @@ export class Warehouse {
       (e) => reply.triggerError(e),
     );
     return reply;
+  }
+
+  /** .NET-compatible alias for {@link get}. */
+  Get<T = IResource>(
+    path: string,
+    options?: WarehouseGetOptions,
+  ): AsyncReply<T | EpConnection | undefined> {
+    return this.get<T>(path, options);
   }
 
   /** Resolve a resource by path, returning the raw resource. */
@@ -211,14 +277,14 @@ export class Warehouse {
       const connection = await EpConnection.connect(remote.socketUrl, this, remoteOptions);
       if (!remote.resourcePath) return connection;
 
-      if (!remoteOptions.template)
+      if (!remoteOptions.typeDef)
         throw new AsyncException(
           ErrorType.Management,
           ExceptionCode.NotSupported,
-          "Remote Warehouse.get(path) requires a TypeTemplate or resource constructor.",
+          "Remote Warehouse.get(path) requires a TypeDef or resource constructor.",
         );
 
-      return (await connection.get(remote.resourcePath, remoteOptions.template)) as T;
+      return (await connection.get(remote.resourcePath, remoteOptions.typeDef)) as T;
     }
 
     return (await this.queryAsync(path)) as T | undefined;
@@ -308,8 +374,8 @@ function normalizeRemoteOptions(
   warehouse: Warehouse,
 ): WarehouseRemoteGetOptions {
   if (!options) return {};
-  if (options instanceof TypeTemplate) return { template: options };
-  if (typeof options === "function") return { type: options, template: warehouse.getTemplate(options) };
-  const template = options.template ?? (options.type ? warehouse.getTemplate(options.type) : undefined);
-  return { ...options, template };
+  if (options instanceof TypeDef) return { typeDef: options };
+  if (typeof options === "function") return { type: options, typeDef: warehouse.getTypeDef(options) };
+  const typeDef = options.typeDef ?? options.template ?? (options.type ? warehouse.getTypeDef(options.type) : undefined);
+  return { ...options, typeDef, template: options.template ?? typeDef };
 }

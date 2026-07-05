@@ -1,6 +1,7 @@
 import type { Warehouse } from "../resource/Warehouse.js";
 import { WSocket } from "../net/sockets/WSocket.js";
 import { EpConnection } from "./EpConnection.js";
+import type { IAuthenticationProvider } from "../security/IAuthenticationProvider.js";
 
 export interface EpServerOptions {
   /** Port to listen on (0 = an ephemeral port). */
@@ -11,6 +12,8 @@ export interface EpServerOptions {
   warehouse: Warehouse;
   /** Accept anonymous (None-mode) peers. Default true. */
   allowUnauthorized?: boolean;
+  /** Optional authentication provider to register on the served warehouse. */
+  authenticationProvider?: IAuthenticationProvider;
 }
 
 /**
@@ -29,6 +32,8 @@ export class EpServer {
   /** Start listening and accepting connections bound to `warehouse`. */
   static async listen(options: EpServerOptions): Promise<EpServer> {
     const server = new EpServer(options.warehouse);
+    if (options.authenticationProvider)
+      options.warehouse.registerAuthenticationProvider(options.authenticationProvider);
 
     const { WebSocketServer } = await import("ws");
     const wss = new WebSocketServer({ port: options.port, host: options.host });

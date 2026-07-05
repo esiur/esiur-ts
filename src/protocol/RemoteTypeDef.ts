@@ -1,6 +1,6 @@
 import { parseSync } from "../data/Codec.js";
 import * as DC from "../data/DC.js";
-import { Tru, type Tru as TruType } from "../data/Tru.js";
+import { Tru, type RemoteTypeDefResolver, type Tru as TruType } from "../data/Tru.js";
 import {
   TypeDefKind,
   type ITypeDef,
@@ -12,7 +12,7 @@ import {
   EventTemplate,
   FunctionTemplate,
   PropertyTemplate,
-  TypeTemplate,
+  TypeDef,
 } from "../resource/template.js";
 
 export interface RemoteArgumentDef {
@@ -75,22 +75,83 @@ export interface RemoteTypeDefSnapshot {
 }
 
 export class RemoteTypeDef implements ITypeDef {
-  readonly template: TypeTemplate;
+  template = new TypeDef("", []);
 
-  private readonly cachedProperties: TypeDefProperty[];
+  private cachedProperties: TypeDefProperty[] = [];
+  private _id = 0;
+  private _kind = TypeDefKind.Resource;
+  private _name = "";
+  private _version = 0;
+  private _parentTypeId: number | undefined;
+  private _annotations: Map<string, string> | undefined;
+  private _remoteProperties: RemotePropertyDef[] = [];
+  private _remoteFunctions: RemoteFunctionDef[] = [];
+  private _remoteEvents: RemoteEventDef[] = [];
+  private _remoteConstants: RemoteConstantDef[] = [];
 
-  private constructor(
-    readonly id: number,
-    readonly kind: TypeDefKind,
-    readonly name: string,
-    readonly version: number,
-    readonly parentTypeId: number | undefined,
-    readonly annotations: Map<string, string> | undefined,
-    readonly remoteProperties: RemotePropertyDef[],
-    readonly remoteFunctions: RemoteFunctionDef[],
-    readonly remoteEvents: RemoteEventDef[],
-    readonly remoteConstants: RemoteConstantDef[],
-  ) {
+  get id(): number {
+    return this._id;
+  }
+
+  get kind(): TypeDefKind {
+    return this._kind;
+  }
+
+  get name(): string {
+    return this._name;
+  }
+
+  get version(): number {
+    return this._version;
+  }
+
+  get parentTypeId(): number | undefined {
+    return this._parentTypeId;
+  }
+
+  get annotations(): Map<string, string> | undefined {
+    return this._annotations;
+  }
+
+  get remoteProperties(): ReadonlyArray<RemotePropertyDef> {
+    return this._remoteProperties;
+  }
+
+  get remoteFunctions(): ReadonlyArray<RemoteFunctionDef> {
+    return this._remoteFunctions;
+  }
+
+  get remoteEvents(): ReadonlyArray<RemoteEventDef> {
+    return this._remoteEvents;
+  }
+
+  get remoteConstants(): ReadonlyArray<RemoteConstantDef> {
+    return this._remoteConstants;
+  }
+
+  hydrate(
+    id: number,
+    kind: TypeDefKind,
+    name: string,
+    version: number,
+    parentTypeId: number | undefined,
+    annotations: Map<string, string> | undefined,
+    remoteProperties: RemotePropertyDef[],
+    remoteFunctions: RemoteFunctionDef[],
+    remoteEvents: RemoteEventDef[],
+    remoteConstants: RemoteConstantDef[],
+  ): void {
+    this._id = id;
+    this._kind = kind;
+    this._name = name;
+    this._version = version;
+    this._parentTypeId = parentTypeId;
+    this._annotations = annotations;
+    this._remoteProperties = remoteProperties;
+    this._remoteFunctions = remoteFunctions;
+    this._remoteEvents = remoteEvents;
+    this._remoteConstants = remoteConstants;
+
     const members = [
       ...remoteProperties.map(
         (p) => new PropertyTemplate(p.name, p.index, p.valueType, false, p.annotations),
@@ -119,7 +180,7 @@ export class RemoteTypeDef implements ITypeDef {
           ),
       ),
     ];
-    this.template = new TypeTemplate(name, members, annotations);
+    this.template = new TypeDef(name, members, annotations);
     this.cachedProperties = remoteProperties.map((p) => ({
       name: p.name,
       valueType: p.valueType,
@@ -260,7 +321,8 @@ export class RemoteTypeDef implements ITypeDef {
       }
     }
 
-    return new RemoteTypeDef(
+    const typeDef = new RemoteTypeDef();
+    typeDef.hydrate(
       id,
       kind,
       name.value,
@@ -272,6 +334,151 @@ export class RemoteTypeDef implements ITypeDef {
       events,
       constants,
     );
+    return typeDef;
+  }
+
+  static async parseAsync(
+    data: Uint8Array,
+    warehouse: unknown = null,
+    remoteResolver?: RemoteTypeDefResolver,
+    requestSequence: readonly number[] | null = null,
+  ): Promise<RemoteTypeDef> {
+    return RemoteTypeDef.parseAsyncInto(
+      new RemoteTypeDef(),
+      data,
+      warehouse,
+      remoteResolver,
+      requestSequence,
+    );
+  }
+
+  static async parseAsyncInto(
+    target: RemoteTypeDef,
+    data: Uint8Array,
+    warehouse: unknown = null,
+    remoteResolver?: RemoteTypeDefResolver,
+    requestSequence: readonly number[] | null = null,
+  ): Promise<RemoteTypeDef> {
+    let offset = 0;
+    const flags = data[offset++];
+    const hasParent = (flags & 0x80) > 0;
+    const hasClassAnnotation = (flags & 0x40) > 0;
+    const kind = (flags & 0x0f) as TypeDefKind;
+
+    const id = Number(DC.getUint64(data, offset));
+    offset += 8;
+
+    const name = readName(data, offset);
+    offset = name.offset;
+
+    let parentTypeId: number | undefined;
+    if (hasParent) {
+      parentTypeId = Number(DC.getUint64(data, offset));
+      offset += 8;
+    }
+
+    let annotations: Map<string, string> | undefined;
+    if (hasClassAnnotation) {
+      const parsed = parseSync(data, offset, warehouse);
+      annotations = asStringMap(parsed.value);
+      offset += parsed.length;
+    }
+
+    const version = DC.getInt32(data, offset);
+    offset += 4;
+    const memberCount = DC.getUint16(data, offset);
+    offset += 2;
+
+    const functions: RemoteFunctionDef[] = [];
+    const properties: RemotePropertyDef[] = [];
+    const events: RemoteEventDef[] = [];
+    const constants: RemoteConstantDef[] = [];
+
+    target.hydrate(
+      id,
+      kind,
+      name.value,
+      version,
+      parentTypeId,
+      annotations,
+      properties,
+      functions,
+      events,
+      constants,
+    );
+
+    let functionIndex = 0;
+    let propertyIndex = 0;
+    let eventIndex = 0;
+    let constantIndex = 0;
+
+    for (let i = 0; i < memberCount; i++) {
+      const inherited = (data[offset] & 0x80) > 0;
+      const memberType = (data[offset] >> 5) & 0x3;
+      if (memberType === 0) {
+        const parsed = await parseFunctionAsync(
+          data,
+          offset,
+          functionIndex++,
+          inherited,
+          warehouse,
+          remoteResolver,
+          requestSequence,
+        );
+        functions.push(parsed.value);
+        offset = parsed.offset;
+      } else if (memberType === 1) {
+        const parsed = await parsePropertyAsync(
+          data,
+          offset,
+          propertyIndex++,
+          inherited,
+          warehouse,
+          remoteResolver,
+          requestSequence,
+        );
+        properties.push(parsed.value);
+        offset = parsed.offset;
+      } else if (memberType === 2) {
+        const parsed = await parseEventAsync(
+          data,
+          offset,
+          eventIndex++,
+          inherited,
+          warehouse,
+          remoteResolver,
+          requestSequence,
+        );
+        events.push(parsed.value);
+        offset = parsed.offset;
+      } else {
+        const parsed = await parseConstantAsync(
+          data,
+          offset,
+          constantIndex++,
+          inherited,
+          warehouse,
+          remoteResolver,
+          requestSequence,
+        );
+        constants.push(parsed.value);
+        offset = parsed.offset;
+      }
+    }
+
+    target.hydrate(
+      id,
+      kind,
+      name.value,
+      version,
+      parentTypeId,
+      annotations,
+      properties,
+      functions,
+      events,
+      constants,
+    );
+    return target;
   }
 }
 
@@ -296,6 +503,67 @@ function parseFunction(
   const args: RemoteArgumentDef[] = [];
   for (let i = 0; i < argsCount; i++) {
     const parsed = parseArgument(data, offset, i, warehouse);
+    args.push(parsed.value);
+    offset = parsed.offset;
+  }
+
+  let annotations: Map<string, string> | undefined;
+  if (hasAnnotations) {
+    const parsed = parseAnnotationMap(data, offset, warehouse, true);
+    annotations = parsed.value;
+    offset = parsed.offset;
+  }
+
+  return {
+    value: {
+      index,
+      name: name.value,
+      returnType: returnType.value,
+      arguments: args,
+      inherited,
+      isStatic,
+      annotations,
+    },
+    offset,
+  };
+}
+
+async function parseFunctionAsync(
+  data: Uint8Array,
+  offset: number,
+  index: number,
+  inherited: boolean,
+  warehouse: unknown,
+  remoteResolver: RemoteTypeDefResolver | undefined,
+  requestSequence: readonly number[] | null,
+): Promise<{ value: RemoteFunctionDef; offset: number }> {
+  const header = data[offset++];
+  const isStatic = (header & 0x04) > 0;
+  const hasAnnotations = (header & 0x10) > 0;
+
+  const name = readName(data, offset);
+  offset = name.offset;
+
+  const returnType = await Tru.parseAsync(
+    data,
+    offset,
+    warehouse,
+    remoteResolver,
+    requestSequence,
+  );
+  offset += returnType.size;
+
+  const argsCount = data[offset++];
+  const args: RemoteArgumentDef[] = [];
+  for (let i = 0; i < argsCount; i++) {
+    const parsed = await parseArgumentAsync(
+      data,
+      offset,
+      i,
+      warehouse,
+      remoteResolver,
+      requestSequence,
+    );
     args.push(parsed.value);
     offset = parsed.offset;
   }
@@ -360,6 +628,53 @@ function parseProperty(
   };
 }
 
+async function parsePropertyAsync(
+  data: Uint8Array,
+  offset: number,
+  index: number,
+  inherited: boolean,
+  warehouse: unknown,
+  remoteResolver: RemoteTypeDefResolver | undefined,
+  requestSequence: readonly number[] | null,
+): Promise<{ value: RemotePropertyDef; offset: number }> {
+  const header = data[offset++];
+  const hasAnnotations = (header & 0x08) > 0;
+  const hasHistory = (header & 0x01) > 0;
+  const permission = (header >> 1) & 0x03;
+
+  const name = readName(data, offset);
+  offset = name.offset;
+
+  const valueType = await Tru.parseAsync(
+    data,
+    offset,
+    warehouse,
+    remoteResolver,
+    requestSequence,
+  );
+  offset += valueType.size;
+
+  let annotations: Map<string, string> | undefined;
+  if (hasAnnotations) {
+    const parsed = parseAnnotationMap(data, offset, warehouse, true);
+    annotations = parsed.value;
+    offset = parsed.offset;
+  }
+
+  return {
+    value: {
+      index,
+      name: name.value,
+      valueType: valueType.value,
+      inherited,
+      permission,
+      hasHistory,
+      annotations,
+    },
+    offset,
+  };
+}
+
 function parseEvent(
   data: Uint8Array,
   offset: number,
@@ -375,6 +690,51 @@ function parseEvent(
   offset = name.offset;
 
   const argType = Tru.parseSync(data, offset, warehouse);
+  offset += argType.size;
+
+  let annotations: Map<string, string> | undefined;
+  if (hasAnnotations) {
+    const parsed = parseAnnotationMap(data, offset, warehouse, true);
+    annotations = parsed.value;
+    offset = parsed.offset;
+  }
+
+  return {
+    value: {
+      index,
+      name: name.value,
+      argumentType: argType.value,
+      inherited,
+      subscribable,
+      annotations,
+    },
+    offset,
+  };
+}
+
+async function parseEventAsync(
+  data: Uint8Array,
+  offset: number,
+  index: number,
+  inherited: boolean,
+  warehouse: unknown,
+  remoteResolver: RemoteTypeDefResolver | undefined,
+  requestSequence: readonly number[] | null,
+): Promise<{ value: RemoteEventDef; offset: number }> {
+  const header = data[offset++];
+  const hasAnnotations = (header & 0x10) > 0;
+  const subscribable = (header & 0x08) > 0;
+
+  const name = readName(data, offset);
+  offset = name.offset;
+
+  const argType = await Tru.parseAsync(
+    data,
+    offset,
+    warehouse,
+    remoteResolver,
+    requestSequence,
+  );
   offset += argType.size;
 
   let annotations: Map<string, string> | undefined;
@@ -432,6 +792,49 @@ function parseArgument(
   };
 }
 
+async function parseArgumentAsync(
+  data: Uint8Array,
+  offset: number,
+  index: number,
+  warehouse: unknown,
+  remoteResolver: RemoteTypeDefResolver | undefined,
+  requestSequence: readonly number[] | null,
+): Promise<{ value: RemoteArgumentDef; offset: number }> {
+  const header = data[offset++];
+  const optional = (header & 0x01) > 0;
+  const hasAnnotations = (header & 0x02) > 0;
+
+  const name = readName(data, offset);
+  offset = name.offset;
+
+  const type = await Tru.parseAsync(
+    data,
+    offset,
+    warehouse,
+    remoteResolver,
+    requestSequence,
+  );
+  offset += type.size;
+
+  let annotations: Map<string, string> | undefined;
+  if (hasAnnotations) {
+    const parsed = parseSync(data, offset, warehouse);
+    annotations = asStringMap(parsed.value);
+    offset += parsed.length;
+  }
+
+  return {
+    value: {
+      index,
+      name: name.value,
+      type: type.value,
+      optional,
+      annotations,
+    },
+    offset,
+  };
+}
+
 function parseConstant(
   data: Uint8Array,
   offset: number,
@@ -446,6 +849,53 @@ function parseConstant(
   offset = name.offset;
 
   const valueType = Tru.parseSync(data, offset, warehouse);
+  offset += valueType.size;
+
+  const value = parseSync(data, offset, warehouse);
+  offset += value.length;
+
+  let annotations: Map<string, string> | undefined;
+  if (hasAnnotations) {
+    const parsed = parseSync(data, offset, warehouse);
+    annotations = asStringMap(parsed.value);
+    offset += parsed.length;
+  }
+
+  return {
+    value: {
+      index,
+      name: name.value,
+      valueType: valueType.value,
+      value: value.value,
+      inherited,
+      annotations,
+    },
+    offset,
+  };
+}
+
+async function parseConstantAsync(
+  data: Uint8Array,
+  offset: number,
+  index: number,
+  inherited: boolean,
+  warehouse: unknown,
+  remoteResolver: RemoteTypeDefResolver | undefined,
+  requestSequence: readonly number[] | null,
+): Promise<{ value: RemoteConstantDef; offset: number }> {
+  const header = data[offset++];
+  const hasAnnotations = (header & 0x10) > 0;
+
+  const name = readName(data, offset);
+  offset = name.offset;
+
+  const valueType = await Tru.parseAsync(
+    data,
+    offset,
+    warehouse,
+    remoteResolver,
+    requestSequence,
+  );
   offset += valueType.size;
 
   const value = parseSync(data, offset, warehouse);

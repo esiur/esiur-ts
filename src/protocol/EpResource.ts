@@ -1,6 +1,6 @@
 import { EventHandler } from "../core/EventHandler.js";
 import type { AsyncReply } from "../core/AsyncReply.js";
-import type { TypeTemplate } from "../resource/template.js";
+import type { TypeDef } from "../resource/template.js";
 import type { EpConnection } from "./EpConnection.js";
 
 /** Notification payload for a remote property change. */
@@ -29,7 +29,7 @@ export interface EpResourceOptions {
 
 /**
  * A remote resource proxy (port of C# `EpResource`). Wraps a connection +
- * instance id + type template; exported functions invoke remotely, exported
+ * instance id + TypeDef; exported functions invoke remotely, exported
  * properties read from a locally-cached value (kept fresh by PropertyModified
  * notifications), and exported events surface via {@link eventOccurred}.
  *
@@ -56,13 +56,18 @@ export class EpResource {
   constructor(
     readonly connection: EpConnection,
     public instanceId: number,
-    readonly template: TypeTemplate,
+    readonly typeDef: TypeDef,
     options: EpResourceOptions = {},
   ) {
     this.typeDefId = options.typeDefId;
     this.age = options.age ?? 0;
     this.link = options.link ?? "";
     this.hops = options.hops ?? 0;
+  }
+
+  /** @deprecated Use {@link typeDef}. */
+  get template(): TypeDef {
+    return this.typeDef;
   }
 
   /** @internal Update resource-level metadata returned by attach/reattach. */
@@ -106,13 +111,13 @@ export class EpResource {
       if (age > this.age) this.age = age;
     }
     if (date != null) this.propertyModificationDates.set(index, date);
-    const pt = this.template.getPropertyByIndex(index);
+    const pt = this.typeDef.getPropertyByIndex(index);
     if (pt) this.propertyModified.emit({ name: pt.name, index, value, age, date });
   }
 
   /** @internal Apply an event occurrence pushed by the server. */
   applyEvent(index: number, value: unknown): void {
-    const et = this.template.getEventByIndex(index);
+    const et = this.typeDef.getEventByIndex(index);
     if (et) this.eventOccurred.emit({ name: et.name, index, value });
   }
 
@@ -125,12 +130,12 @@ export class EpResource {
 const proxyHandler: ProxyHandler<EpResource> = {
   get(target, prop, receiver) {
     if (typeof prop === "string" && !(prop in target)) {
-      const fn = target.template.getFunctionByName(prop);
+      const fn = target.typeDef.getFunctionByName(prop);
       if (fn) {
         return (...args: unknown[]): AsyncReply =>
           target.connection.invoke(target.instanceId, fn.index, ...args);
       }
-      const pt = target.template.getPropertyByName(prop);
+      const pt = target.typeDef.getPropertyByName(prop);
       if (pt) return target.cache.get(pt.index);
     }
     return Reflect.get(target, prop, receiver);
@@ -138,7 +143,7 @@ const proxyHandler: ProxyHandler<EpResource> = {
 
   set(target, prop, value, receiver) {
     if (typeof prop === "string") {
-      const pt = target.template.getPropertyByName(prop);
+      const pt = target.typeDef.getPropertyByName(prop);
       if (pt) {
         target.connection.set(target.instanceId, pt.index, value);
         target.cache.set(pt.index, value);

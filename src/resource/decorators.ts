@@ -6,7 +6,7 @@ import {
   FunctionTemplate,
   MemberType,
   PropertyTemplate,
-  TypeTemplate,
+  TypeDef,
   type MemberTemplate,
 } from "./template.js";
 
@@ -70,12 +70,12 @@ export function Export(type?: Tru, args?: Tru[]) {
   };
 }
 
-/** Build (and cache) the {@link TypeTemplate} for a resource class from its decorator metadata. */
-export function getTemplate(ctor: Function): TypeTemplate {
+/** Build (and cache) the decorated {@link TypeDef} surface for a resource class. */
+export function getTypeDef(ctor: Function): TypeDef {
   const meta = (ctor as { [Symbol.metadata]?: MetaBag })[Symbol.metadata];
-  if (!meta) return new TypeTemplate(ctor.name, []);
+  if (!meta) return new TypeDef(ctor.name, []);
 
-  const cached = meta[TEMPLATE] as TypeTemplate | undefined;
+  const cached = meta[TEMPLATE] as TypeDef | undefined;
   if (cached && cached.className === ctor.name) return cached;
 
   const pending = (meta[MEMBERS] as PendingMember[] | undefined) ?? [];
@@ -96,9 +96,14 @@ export function getTemplate(ctor: Function): TypeTemplate {
     return new EventTemplate(m.name, eventIndex++, m.type);
   });
 
-  const template = new TypeTemplate(ctor.name, members);
+  const template = new TypeDef(ctor.name, members);
   meta[TEMPLATE] = template;
   return template;
+}
+
+/** @deprecated Use {@link getTypeDef}. */
+export function getTemplate(ctor: Function): TypeDef {
+  return getTypeDef(ctor);
 }
 
 /**

@@ -19,14 +19,14 @@ describe("EpConnection reattach + auto reconnect", () => {
     await wh.open();
 
     const server = await EpServer.listen({ port: 0, warehouse: wh });
-    const template = wh.getTemplate(CounterResource);
+    const typeDef = wh.getTypeDef(CounterResource);
     const counterId = counter.instance!.id;
 
     const client = await EpConnection.connect(`ws://127.0.0.1:${server.port}`, {
       autoReconnect: true,
       reconnectInterval: 20,
     });
-    const res = (await client.attach(counterId, template)) as {
+    const res = (await client.attach(counterId, typeDef)) as {
       counts: number;
       age: number;
       getAge(index: number): number;

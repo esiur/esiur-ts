@@ -153,7 +153,7 @@ function typedObjectParser(tdu: ParsedTdu, typeDef: ITypeDef, warehouse: unknown
   throw new Error("Typed resource parsing is not supported yet.");
 }
 
-/** Decode a record TDU: parse each property in template order, then build the instance. */
+/** Decode a record TDU: parse each property in TypeDef order, then build the instance. */
 function recordParser(tdu: ParsedTdu, typeDef: ITypeDef, warehouse: unknown): object {
   const values: unknown[] = [];
   let offset = tdu.payloadOffset;

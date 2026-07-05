@@ -1,7 +1,7 @@
 import { EventHandler } from "../core/EventHandler.js";
 import type { IResource, IStore } from "./IResource.js";
 import type { Warehouse } from "./Warehouse.js";
-import type { TypeTemplate, PropertyTemplate, EventTemplate } from "./template.js";
+import type { TypeDef, PropertyTemplate, EventTemplate } from "./template.js";
 import { EventSource } from "./decorators.js";
 
 /** Payload for {@link Instance.propertyModified}. */
@@ -21,14 +21,14 @@ export interface EventOccurredInfo {
 
 /**
  * Manages a resource's identity and state (port of C# `Instance`): id, name,
- * owning store, type template, per-property age/modification date, and the
+ * owning store, TypeDef, per-property age/modification date, and the
  * property-change / event notification channels.
  */
 export class Instance {
   readonly warehouse: Warehouse;
   readonly id: number;
   name: string;
-  readonly definition: TypeTemplate;
+  readonly definition: TypeDef;
   readonly variables = new Map<string, unknown>();
 
   readonly propertyModified = new EventHandler<PropertyModificationInfo>();
@@ -58,7 +58,7 @@ export class Instance {
     this.store_ = store;
     this.resourceRef = new WeakRef(resource);
     this.instanceAge = age;
-    this.definition = warehouse.getTemplate(resource.constructor);
+    this.definition = warehouse.getTypeDef(resource.constructor);
 
     for (let i = 0; i < this.definition.properties.length; i++) {
       this.ages.push(0);
@@ -129,7 +129,7 @@ export class Instance {
     this.propertyModified.emit({ resource: res, property, value, age: this.instanceAge });
   }
 
-  /** Raise an exported event by its template index. */
+  /** Raise an exported event by its TypeDef index. */
   emitEventByIndex(index: number, value: unknown): void {
     const res = this.resource;
     if (!res) return;

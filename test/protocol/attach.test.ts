@@ -26,7 +26,7 @@ describe("EpConnection attach + proxy + notifications (TS ↔ TS)", () => {
     const hello = await wh.put("sys/hello", new HelloResource());
     await wh.open();
     const helloId = hello.instance!.id;
-    const template = wh.getTemplate(HelloResource); // the client "knows" the type (generated stub)
+    const typeDef = wh.getTypeDef(HelloResource); // the client "knows" the TypeDef (generated stub)
 
     const wss = new WebSocketServer({ port: 0 });
     await new Promise<void>((r) => wss.on("listening", () => r()));
@@ -43,7 +43,7 @@ describe("EpConnection attach + proxy + notifications (TS ↔ TS)", () => {
     await sock.connect(`ws://127.0.0.1:${port}`);
 
     // attach → dynamic proxy primed with current property values
-    const res = (await client.attach(helloId, template)) as Record<string, unknown> & {
+    const res = (await client.attach(helloId, typeDef)) as Record<string, unknown> & {
       counts: number;
       sayHi: (m: string) => PromiseLike<string>;
       propertyModified: { add(cb: (c: RemotePropertyChange) => void): void };

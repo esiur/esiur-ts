@@ -31,10 +31,10 @@ describe("EpConnection remote invoke (TS ↔ TS)", () => {
     await wh.open();
 
     const helloId = hello.instance!.id;
-    const tmpl = wh.getTemplate(HelloResource);
-    const sayHiIndex = tmpl.getFunctionByName("sayHi")!.index;
-    const addIndex = tmpl.getFunctionByName("add")!.index;
-    const countsIndex = tmpl.getPropertyByName("counts")!.index;
+    const typeDef = wh.getTypeDef(HelloResource);
+    const sayHiIndex = typeDef.getFunctionByName("sayHi")!.index;
+    const addIndex = typeDef.getFunctionByName("add")!.index;
+    const countsIndex = typeDef.getPropertyByName("counts")!.index;
 
     const wss = new WebSocketServer({ port: 0 });
     await new Promise<void>((r) => wss.on("listening", () => r()));

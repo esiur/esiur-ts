@@ -5,6 +5,11 @@ import { registerTruParser } from "./ParsedTdu.js";
 import type { ComposableTru } from "./Tdu.js";
 import type { ITypeDef } from "./types/ITypeDef.js";
 
+export type RemoteTypeDefResolver = (
+  id: number,
+  requestSequence: readonly number[] | null,
+) => ITypeDef | PromiseLike<ITypeDef>;
+
 /**
  * Type-Representation Unit (port of C# `Tru`). Describes how a value's type maps
  * onto the wire. Because TypeScript has no runtime reflection, Trus are built
@@ -57,6 +62,47 @@ export abstract class Tru implements ComposableTru {
       const subTypes: Tru[] = [];
       for (let i = 0; i < subsCount; i++) {
         const pr = Tru.parseSync(data, offset, warehouse);
+        subTypes.push(pr.value);
+        offset += pr.size;
+      }
+      return { value: new TruComposite(identifier, nullable, subTypes), size: offset - start };
+    }
+
+    return { value: new TruPrimitive(identifier, nullable), size: 1 };
+  }
+
+  /** Async parser variant used when remote TypeDef references may need fetching. */
+  static async parseAsync(
+    data: Uint8Array,
+    offset: number,
+    warehouse: unknown = null,
+    remoteResolver?: RemoteTypeDefResolver,
+    requestSequence: readonly number[] | null = null,
+  ): Promise<{ value: Tru; size: number }> {
+    const start = offset;
+    const header = data[offset++];
+    const nullable = (header & 0x80) > 0;
+    const identifier = (header & 0x7f) as TruIdentifier;
+
+    if ((header & 0x40) > 0) {
+      const subsCount = (header >> 3) & 0x7;
+      if (subsCount === 0) {
+        const ref = readTypeDefId(data, offset, identifier);
+        const typeDef = ref.remote
+          ? await resolveRemoteTypeDef(remoteResolver, ref.id, requestSequence)
+          : typeDefResolver(warehouse, ref.id);
+        return { value: new TruTypeDef(nullable, typeDef), size: 1 + ref.size };
+      }
+
+      const subTypes: Tru[] = [];
+      for (let i = 0; i < subsCount; i++) {
+        const pr = await Tru.parseAsync(
+          data,
+          offset,
+          warehouse,
+          remoteResolver,
+          requestSequence,
+        );
         subTypes.push(pr.value);
         offset += pr.size;
       }
@@ -158,6 +204,16 @@ function readTypeDefId(
     default:
       throw new Error("Invalid Tru typedef identifier.");
   }
+}
+
+async function resolveRemoteTypeDef(
+  resolver: RemoteTypeDefResolver | undefined,
+  id: number,
+  requestSequence: readonly number[] | null,
+): Promise<ITypeDef> {
+  if (!resolver)
+    throw new Error("Remote type definitions require a connection.");
+  return await resolver(id, requestSequence);
 }
 
 /** A Tru referencing a registered type definition (record/enum/resource). */

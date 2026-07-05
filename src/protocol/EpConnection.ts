@@ -12,7 +12,7 @@ import { EpPacketReply } from "../net/packets/EpPacketReply.js";
 import { EpPacketNotification } from "../net/packets/EpPacketNotification.js";
 import type { PlainTdu } from "../data/PlainTdu.js";
 import { compose, parse, parseSync } from "../data/Codec.js";
-import { merge } from "../data/DC.js";
+import { getUint64, merge } from "../data/DC.js";
 import { typedMap } from "../data/descriptors.js";
 import { t } from "../data/descriptors.js";
 import { u8 } from "../data/widths.js";
@@ -24,8 +24,15 @@ import { EpAuthPacketMethod } from "../net/packets/EpAuthPacketMethod.js";
 import { EpAuthPacketHeader } from "../net/packets/EpAuthPacketHeader.js";
 import { AuthenticationMode } from "../security/AuthenticationMode.js";
 import { EncryptionMode } from "../security/EncryptionMode.js";
+import { AuthenticationDirection } from "../security/AuthenticationDirection.js";
+import { AuthenticationMaterialType } from "../security/AuthenticationMaterialType.js";
+import { AuthenticationResult } from "../security/AuthenticationResult.js";
+import { AuthenticationRuling } from "../security/AuthenticationRuling.js";
+import type { AuthenticationSession } from "../security/AuthenticationSession.js";
+import type { IAuthenticationHandler } from "../security/IAuthenticationHandler.js";
+import type { IAuthenticationProvider } from "../security/IAuthenticationProvider.js";
 import type { Warehouse } from "../resource/Warehouse.js";
-import type { TypeTemplate } from "../resource/template.js";
+import type { TypeDef } from "../resource/template.js";
 import { EpResource, type RemotePropertyValue } from "./EpResource.js";
 import { RemoteTypeDef } from "./RemoteTypeDef.js";
 
@@ -47,8 +54,52 @@ export type NotificationHandler = (
 export interface EpConnectionOptions {
   /** Reconnect automatically after an unexpected client-side disconnect. */
   autoReconnect?: boolean;
+  /** .NET-compatible alias for {@link autoReconnect}. */
+  AutoReconnect?: boolean;
   /** Delay between reconnect attempts, in milliseconds. */
   reconnectInterval?: number;
+  /** .NET-compatible alias for {@link reconnectInterval}. */
+  ReconnectInterval?: number;
+  /** Authentication mode requested by the initiator. Default `None`. */
+  authenticationMode?: AuthenticationMode;
+  /** .NET-compatible alias for {@link authenticationMode}. */
+  AuthenticationMode?: AuthenticationMode;
+  /** Authentication protocol name. Default `"hash"`. */
+  authenticationProtocol?: string;
+  /** .NET-compatible alias for {@link authenticationProtocol}. */
+  AuthenticationProtocol?: string;
+  /** Provider used to create the initiator authentication handler. */
+  authenticationProvider?: IAuthenticationProvider;
+  /** PascalCase alias for {@link authenticationProvider}. */
+  AuthenticationProvider?: IAuthenticationProvider;
+  /** Initiator identity for protocols that need one. */
+  identity?: string;
+  /** .NET-compatible alias for {@link identity}. */
+  Identity?: string;
+  /** Optional responder identity for protocols that need one. */
+  responderIdentity?: string;
+  /** PascalCase alias for {@link responderIdentity}. */
+  ResponderIdentity?: string;
+  /** Remote domain. Defaults to the WebSocket host. */
+  domain?: string;
+  /** .NET-compatible alias for {@link domain}. */
+  Domain?: string;
+}
+
+/** .NET-compatible connection context accepted by `Warehouse.get` and `EpConnection.connect`. */
+export class EpConnectionContext implements EpConnectionOptions {
+  AutoReconnect?: boolean;
+  ReconnectInterval?: number;
+  AuthenticationMode?: AuthenticationMode;
+  AuthenticationProtocol?: string;
+  AuthenticationProvider?: IAuthenticationProvider;
+  Identity?: string;
+  ResponderIdentity?: string;
+  Domain?: string;
+
+  constructor(options?: EpConnectionOptions) {
+    if (options) Object.assign(this, options);
+  }
 }
 
 export interface EpReconnectMetrics {
@@ -59,15 +110,19 @@ export interface EpReconnectMetrics {
   failedResources: number;
 }
 
+interface TypeDefFetchRequestInfo {
+  reply: AsyncReply<RemoteTypeDef>;
+  requestSequence: number[];
+}
+
 /**
  * IIP/Ep connection — request/reply correlation and packet dispatch
  * (the backbone of C# `EpConnection`/`EpConnectionProtocol`).
  *
- * This build implements the request/reply engine and reply decoding. The full
- * resource operations (attach/get/set/invoke handlers), the authentication
- * handshake, and the remote-resource proxy are layered on next; for now incoming
- * requests/notifications are surfaced via {@link onRequest}/{@link onNotification}
- * so the engine can be driven and tested end-to-end.
+ * This build implements the request/reply engine, SHA3 password-hash
+ * authentication, resource operations, and reply decoding. Incoming
+ * requests/notifications can still be surfaced via {@link onRequest}/
+ * {@link onNotification} for custom protocol handlers.
  */
 export class EpConnection extends NetworkConnection {
   /** Warehouse used to resolve types/resources during (de)serialization. */
@@ -84,6 +139,14 @@ export class EpConnection extends NetworkConnection {
 
   /** Remote resources attached through this connection (instance id → proxy state). */
   private readonly attachedResources = new Map<number, EpResource>();
+  /** Remote TypeDefs currently needed by an in-flight parse (type id to placeholder). */
+  private readonly neededTypeDefs = new Map<number, RemoteTypeDef>();
+  /** Fully parsed remote TypeDefs (type id to definition). */
+  private readonly cachedTypeDefs = new Map<number, RemoteTypeDef>();
+  /** In-flight TypeDef fetches, used to share work and detect recursive cycles. */
+  private readonly typeDefRequests = new Map<number, TypeDefFetchRequestInfo>();
+  /** Wait-for graph for in-flight remote TypeDef parsing. */
+  private readonly typeDefsFetchBlockedOn = new Map<number, Set<number>>();
   /** Server-side notification subscriptions (instance id → unsubscribe). */
   private readonly subscriptions = new Map<number, () => void>();
 
@@ -95,10 +158,24 @@ export class EpConnection extends NetworkConnection {
    * `EpServer` switch it off to run the (anonymous) handshake first.
    */
   private authenticated = true;
+  private authSessionEstablished = true;
   private direction: "initiator" | "responder" | null = null;
   private readonly authPacket = new EpAuthPacket();
   private readyReply?: AsyncReply;
   private domain = "";
+  private hostName: string | null = null;
+  private authenticationMode = AuthenticationMode.None;
+  private encryptionMode = EncryptionMode.None;
+  private authenticationProtocol = "hash";
+  private authenticationProvider?: IAuthenticationProvider;
+  private authenticationHandler?: IAuthenticationHandler;
+  private localIdentity: string | null = null;
+  private remoteIdentity: string | null = null;
+  private responderIdentity: string | null = null;
+  private sessionKey: Uint8Array | null = null;
+  private readonly localHeaders = new Map<EpAuthPacketHeader, unknown>();
+  private readonly remoteHeaders = new Map<EpAuthPacketHeader, unknown>();
+  private readonly variables = new Map<string, unknown>();
   /** Responder: accept unauthenticated (anonymous, None-mode) peers. */
   allowUnauthorized = true;
   /** Reconnect automatically after an unexpected client-side disconnect. */
@@ -107,6 +184,26 @@ export class EpConnection extends NetworkConnection {
   reconnectInterval = 5000;
   /** Metrics from the most recent reconnect attempt. */
   lastReconnectMetrics?: EpReconnectMetrics;
+
+  /** True once the authentication phase has completed. */
+  get isAuthenticated(): boolean {
+    return this.authenticated;
+  }
+
+  /** Local identity reported by the authentication handler. */
+  get localAuthenticationIdentity(): string | null {
+    return this.localIdentity;
+  }
+
+  /** Remote identity reported by the authentication handler. */
+  get remoteAuthenticationIdentity(): string | null {
+    return this.remoteIdentity;
+  }
+
+  /** Derived session key, when the selected authentication protocol creates one. */
+  get authenticationSessionKey(): Uint8Array | null {
+    return this.sessionKey;
+  }
 
   private reconnectUrl?: string;
   private reconnectTimer?: ReturnType<typeof setTimeout>;
@@ -117,15 +214,27 @@ export class EpConnection extends NetworkConnection {
   /** Begin the client-side handshake; resolves via {@link whenReady}. */
   startInitiatorHandshake(domain = ""): void {
     this.authenticated = false;
+    this.authSessionEstablished = false;
     this.direction = "initiator";
-    this.domain = domain;
+    if (domain) this.domain = domain;
+    this.authenticationHandler = undefined;
+    this.remoteHeaders.clear();
+    this.localHeaders.clear();
+    if (this.domain) this.localHeaders.set(EpAuthPacketHeader.Domain, this.domain);
     this.readyReply = new AsyncReply();
   }
 
   /** Begin the server-side handshake (waits for the peer's Initialize). */
   startResponderHandshake(): void {
     this.authenticated = false;
+    this.authSessionEstablished = false;
     this.direction = "responder";
+    this.authenticationHandler = undefined;
+    this.remoteHeaders.clear();
+    this.localHeaders.clear();
+    this.localIdentity = null;
+    this.remoteIdentity = null;
+    this.sessionKey = null;
   }
 
   /** Resolves when the handshake completes (initiator side). */
@@ -153,15 +262,31 @@ export class EpConnection extends NetworkConnection {
 
   private applyOptions(options?: EpConnectionOptions): void {
     if (!options) return;
-    if (options.autoReconnect != null) this.autoReconnect = options.autoReconnect;
-    if (options.reconnectInterval != null) this.reconnectInterval = options.reconnectInterval;
+    const autoReconnect = options.autoReconnect ?? options.AutoReconnect;
+    const reconnectInterval = options.reconnectInterval ?? options.ReconnectInterval;
+    const authenticationMode = options.authenticationMode ?? options.AuthenticationMode;
+    const authenticationProtocol = options.authenticationProtocol ?? options.AuthenticationProtocol;
+    const authenticationProvider = options.authenticationProvider ?? options.AuthenticationProvider;
+    const identity = options.identity ?? options.Identity;
+    const responderIdentity = options.responderIdentity ?? options.ResponderIdentity;
+    const domain = options.domain ?? options.Domain;
+
+    if (autoReconnect != null) this.autoReconnect = autoReconnect;
+    if (reconnectInterval != null) this.reconnectInterval = reconnectInterval;
+    if (authenticationMode != null) this.authenticationMode = authenticationMode;
+    if (authenticationProtocol != null) this.authenticationProtocol = authenticationProtocol;
+    if (authenticationProvider != null) this.authenticationProvider = authenticationProvider;
+    if (identity != null) this.localIdentity = identity;
+    if (responderIdentity != null) this.responderIdentity = responderIdentity;
+    if (domain != null) this.domain = domain;
   }
 
   private async openClientSocket(url: string): Promise<void> {
     this.reconnectUrl = url;
     this.manualClose = false;
     try {
-      this.domain = new URL(url).hostname;
+      this.hostName = new URL(url).hostname;
+      if (!this.domain) this.domain = this.hostName;
     } catch {
       /* leave domain empty */
     }
@@ -173,38 +298,360 @@ export class EpConnection extends NetworkConnection {
     await this.whenReady();
   }
 
-  /** Send the initiator's Initialize packet (anonymous, None auth/encryption). */
+  /** Send the initiator's Initialize packet. */
   private declare(): void {
-    const headers = compose(
-      typedMap(t.u8, t.dynamic, [[u8(EpAuthPacketHeader.Domain), this.domain]]),
+    try {
+      const headers = new Map(this.localHeaders);
+      if (this.domain) headers.set(EpAuthPacketHeader.Domain, this.domain);
+
+      if (this.authenticationMode !== AuthenticationMode.None) {
+        const handler = this.getOrCreateInitiatorAuthenticationHandler();
+        const initAuthResult = handler.process(null);
+        if (initAuthResult.ruling === AuthenticationRuling.Failed)
+          throw new AsyncException(
+            ErrorType.Management,
+            ExceptionCode.AccessDenied,
+            "Authentication failed.",
+          );
+        headers.set(EpAuthPacketHeader.AuthenticationProtocol, handler.protocol);
+        headers.set(EpAuthPacketHeader.AuthenticationData, initAuthResult.authenticationData);
+      }
+
+      this.send(
+        EpAuthPacket.composeInitialize(
+          this.authenticationMode,
+          this.encryptionMode,
+          this.composeAuthHeaders(headers),
+        ),
+      );
+    } catch (e) {
+      this.failAuthentication(e);
+    }
+  }
+
+  /** Handle an auth-phase packet. */
+  private handleAuthPacket(packet: EpAuthPacket): void {
+    try {
+      if (packet.command === EpAuthPacketCommand.Initialize) {
+        this.handleAuthInitialize(packet);
+      } else if (packet.command === EpAuthPacketCommand.Acknowledge) {
+        this.handleAuthAcknowledge(packet);
+      } else if (packet.command === EpAuthPacketCommand.Action) {
+        this.handleAuthAction(packet);
+      } else if (packet.command === EpAuthPacketCommand.Event) {
+        this.handleAuthEvent(packet);
+      }
+    } catch (e) {
+      this.failAuthentication(e);
+    }
+  }
+
+  private handleAuthInitialize(packet: EpAuthPacket): void {
+    const { headers: remoteHeaders, authData: remoteAuthData } = this.parseAuthHeaders(packet);
+    this.remoteHeaders.clear();
+    for (const [key, value] of remoteHeaders) this.remoteHeaders.set(key, value);
+
+    const localHeaders = new Map(this.localHeaders);
+
+    if (packet.authMode === AuthenticationMode.None) {
+      if (!this.allowUnauthorized) {
+        this.sendAuthData(EpAuthPacketMethod.ErrorTerminate, "Unauthorized access not allowed.");
+        this.failAuthentication("Unauthorized access not allowed.", true);
+        return;
+      }
+
+      this.sendAuthHeaders(EpAuthPacketMethod.SessionEstablished, localHeaders);
+      this.authenticationMode = AuthenticationMode.None;
+      this.completeAuthentication(nullResult());
+      return;
+    }
+
+    const protocol = this.remoteHeaders.get(EpAuthPacketHeader.AuthenticationProtocol);
+    if (typeof protocol !== "string") {
+      this.sendAuthHeaders(EpAuthPacketMethod.NotSupported, localHeaders);
+      this.failAuthentication("Authentication protocol is missing.", true);
+      return;
+    }
+
+    const provider =
+      this.warehouse?.tryGetAuthenticationProvider(protocol) ??
+      (this.authenticationProvider?.defaultName === protocol ? this.authenticationProvider : undefined);
+    if (!provider) {
+      this.sendAuthHeaders(EpAuthPacketMethod.NotSupported, localHeaders);
+      this.failAuthentication("Authentication provider not found.", true);
+      return;
+    }
+
+    this.authenticationMode = packet.authMode;
+    this.authenticationProtocol = protocol;
+    this.authenticationProvider = provider;
+    const handler = provider.createAuthenticationHandler({
+      direction: AuthenticationDirection.Responder,
+      mode: packet.authMode,
+      domain: String(this.remoteHeaders.get(EpAuthPacketHeader.Domain) ?? this.domain ?? ""),
+      hostName: this.hostName,
+      materials: [{ type: AuthenticationMaterialType.Data, value: remoteAuthData }],
+    });
+    if (!handler) {
+      this.sendAuthHeaders(EpAuthPacketMethod.NotSupported, localHeaders);
+      this.failAuthentication("Authentication handler not found.", true);
+      return;
+    }
+
+    this.authenticationHandler = handler;
+    const authResult = handler.process(remoteAuthData);
+    localHeaders.set(EpAuthPacketHeader.AuthenticationData, authResult.authenticationData);
+
+    if (authResult.ruling === AuthenticationRuling.Failed) {
+      this.sendAuthHeaders(EpAuthPacketMethod.Denied, localHeaders);
+      this.failAuthentication("Authentication failed.", true);
+    } else if (authResult.ruling === AuthenticationRuling.InProgress) {
+      this.sendAuthHeaders(EpAuthPacketMethod.ProceedToHandshake, localHeaders);
+    } else {
+      this.sendAuthHeaders(EpAuthPacketMethod.SessionEstablished, localHeaders);
+      this.completeAuthentication(authResult);
+    }
+  }
+
+  private handleAuthAcknowledge(packet: EpAuthPacket): void {
+    if (this.authenticationMode === AuthenticationMode.None) {
+      if (packet.method === EpAuthPacketMethod.SessionEstablished) {
+        this.completeAuthentication(nullResult());
+      } else {
+        this.failAuthentication(this.readAuthErrorMessage(packet), true);
+      }
+      return;
+    }
+
+    if (
+      packet.method === EpAuthPacketMethod.Denied ||
+      packet.method === EpAuthPacketMethod.NotSupported
+    ) {
+      this.failAuthentication(this.readAuthErrorMessage(packet), true);
+      return;
+    }
+
+    if (
+      packet.method !== EpAuthPacketMethod.ProceedToHandshake &&
+      packet.method !== EpAuthPacketMethod.ProceedToFinalHandshake &&
+      packet.method !== EpAuthPacketMethod.SessionEstablished
+    ) {
+      return;
+    }
+
+    const { headers: remoteHeaders, authData: remoteAuthData } = this.parseAuthHeaders(packet);
+    this.remoteHeaders.clear();
+    for (const [key, value] of remoteHeaders) this.remoteHeaders.set(key, value);
+
+    const authResult = this.requireAuthenticationHandler().process(remoteAuthData);
+    if (authResult.ruling === AuthenticationRuling.Failed) {
+      this.failAuthentication("Authentication failed.");
+    } else if (authResult.ruling === AuthenticationRuling.InProgress) {
+      if (packet.method === EpAuthPacketMethod.ProceedToHandshake)
+        this.sendAuthData(EpAuthPacketMethod.Handshake, authResult.authenticationData);
+      else
+        this.failAuthentication("Bad authentication protocol sequence.");
+    } else {
+      this.storeAuthenticationResult(authResult);
+      if (packet.method === EpAuthPacketMethod.SessionEstablished) {
+        this.completeAuthentication(authResult);
+      } else {
+        this.sendAuthData(EpAuthPacketMethod.FinalHandshake, authResult.authenticationData);
+      }
+    }
+  }
+
+  private handleAuthAction(packet: EpAuthPacket): void {
+    if (
+      packet.method !== EpAuthPacketMethod.Handshake &&
+      packet.method !== EpAuthPacketMethod.FinalHandshake
+    ) {
+      return;
+    }
+
+    const authData = this.decodeAuthValue(packet);
+    const authResult = this.requireAuthenticationHandler().process(authData);
+    if (authResult.ruling === AuthenticationRuling.Failed) {
+      this.failAuthentication("Authentication failed.");
+    } else if (authResult.ruling === AuthenticationRuling.InProgress) {
+      this.sendAuthData(EpAuthPacketMethod.Handshake, authResult.authenticationData);
+    } else {
+      this.storeAuthenticationResult(authResult);
+      if (authResult.authenticationData != null) {
+        this.sendAuthData(EpAuthPacketMethod.FinalHandshake, authResult.authenticationData);
+      }
+
+      if (packet.method === EpAuthPacketMethod.FinalHandshake || authResult.authenticationData == null) {
+        this.sendAuth(EpAuthPacketMethod.Established);
+        this.completeAuthentication(authResult);
+      }
+    }
+  }
+
+  private handleAuthEvent(packet: EpAuthPacket): void {
+    if (packet.method === EpAuthPacketMethod.Established) {
+      if (this.authSessionEstablished) this.completeAuthentication();
+      else this.failAuthentication("Authentication error.");
+    } else if (
+      packet.method === EpAuthPacketMethod.ErrorTerminate ||
+      packet.method === EpAuthPacketMethod.ErrorMustEncrypt ||
+      packet.method === EpAuthPacketMethod.ErrorRetry
+    ) {
+      this.failAuthentication(this.readAuthErrorMessage(packet), true);
+    }
+  }
+
+  private getOrCreateInitiatorAuthenticationHandler(): IAuthenticationHandler {
+    if (this.authenticationHandler) return this.authenticationHandler;
+
+    const provider =
+      this.authenticationProvider ??
+      this.warehouse?.tryGetAuthenticationProvider(this.authenticationProtocol);
+    if (!provider)
+      throw new AsyncException(
+        ErrorType.Management,
+        ExceptionCode.AccessDenied,
+        "Authentication provider not found.",
+      );
+
+    const handler = provider.createAuthenticationHandler({
+      direction: AuthenticationDirection.Initiator,
+      mode: this.authenticationMode,
+      domain: this.domain,
+      hostName: this.hostName,
+      initiatorIdentity: this.localIdentity,
+      responderIdentity: this.responderIdentity,
+    });
+    if (!handler)
+      throw new AsyncException(
+        ErrorType.Management,
+        ExceptionCode.NotSupported,
+        "Authentication handler not found.",
+      );
+
+    this.authenticationProvider = provider;
+    this.authenticationHandler = handler;
+    return handler;
+  }
+
+  private requireAuthenticationHandler(): IAuthenticationHandler {
+    if (!this.authenticationHandler)
+      throw new AsyncException(
+        ErrorType.Management,
+        ExceptionCode.AccessDenied,
+        "Authentication handler is not initialized.",
+      );
+    return this.authenticationHandler;
+  }
+
+  private composeAuthHeaders(headers: Map<EpAuthPacketHeader, unknown>): Uint8Array {
+    return compose(
+      typedMap(
+        t.u8,
+        t.dynamic,
+        [...headers.entries()].map(([key, value]) => [u8(key), value] as const),
+      ),
       this.warehouse,
       this,
     );
-    this.send(
-      EpAuthPacket.composeInitialize(AuthenticationMode.None, EncryptionMode.None, headers),
-    );
   }
 
-  /** Handle an auth-phase packet (anonymous handshake only). */
-  private handleAuthPacket(packet: EpAuthPacket): void {
-    if (packet.command === EpAuthPacketCommand.Initialize) {
-      // Responder: accept an anonymous peer and establish the session.
-      if (packet.authMode === AuthenticationMode.None && this.allowUnauthorized) {
-        const headers = compose(typedMap(t.u8, t.dynamic, []), this.warehouse, this);
-        this.send(EpAuthPacket.composeMethod(EpAuthPacketMethod.SessionEstablished, headers));
-        this.authenticated = true;
-      } else {
-        this.send(EpAuthPacket.composeMethod(EpAuthPacketMethod.ErrorTerminate));
-        this.close();
-      }
-    } else if (
-      packet.command === EpAuthPacketCommand.Acknowledge &&
-      packet.method === EpAuthPacketMethod.SessionEstablished
-    ) {
-      // Initiator: the session is established.
-      this.authenticated = true;
-      this.readyReply?.trigger(true);
+  private sendAuth(method: EpAuthPacketMethod): void {
+    this.send(EpAuthPacket.composeMethod(method));
+  }
+
+  private sendAuthData(method: EpAuthPacketMethod, data: unknown): void {
+    const tdu = data == null ? undefined : compose(data, this.warehouse, this);
+    this.send(EpAuthPacket.composeMethod(method, tdu));
+  }
+
+  private sendAuthHeaders(
+    method: EpAuthPacketMethod,
+    headers: Map<EpAuthPacketHeader, unknown>,
+  ): void {
+    this.send(EpAuthPacket.composeMethod(method, this.composeAuthHeaders(headers)));
+  }
+
+  private parseAuthHeaders(packet: EpAuthPacket): {
+    headers: Map<EpAuthPacketHeader, unknown>;
+    authData: unknown;
+  } {
+    const value = this.decodeAuthValue(packet);
+    const headers = new Map<EpAuthPacketHeader, unknown>();
+    let authData: unknown = null;
+    if (value == null) return { headers, authData };
+    if (!(value instanceof Map))
+      throw new AsyncException(
+        ErrorType.Management,
+        ExceptionCode.ParseError,
+        "Authentication headers must be a map.",
+      );
+
+    for (const [rawKey, headerValue] of value.entries()) {
+      const key = Number(rawKey) as EpAuthPacketHeader;
+      if (key === EpAuthPacketHeader.AuthenticationData) authData = headerValue;
+      else headers.set(key, headerValue);
     }
+
+    return { headers, authData };
+  }
+
+  private decodeAuthValue(packet: EpAuthPacket): unknown {
+    if (!packet.tdu) return null;
+    return parse(packet.tdu.data, packet.tdu.tduOffset, this.warehouse);
+  }
+
+  private readAuthErrorMessage(packet: EpAuthPacket): string {
+    const fallback = "Authentication error.";
+    try {
+      const value = this.decodeAuthValue(packet);
+      if (typeof value === "string") return value;
+      if (value instanceof Map) {
+        const msg = value.get(EpAuthPacketHeader.ErrorMessage);
+        if (msg != null) return String(msg);
+      }
+    } catch {
+      /* keep fallback */
+    }
+    return fallback;
+  }
+
+  private storeAuthenticationResult(result: AuthenticationResult): void {
+    this.authSessionEstablished = true;
+    this.localIdentity = result.localIdentity;
+    this.remoteIdentity = result.remoteIdentity;
+    this.sessionKey = result.sessionKey;
+  }
+
+  private completeAuthentication(result?: AuthenticationResult | null): void {
+    if (result) this.storeAuthenticationResult(result);
+    this.authSessionEstablished = true;
+    this.authenticated = true;
+    this.readyReply?.trigger(true);
+    this.authenticationProvider?.login?.(this.getAuthenticationSession());
+  }
+
+  private failAuthentication(error: unknown, suppressSend = false): void {
+    const exception =
+      error instanceof AsyncException
+        ? error
+        : new AsyncException(ErrorType.Management, ExceptionCode.AccessDenied, String(error));
+    this.readyReply?.triggerError(exception);
+    if (!suppressSend) this.sendAuthData(EpAuthPacketMethod.ErrorTerminate, exception.message);
+    this.close();
+  }
+
+  private getAuthenticationSession(): AuthenticationSession {
+    return {
+      authenticationMode: this.authenticationMode,
+      localHeaders: this.localHeaders,
+      remoteHeaders: this.remoteHeaders,
+      localIdentity: this.localIdentity,
+      remoteIdentity: this.remoteIdentity,
+      key: this.sessionKey,
+      authenticated: this.authenticated,
+      variables: this.variables,
+    };
   }
 
   // ---- outbound ---------------------------------------------------------------
@@ -237,31 +684,178 @@ export class EpConnection extends NetworkConnection {
   /** Fetch and parse the runtime TypeDef for a remote resource id. */
   fetchTypeDefByResourceId(instanceId: number): AsyncReply<RemoteTypeDef> {
     return this.sendRequest(EpPacketRequest.TypeDefByResourceId, instanceId).then((reply) => {
-      if (!(reply instanceof Uint8Array))
-        throw new AsyncException(
-          ErrorType.Management,
-          ExceptionCode.ParseError,
-          "TypeDefByResourceId did not return a raw TypeDef payload.",
-        );
-      return RemoteTypeDef.parse(reply, this.warehouse);
+      const data = this.expectTypeDefPayload(
+        reply,
+        "TypeDefByResourceId did not return a raw TypeDef payload.",
+      );
+      return this.parseTypeDefPayload(data, null);
     });
   }
 
   /** Fetch and parse a runtime TypeDef by its remote TypeDef id. */
   fetchTypeDefById(typeDefId: number): AsyncReply<RemoteTypeDef> {
-    return this.sendRequest(EpPacketRequest.TypeDefById, typeDefId).then((reply) => {
-      if (!(reply instanceof Uint8Array))
-        throw new AsyncException(
-          ErrorType.Management,
-          ExceptionCode.ParseError,
-          "TypeDefById did not return a raw TypeDef payload.",
-        );
-      return RemoteTypeDef.parse(reply, this.warehouse);
-    });
+    return this.fetchTypeDef(typeDefId, null);
+  }
+
+  /** Fetch and parse a runtime TypeDef by id, resolving cyclic remote TypeDef references. */
+  fetchTypeDef(
+    typeDefId: number,
+    requestSequence: readonly number[] | null = null,
+  ): AsyncReply<RemoteTypeDef> {
+    const cached = this.cachedTypeDefs.get(typeDefId);
+    if (cached) return AsyncReply.fromResult(cached);
+
+    const needed = this.neededTypeDefs.get(typeDefId);
+    const requestInfo = this.typeDefRequests.get(typeDefId);
+    const parent =
+      requestSequence && requestSequence.length > 0
+        ? requestSequence[requestSequence.length - 1]
+        : undefined;
+
+    if (requestInfo) {
+      if (needed && requestSequence?.includes(typeDefId))
+        return AsyncReply.fromResult(needed);
+
+      if (needed && this.hasTypeDefWaitForCycle(typeDefId, requestSequence))
+        return AsyncReply.fromResult(needed);
+
+      if (parent != null) this.addTypeDefFetchBlock(parent, typeDefId);
+      return requestInfo.reply;
+    }
+
+    const newSequence = requestSequence ? [...requestSequence, typeDefId] : [typeDefId];
+    const reply = new AsyncReply<RemoteTypeDef>();
+    this.typeDefRequests.set(typeDefId, { reply, requestSequence: newSequence });
+
+    if (parent != null) this.addTypeDefFetchBlock(parent, typeDefId);
+
+    this.sendRequest(EpPacketRequest.TypeDefById, typeDefId)
+      .onReady((result) => {
+        void (async () => {
+          try {
+            const data = this.expectTypeDefPayload(
+              result,
+              "TypeDefById did not return a raw TypeDef payload.",
+            );
+            const typeDef = await this.finishTypeDefRequest(typeDefId, data, newSequence);
+            reply.trigger(typeDef);
+          } catch (e) {
+            this.typeDefRequests.delete(typeDefId);
+            this.neededTypeDefs.delete(typeDefId);
+            this.clearTypeDefFetchNode(typeDefId);
+            reply.triggerError(AsyncException.from(e));
+          }
+        })();
+      })
+      .error((ex) => {
+        this.typeDefRequests.delete(typeDefId);
+        this.clearTypeDefFetchNode(typeDefId);
+        reply.triggerError(ex);
+      });
+
+    return reply;
+  }
+
+  private expectTypeDefPayload(value: unknown, message: string): Uint8Array {
+    if (value instanceof Uint8Array) return value;
+    throw new AsyncException(ErrorType.Management, ExceptionCode.ParseError, message);
+  }
+
+  private parseTypeDefPayload(
+    data: Uint8Array,
+    requestSequence: readonly number[] | null,
+  ): AsyncReply<RemoteTypeDef> {
+    const typeDefId = readTypeDefPayloadId(data);
+    const cached = this.cachedTypeDefs.get(typeDefId);
+    if (cached) return AsyncReply.fromResult(cached);
+
+    const pending = this.typeDefRequests.get(typeDefId);
+    if (pending) return pending.reply;
+
+    const newSequence = requestSequence ? [...requestSequence, typeDefId] : [typeDefId];
+    const reply = new AsyncReply<RemoteTypeDef>();
+    this.typeDefRequests.set(typeDefId, { reply, requestSequence: newSequence });
+
+    void (async () => {
+      try {
+        const typeDef = await this.finishTypeDefRequest(typeDefId, data, newSequence);
+        reply.trigger(typeDef);
+      } catch (e) {
+        reply.triggerError(AsyncException.from(e));
+      }
+    })();
+
+    return reply;
+  }
+
+  private async finishTypeDefRequest(
+    typeDefId: number,
+    data: Uint8Array,
+    requestSequence: readonly number[],
+  ): Promise<RemoteTypeDef> {
+    const placeholder = this.neededTypeDefs.get(typeDefId) ?? new RemoteTypeDef();
+    this.neededTypeDefs.set(typeDefId, placeholder);
+    try {
+      const typeDef = await RemoteTypeDef.parseAsyncInto(
+        placeholder,
+        data,
+        this.warehouse,
+        (id, sequence) => this.fetchTypeDef(id, sequence),
+        requestSequence,
+      );
+      this.cachedTypeDefs.set(typeDefId, typeDef);
+      if (typeDef.id !== typeDefId) this.cachedTypeDefs.set(typeDef.id, typeDef);
+      return typeDef;
+    } finally {
+      this.typeDefRequests.delete(typeDefId);
+      this.neededTypeDefs.delete(typeDefId);
+      this.clearTypeDefFetchNode(typeDefId);
+    }
+  }
+
+  private addTypeDefFetchBlock(parent: number, child: number): void {
+    let children = this.typeDefsFetchBlockedOn.get(parent);
+    if (!children) {
+      children = new Set<number>();
+      this.typeDefsFetchBlockedOn.set(parent, children);
+    }
+    children.add(child);
+  }
+
+  private clearTypeDefFetchNode(typeDefId: number): void {
+    this.typeDefsFetchBlockedOn.delete(typeDefId);
+    for (const children of this.typeDefsFetchBlockedOn.values())
+      children.delete(typeDefId);
+  }
+
+  private hasTypeDefWaitForCycle(
+    typeDefId: number,
+    requestSequence: readonly number[] | null,
+  ): boolean {
+    if (!requestSequence || requestSequence.length === 0) return false;
+
+    const chain = new Set(requestSequence);
+    const visited = new Set<number>();
+    const stack = [typeDefId];
+    while (stack.length > 0) {
+      const current = stack.pop();
+      if (current == null) continue;
+      if (visited.has(current)) continue;
+      visited.add(current);
+
+      const children = this.typeDefsFetchBlockedOn.get(current);
+      if (!children) continue;
+
+      for (const child of children) {
+        if (chain.has(child)) return true;
+        stack.push(child);
+      }
+    }
+    return false;
   }
 
   /** Resolve and attach a remote resource by its path on this connection. */
-  get(path: string, template?: TypeTemplate): AsyncReply {
+  get(path: string, typeDef?: TypeDef): AsyncReply {
     return this.getResourceIdByLink(path).then((resourceRef) => {
       const instanceId = toInstanceId(resourceRef);
       if (instanceId == null)
@@ -270,9 +864,14 @@ export class EpConnection extends NetworkConnection {
           ExceptionCode.ResourceNotFound,
           `Remote resource '${path}' was not found.`,
         );
-      if (!template) return resourceRef;
-      return this.attach(instanceId, template);
+      if (!typeDef) return resourceRef;
+      return this.attach(instanceId, typeDef);
     });
+  }
+
+  /** .NET-compatible alias for {@link get}. */
+  Get(path: string, typeDef?: TypeDef): AsyncReply {
+    return this.get(path, typeDef);
   }
 
   /** Reopen the WebSocket session and reattach all known remote resources. */
@@ -315,10 +914,10 @@ export class EpConnection extends NetworkConnection {
   /**
    * Attach to a remote resource, returning a dynamic {@link EpResource} proxy
    * primed with current property values and kept fresh by notifications. The
-   * caller supplies the resource's {@link TypeTemplate} (e.g. from generated
+   * caller supplies the resource's {@link TypeDef} (e.g. from generated
    * stubs); a server build resolves it from the warehouse.
    */
-  attach(instanceId: number, template: TypeTemplate): AsyncReply {
+  attach(instanceId: number, typeDef: TypeDef): AsyncReply {
     return this.sendRequest(EpPacketRequest.AttachResource, instanceId).then((reply) => {
       // Reply: [typeDefId, age, link, hops, propertyValues] (matches C#). The
       // 5th element is a RawData blob of (age, date, value) self-describing TDUs,
@@ -330,14 +929,14 @@ export class EpConnection extends NetworkConnection {
       const hops = asNumber(list[3]);
       const raw = list[4] as Uint8Array | undefined;
 
-      const resource = new EpResource(this, instanceId, template, {
+      const resource = new EpResource(this, instanceId, typeDef, {
         typeDefId,
         age,
         link,
         hops,
       });
       if (raw) {
-        const snapshots = this.parsePropertyValueArray(raw, template);
+        const snapshots = this.parsePropertyValueArray(raw, typeDef);
         for (const pv of snapshots)
           resource.setPropertySnapshot(pv.index, pv.age, pv.date, pv.value);
       }
@@ -402,10 +1001,10 @@ export class EpConnection extends NetworkConnection {
     return compose(args, this.warehouse, this);
   }
 
-  private parsePropertyValueArray(raw: Uint8Array, template: TypeTemplate): RemotePropertyValue[] {
+  private parsePropertyValueArray(raw: Uint8Array, typeDef: TypeDef): RemotePropertyValue[] {
     const values: RemotePropertyValue[] = [];
     let offset = 0;
-    for (const p of template.properties) {
+    for (const p of typeDef.properties) {
       const age = parseSync(raw, offset, this.warehouse);
       offset += age.length;
       const date = parseSync(raw, offset, this.warehouse);
@@ -862,6 +1461,8 @@ export class EpConnection extends NetworkConnection {
   override close(): void {
     this.manualClose = true;
     this.clearReconnectTimer();
+    if (this.authSessionEstablished)
+      this.authenticationProvider?.logout?.(this.getAuthenticationSession());
     super.close();
   }
 
@@ -928,7 +1529,28 @@ function isThenable(value: unknown): value is PromiseLike<unknown> {
 function isConnectionOptions(value: unknown): value is EpConnectionOptions {
   if (value == null || typeof value !== "object") return false;
   const keys = value as Record<string, unknown>;
-  return "autoReconnect" in keys || "reconnectInterval" in keys;
+  return (
+    "autoReconnect" in keys ||
+    "AutoReconnect" in keys ||
+    "reconnectInterval" in keys ||
+    "ReconnectInterval" in keys ||
+    "authenticationMode" in keys ||
+    "AuthenticationMode" in keys ||
+    "authenticationProtocol" in keys ||
+    "AuthenticationProtocol" in keys ||
+    "authenticationProvider" in keys ||
+    "AuthenticationProvider" in keys ||
+    "identity" in keys ||
+    "Identity" in keys ||
+    "responderIdentity" in keys ||
+    "ResponderIdentity" in keys ||
+    "domain" in keys ||
+    "Domain" in keys
+  );
+}
+
+function nullResult(): AuthenticationResult {
+  return new AuthenticationResult(AuthenticationRuling.Succeeded, null, null, null, null);
 }
 
 function asNumber(value: unknown): number {
@@ -940,6 +1562,16 @@ function asNumber(value: unknown): number {
 
 function asDate(value: unknown): Date | undefined {
   return value instanceof Date ? value : undefined;
+}
+
+function readTypeDefPayloadId(data: Uint8Array): number {
+  if (data.length < 9)
+    throw new AsyncException(
+      ErrorType.Management,
+      ExceptionCode.ParseError,
+      "TypeDef payload is too short.",
+    );
+  return Number(getUint64(data, 1));
 }
 
 function toInstanceId(value: unknown): number | undefined {

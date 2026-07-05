@@ -4,11 +4,11 @@ import {
   type TypeDefConstant,
   type TypeDefProperty,
 } from "../data/types/ITypeDef.js";
-import type { TypeTemplate } from "./template.js";
+import type { TypeDef } from "./template.js";
 
 /**
- * Concrete type definition built from a resource/record class's
- * {@link TypeTemplate} (port of C# `LocalTypeDef`). Implements the layer-neutral
+ * Concrete type definition built from a resource/record class's decorated
+ * {@link TypeDef} surface. Implements the layer-neutral
  * {@link ITypeDef} consumed by the serializer.
  */
 export class LocalTypeDef implements ITypeDef {
@@ -18,7 +18,7 @@ export class LocalTypeDef implements ITypeDef {
     readonly id: number,
     readonly kind: TypeDefKind,
     readonly name: string,
-    readonly template: TypeTemplate,
+    readonly template: TypeDef,
     private readonly ctor?: new () => object,
     readonly constants?: TypeDefConstant[],
   ) {}
