@@ -85,6 +85,7 @@ export function composeInternal(
   if (value instanceof TypedList) return typedListComposer(value, warehouse, connection);
   if (value instanceof TypedMap) return typedMapComposer(value, warehouse, connection);
   if (value instanceof TypedTuple) return tupleComposer(value, warehouse, connection);
+  if (value instanceof Map) return mapComposer(value, warehouse, connection);
 
   // A bare JS array becomes a dynamic, self-describing List (each element keeps
   // its own type tag). Typed Gvwie arrays are produced from explicit typed-list
@@ -156,6 +157,19 @@ function listComposer(
 
   const content = merge(...parts);
   return new Tdu(identifier, content, content.length);
+}
+
+/** Compose a dynamic Map TDU as alternating key/value self-describing TDUs. */
+function mapComposer(
+  value: Map<unknown, unknown>,
+  warehouse: unknown,
+  connection: unknown,
+): Tdu {
+  const flat: unknown[] = [];
+  for (const [key, item] of value.entries()) {
+    flat.push(key, item);
+  }
+  return listComposer(flat, TduIdentifier.Map, warehouse, connection);
 }
 
 /** Compose an explicitly-typed array as a Typed TDU with `TypedList<element>`. */

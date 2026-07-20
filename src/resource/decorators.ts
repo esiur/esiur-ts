@@ -12,6 +12,7 @@ import {
 
 const MEMBERS = Symbol.for("esiur.members");
 const TEMPLATE = Symbol.for("esiur.template");
+const REMOTE = Symbol.for("esiur.remote");
 
 interface PendingMember {
   kind: MemberType;
@@ -21,6 +22,11 @@ interface PendingMember {
 }
 
 type MetaBag = Record<symbol, unknown>;
+
+export interface RemoteInfo {
+  name: string;
+  domains: string[];
+}
 
 /**
  * Marks a class member as exported over Esiur (port of C#'s `[Export]`).
@@ -104,6 +110,47 @@ export function getTypeDef(ctor: Function): TypeDef {
 /** @deprecated Use {@link getTypeDef}. */
 export function getTemplate(ctor: Function): TypeDef {
   return getTypeDef(ctor);
+}
+
+/** Marks a generated proxy class as representing a remote TypeDef. */
+export function Remote(name: string, ...domains: string[]) {
+  return function (value: Function, _context?: ClassDecoratorContext): void {
+    (value as { [REMOTE]?: RemoteInfo })[REMOTE] = { name, domains };
+  };
+}
+
+/** Read remote proxy metadata from a class decorator or generator statics. */
+export function getRemoteInfo(ctor: Function): RemoteInfo | undefined {
+  const decorated = (ctor as { [REMOTE]?: RemoteInfo })[REMOTE];
+  if (decorated) return decorated;
+
+  const statics = ctor as {
+    remote?: RemoteInfo;
+    Remote?: RemoteInfo;
+    remoteName?: string;
+    RemoteName?: string;
+    fullName?: string;
+    FullName?: string;
+    domains?: string[] | string;
+    Domains?: string[] | string;
+    domain?: string;
+    Domain?: string;
+  };
+
+  const structured = statics.remote ?? statics.Remote;
+  if (structured?.name) return structured;
+
+  const name = statics.remoteName ?? statics.RemoteName ?? statics.fullName ?? statics.FullName;
+  if (!name) return undefined;
+
+  const domains = statics.domains ?? statics.Domains ?? statics.domain ?? statics.Domain;
+  return { name, domains: normalizeDomains(domains) };
+}
+
+function normalizeDomains(value: string[] | string | undefined): string[] {
+  if (Array.isArray(value)) return value;
+  if (typeof value === "string") return [value];
+  return [];
 }
 
 /**
