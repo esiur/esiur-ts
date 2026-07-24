@@ -3,13 +3,14 @@ import { EventHandler } from "../core/EventHandler.js";
 import type { IResource, IResourceContext, IStore } from "./IResource.js";
 import { Instance } from "./Instance.js";
 import { ResourceOperation } from "./ResourceOperation.js";
-import { getTypeDef } from "./decorators.js";
+import { getRemoteInfo, getTypeDef } from "./decorators.js";
 import { TypeDef } from "./template.js";
 import { TypeDefKind, type ITypeDef } from "../data/types/ITypeDef.js";
 import { LocalTypeDef } from "./typedef.js";
 import { Record } from "./records.js";
 import type { EnumType } from "./enums.js";
 import { EpConnection, type EpConnectionOptions } from "../protocol/EpConnection.js";
+import type { EpResourceConstructor } from "../protocol/EpResource.js";
 import type { IAuthenticationProvider } from "../security/IAuthenticationProvider.js";
 import type { IEncryptionProvider } from "../security/cryptography/IEncryptionProvider.js";
 import { getResourceManagerTypes } from "./decorators.js";
@@ -30,7 +31,7 @@ export interface WarehouseRemoteGetOptions extends EpConnectionOptions {
   /** @deprecated Use {@link typeDef}. */
   template?: TypeDef;
   /** Resource/stub constructor used to derive {@link typeDef}. */
-  type?: Function;
+  type?: Function | EpResourceConstructor;
 }
 
 export type WarehouseGetOptions =
@@ -77,6 +78,7 @@ export class Warehouse {
   private readonly resourceManagers = new Map<Function, IResourceManager>();
   private readonly defaultResourceManagerTypes = new Set<Function>();
   private readonly ratePolicies = new Map<string, RatePolicy>();
+  private readonly proxyTypes = new Map<string, Function>();
 
   constructor() {
     // Built in and always-on, matching dotnet's own Warehouse construction —
@@ -408,6 +410,63 @@ export class Warehouse {
     return name?.trim() ? this.ratePolicies.delete(name) : false;
   }
 
+  /** Register a generated remote proxy type for automatic EpResource attachment. */
+  registerProxyType(type: Function): void {
+    const registration = getProxyRegistration(type);
+    const domains = registration.domains.length > 0 ? registration.domains : [""];
+    for (const domain of domains)
+      this.proxyTypes.set(proxyKey(registration.kind, domain, registration.name), type);
+  }
+
+  /** .NET-compatible alias for {@link registerProxyType}. */
+  RegisterProxyType(type: Function): void {
+    this.registerProxyType(type);
+  }
+
+  /** Register multiple generated remote proxy types. */
+  registerProxyTypes(types: Iterable<Function>): void {
+    for (const type of types) this.registerProxyType(type);
+  }
+
+  /** .NET-compatible alias for {@link registerProxyTypes}. */
+  RegisterProxyTypes(types: Iterable<Function>): void {
+    this.registerProxyTypes(types);
+  }
+
+  /** Resolve a registered generated proxy type by kind, domain and remote TypeDef name. */
+  tryGetProxyType(kind: TypeDefKind, domain: string, name: string): Function | undefined {
+    const exact = this.proxyTypes.get(proxyKey(kind, domain, name));
+    if (exact) return exact;
+
+    const wildcard = this.proxyTypes.get(proxyKey(kind, "*", name));
+    if (wildcard) return wildcard;
+
+    const domainless = this.proxyTypes.get(proxyKey(kind, "", name));
+    if (domainless) return domainless;
+
+    const suffix = `|${kind}|${name}`;
+    for (const [key, type] of this.proxyTypes)
+      if (key.endsWith(suffix)) return type;
+    return undefined;
+  }
+
+  /** .NET-compatible alias for {@link tryGetProxyType}. */
+  TryGetProxyType(kind: TypeDefKind, domain: string, name: string): Function | undefined {
+    return this.tryGetProxyType(kind, domain, name);
+  }
+
+  /** Resolve a registered generated proxy type or throw when missing. */
+  getProxyType(kind: TypeDefKind, domain: string, name: string): Function {
+    const type = this.tryGetProxyType(kind, domain, name);
+    if (!type) throw new Error(`No proxy type registered for '${name}' in '${domain}'.`);
+    return type;
+  }
+
+  /** .NET-compatible alias for {@link getProxyType}. */
+  GetProxyType(kind: TypeDefKind, domain: string, name: string): Function {
+    return this.getProxyType(kind, domain, name);
+  }
+
   /** Build (cached) the decorated TypeDef surface for a resource class. */
   getTypeDef(ctor: Function): TypeDef {
     return getTypeDef(ctor);
@@ -577,9 +636,11 @@ export class Warehouse {
       const connection = await EpConnection.connect(remote.socketUrl, this, remoteOptions);
       if (!remote.resourcePath) return connection;
 
-      // `typeDef` is optional here too: EpConnection.get fetches it from the
-      // server when omitted.
-      return (await connection.get(remote.resourcePath, remoteOptions.typeDef)) as T;
+      const target = remoteOptions.type ?? remoteOptions.typeDef;
+      return (await connection.get(
+        remote.resourcePath,
+        target as TypeDef | EpResourceConstructor | undefined,
+      )) as T;
     }
 
     return (await this.queryAsync(path)) as T | undefined;
@@ -744,7 +805,63 @@ function normalizeRemoteOptions(
 ): WarehouseRemoteGetOptions {
   if (!options) return {};
   if (options instanceof TypeDef) return { typeDef: options };
-  if (typeof options === "function") return { type: options, typeDef: warehouse.getTypeDef(options) };
-  const typeDef = options.typeDef ?? options.template ?? (options.type ? warehouse.getTypeDef(options.type) : undefined);
+  if (typeof options === "function")
+    return { type: options, typeDef: getRemoteOptionTypeDef(options, warehouse) };
+  const typeDef =
+    options.typeDef ??
+    options.template ??
+    (options.type ? getRemoteOptionTypeDef(options.type, warehouse) : undefined);
   return { ...options, typeDef, template: options.template ?? typeDef };
+}
+
+function getRemoteOptionTypeDef(type: Function, warehouse: Warehouse): TypeDef | undefined {
+  const statics = type as {
+    typeDef?: unknown;
+    TypeDef?: unknown;
+    template?: unknown;
+    Template?: unknown;
+  };
+  const explicit = statics.typeDef ?? statics.TypeDef ?? statics.template ?? statics.Template;
+  if (explicit instanceof TypeDef) return explicit;
+
+  const decorated = warehouse.getTypeDef(type);
+  return decorated.members.length > 0 ? decorated : undefined;
+}
+
+interface ProxyRegistration {
+  kind: TypeDefKind;
+  name: string;
+  domains: string[];
+}
+
+function getProxyRegistration(type: Function): ProxyRegistration {
+  const remote = getRemoteInfo(type);
+  const statics = type as {
+    typeDef?: unknown;
+    TypeDef?: unknown;
+    template?: unknown;
+    Template?: unknown;
+    kind?: TypeDefKind;
+    Kind?: TypeDefKind;
+    typeDefKind?: TypeDefKind;
+    TypeDefKind?: TypeDefKind;
+  };
+  const template = statics.typeDef ?? statics.TypeDef ?? statics.template ?? statics.Template;
+  const templateName = template instanceof TypeDef ? template.className : undefined;
+  const kind =
+    statics.kind ??
+    statics.Kind ??
+    statics.typeDefKind ??
+    statics.TypeDefKind ??
+    (type.prototype instanceof Record ? TypeDefKind.Record : TypeDefKind.Resource);
+
+  return {
+    kind,
+    name: remote?.name ?? templateName ?? type.name,
+    domains: remote?.domains ?? [],
+  };
+}
+
+function proxyKey(kind: TypeDefKind, domain: string, name: string): string {
+  return `${domain}|${kind}|${name}`;
 }

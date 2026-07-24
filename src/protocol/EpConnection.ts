@@ -46,12 +46,17 @@ import { randomBytes } from "../security/random.js";
 import { ResourceManagerContext } from "../security/management/ResourceManagerContext.js";
 import { ActionType } from "../security/permissions/ActionType.js";
 import type { Warehouse } from "../resource/Warehouse.js";
-import type { TypeDef, MemberTemplate, FunctionTemplate } from "../resource/template.js";
+import { TypeDef, type MemberTemplate, type FunctionTemplate } from "../resource/template.js";
 import type { IResource } from "../resource/IResource.js";
 import { isDynamicResource } from "../resource/IDynamicResource.js";
 import { LocalTypeDef } from "../resource/typedef.js";
 import { typeDefInfoFromTypeDef } from "../resource/typeDefInfoCompose.js";
-import { EpResource, type RemotePropertyValue } from "./EpResource.js";
+import {
+  EpResource,
+  type EpResourceConstructor,
+  type EpResourceOptions,
+  type RemotePropertyValue,
+} from "./EpResource.js";
 import { RemoteTypeDef } from "./RemoteTypeDef.js";
 import { ServerInvocationContext, isIterableResult } from "./ServerInvocationContext.js";
 
@@ -146,6 +151,10 @@ export interface EpReconnectMetrics {
   restoredResources: number;
   failedResources: number;
 }
+
+export type EpResourceAttachTarget<T extends EpResource = EpResource> =
+  | TypeDef
+  | EpResourceConstructor<T>;
 
 interface TypeDefFetchRequestInfo {
   reply: AsyncReply<RemoteTypeDef>;
@@ -1012,6 +1021,11 @@ export class EpConnection extends NetworkConnection {
     );
   }
 
+  /** Invoke function `index` with an already-shaped argument payload. */
+  invokeWithArguments(instanceId: number, index: number, args: unknown): AsyncReply {
+    return this.sendRequest(EpPacketRequest.InvokeFunction, instanceId, u8(index), args ?? []);
+  }
+
   /** Set property `index` on the resource with `instanceId`. */
   set(instanceId: number, index: number, value: unknown): AsyncReply {
     return this.sendRequest(EpPacketRequest.SetProperty, instanceId, u8(index), value);
@@ -1293,8 +1307,11 @@ export class EpConnection extends NetworkConnection {
    * extra round trip) — mirrors dotnet's `Get<T>`, which never needs a
    * caller-supplied type because C# generates the proxy dynamically.
    */
-  get(path: string, typeDef?: TypeDef): AsyncReply {
-    return this.getResourceIdByLink(path).then(async (resourceRef) => {
+  get<T extends EpResource = EpResource>(
+    path: string,
+    target?: EpResourceAttachTarget<T>,
+  ): AsyncReply {
+    return this.getResourceIdByLink(path).then((resourceRef) => {
       const instanceId = toInstanceId(resourceRef);
       if (instanceId == null)
         throw new AsyncException(
@@ -1302,14 +1319,16 @@ export class EpConnection extends NetworkConnection {
           ExceptionCode.ResourceNotFound,
           `Remote resource '${path}' was not found.`,
         );
-      const resolvedTypeDef = typeDef ?? (await this.fetchTypeDefByResourceId(instanceId)).template;
-      return this.attach(instanceId, resolvedTypeDef);
+      return this.attach(instanceId, target);
     });
   }
 
   /** .NET-compatible alias for {@link get}. */
-  Get(path: string, typeDef?: TypeDef): AsyncReply {
-    return this.get(path, typeDef);
+  Get<T extends EpResource = EpResource>(
+    path: string,
+    target?: EpResourceAttachTarget<T>,
+  ): AsyncReply {
+    return this.get(path, target);
   }
 
   /** Reopen the WebSocket session and reattach all known remote resources. */
@@ -1350,12 +1369,39 @@ export class EpConnection extends NetworkConnection {
   }
 
   /**
-   * Attach to a remote resource, returning a dynamic {@link EpResource} proxy
-   * primed with current property values and kept fresh by notifications. The
-   * caller supplies the resource's {@link TypeDef} (e.g. from generated
-   * stubs); a server build resolves it from the warehouse.
+   * Attach to a remote resource, returning a live {@link EpResource}. Passing
+   * a generated EpResource subclass instantiates that class; passing a TypeDef
+   * keeps the dynamic-proxy behavior.
    */
-  attach(instanceId: number, typeDef: TypeDef): AsyncReply {
+  attach(instanceId: number): AsyncReply<any>;
+  attach(instanceId: number, typeDef: TypeDef): AsyncReply<any>;
+  attach<T extends EpResource>(
+    instanceId: number,
+    ctor: EpResourceConstructor<T>,
+  ): AsyncReply<T & Record<string, any>>;
+  attach<T extends EpResource>(
+    instanceId: number,
+    target?: EpResourceAttachTarget<T>,
+  ): AsyncReply<any>;
+  attach<T extends EpResource>(
+    instanceId: number,
+    target?: EpResourceAttachTarget<T>,
+  ): AsyncReply {
+    const resolved = this.resolveAttachTarget(target);
+    if (resolved.typeDef)
+      return this.attachWithTypeDef(instanceId, resolved.typeDef, resolved.ctor);
+
+    return this.fetchTypeDefByResourceId(instanceId).then((remoteTypeDef) => {
+      const ctor = resolved.ctor ?? this.findProxyType(remoteTypeDef);
+      return this.attachWithTypeDef(instanceId, remoteTypeDef.template, ctor);
+    });
+  }
+
+  private attachWithTypeDef<T extends EpResource>(
+    instanceId: number,
+    typeDef: TypeDef,
+    ctor?: EpResourceConstructor<T>,
+  ): AsyncReply {
     return this.sendRequest(EpPacketRequest.AttachResource, instanceId).then((reply) => {
       // Reply: [typeDefId, age, link, hops, propertyValues] (matches C#). The
       // 5th element is a RawData blob of (age, date, value) self-describing TDUs,
@@ -1367,7 +1413,7 @@ export class EpConnection extends NetworkConnection {
       const hops = asNumber(list[3]);
       const raw = list[4] as Uint8Array | undefined;
 
-      const resource = new EpResource(this, instanceId, typeDef, {
+      const resource = this.createAttachedResource(instanceId, typeDef, ctor, {
         typeDefId,
         age,
         link,
@@ -1382,6 +1428,39 @@ export class EpConnection extends NetworkConnection {
       this.attachedResources.set(instanceId, resource);
       return EpResource.createProxy(resource);
     });
+  }
+
+  private resolveAttachTarget<T extends EpResource>(
+    target?: EpResourceAttachTarget<T>,
+  ): { typeDef?: TypeDef; ctor?: EpResourceConstructor<T> } {
+    if (!target) return {};
+    if (isTypeDef(target)) return { typeDef: target };
+
+    return {
+      ctor: target,
+      typeDef: getGeneratedTypeDef(target, this.warehouse),
+    };
+  }
+
+  private createAttachedResource<T extends EpResource>(
+    instanceId: number,
+    typeDef: TypeDef,
+    ctor: EpResourceConstructor<T> | undefined,
+    options: EpResourceOptions,
+  ): EpResource {
+    const resource = ctor
+      ? new ctor(this, instanceId, options.age ?? 0, options.link ?? "")
+      : new EpResource();
+    resource.initializeRemote(this, instanceId, typeDef, options);
+    return resource;
+  }
+
+  private findProxyType(typeDef: RemoteTypeDef): EpResourceConstructor | undefined {
+    return this.warehouse?.tryGetProxyType(
+      typeDef.kind,
+      this.domain || this.hostName || "",
+      typeDef.name,
+    ) as EpResourceConstructor | undefined;
   }
 
   /**
@@ -2417,7 +2496,6 @@ export class EpConnection extends NetworkConnection {
 
     const resourceId = Number(parsed[0]);
     const index = Number(parsed[1]);
-    const args = (parsed[2] as unknown[]) ?? [];
 
     const resource = this.warehouse.getById(resourceId);
     if (!resource?.instance) {
@@ -2443,6 +2521,8 @@ export class EpConnection extends NetworkConnection {
       ))
     )
       return;
+
+    const args = toIndexedArguments(parsed[2], ft.args.length);
 
     let result: unknown;
     try {
@@ -3098,6 +3178,34 @@ function isConnectionOptions(value: unknown): value is EpConnectionOptions {
   );
 }
 
+function isTypeDef(value: unknown): value is TypeDef {
+  return value instanceof TypeDef ||
+    (
+      value != null &&
+      typeof value === "object" &&
+      Array.isArray((value as { members?: unknown }).members) &&
+      typeof (value as { getPropertyByIndex?: unknown }).getPropertyByIndex === "function"
+    );
+}
+
+function getGeneratedTypeDef(
+  ctor: Function,
+  warehouse: Warehouse | undefined,
+): TypeDef | undefined {
+  const statics = ctor as {
+    typeDef?: unknown;
+    TypeDef?: unknown;
+    template?: unknown;
+    Template?: unknown;
+  };
+  const explicit =
+    statics.typeDef ?? statics.TypeDef ?? statics.template ?? statics.Template;
+  if (isTypeDef(explicit)) return explicit;
+
+  const decorated = warehouse?.getTypeDef(ctor);
+  return decorated && decorated.members.length > 0 ? decorated : undefined;
+}
+
 function nullResult(): AuthenticationResult {
   return new AuthenticationResult(AuthenticationRuling.Succeeded, null, null, null, null);
 }
@@ -3138,6 +3246,25 @@ function asNumber(value: unknown): number {
 
 function asDate(value: unknown): Date | undefined {
   return value instanceof Date ? value : undefined;
+}
+
+function toIndexedArguments(value: unknown, expectedCount = 0): unknown[] {
+  if (value == null) return [];
+  if (Array.isArray(value)) return value;
+  if (!(value instanceof Map)) return [value];
+
+  let size = expectedCount;
+  for (const key of value.keys()) {
+    const index = asNumber(key);
+    if (index >= size) size = index + 1;
+  }
+
+  const args = new Array<unknown>(size);
+  for (const [key, item] of value.entries()) {
+    const index = asNumber(key);
+    if (Number.isInteger(index) && index >= 0) args[index] = item;
+  }
+  return args;
 }
 
 function asBytes(value: unknown): Uint8Array | undefined {

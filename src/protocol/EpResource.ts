@@ -1,7 +1,7 @@
 import { EventHandler } from "../core/EventHandler.js";
 import { AsyncReply } from "../core/AsyncReply.js";
 import type { DestroyedEvent } from "../core/IDestructible.js";
-import type { TypeDef } from "../resource/template.js";
+import { TypeDef } from "../resource/template.js";
 import type { Instance } from "../resource/Instance.js";
 import type { IResource, IResourceContext } from "../resource/IResource.js";
 import type { IDynamicResource } from "../resource/IDynamicResource.js";
@@ -31,6 +31,14 @@ export interface EpResourceOptions {
   link?: string;
   hops?: number;
 }
+
+/** Constructor shape emitted by generated TypeScript remote resource stubs. */
+export type EpResourceConstructor<T extends EpResource = EpResource> = new (
+  connection: EpConnection,
+  instanceId: number,
+  age: number,
+  link: string,
+) => T;
 
 /**
  * A remote resource proxy (port of C# `EpResource`). Wraps a connection +
@@ -80,16 +88,43 @@ export class EpResource implements IResource, IDynamicResource {
   link = "";
   hops = 0;
 
+  connection!: EpConnection;
+  instanceId = 0;
+  typeDef: TypeDef = new TypeDef("", []);
+
+  /** Array alias used by generated stubs (`this.properties[index]`). */
+  protected readonly properties: unknown[] = [];
+  /** .NET-name alias used by generated stubs (`this._properties[index]`). */
+  protected readonly _properties = this.properties;
+
+  constructor();
   constructor(
-    readonly connection: EpConnection,
-    public instanceId: number,
-    readonly typeDef: TypeDef,
-    options: EpResourceOptions = {},
+    connection: EpConnection,
+    instanceId: number,
+    typeDef: TypeDef,
+    options?: EpResourceOptions,
+  );
+  constructor(connection: EpConnection, instanceId: number, age: number, link?: string);
+  constructor(
+    connection?: EpConnection,
+    instanceId = 0,
+    typeDefOrAge?: TypeDef | number,
+    optionsOrLink: EpResourceOptions | string = {},
   ) {
-    this.typeDefId = options.typeDefId;
-    this.age = options.age ?? 0;
-    this.link = options.link ?? "";
-    this.hops = options.hops ?? 0;
+    if (connection) this.connection = connection;
+    this.instanceId = instanceId;
+
+    if (isTypeDef(typeDefOrAge)) {
+      this.typeDef = typeDefOrAge;
+      const options =
+        typeof optionsOrLink === "string" ? { link: optionsOrLink } : optionsOrLink;
+      this.setRemoteIdentity(options);
+    } else {
+      this.age = typeDefOrAge ?? 0;
+      this.link =
+        typeof optionsOrLink === "string" ? optionsOrLink : (optionsOrLink.link ?? "");
+      if (typeof optionsOrLink !== "string") this.setRemoteIdentity(optionsOrLink);
+    }
 
     this.propertyModified.add((change) => {
       for (const cb of this.propertyListeners.get(change.index) ?? []) cb(change.value);
@@ -193,6 +228,47 @@ export class EpResource implements IResource, IDynamicResource {
     return this.typeDef;
   }
 
+  /** .NET-compatible alias for {@link connection}. */
+  get ResourceConnection(): EpConnection {
+    return this.connection;
+  }
+
+  /** .NET-compatible alias for {@link link}. */
+  get ResourceLink(): string {
+    return this.link;
+  }
+
+  /** .NET-compatible alias for {@link instanceId}. */
+  get ResourceInstanceId(): number {
+    return this.instanceId;
+  }
+
+  set ResourceInstanceId(value: number) {
+    this.instanceId = value;
+  }
+
+  /** .NET-compatible alias for {@link typeDef}. */
+  get ResourceDefinition(): TypeDef {
+    return this.typeDef;
+  }
+
+  set ResourceDefinition(value: TypeDef) {
+    this.typeDef = value;
+  }
+
+  /** @internal Initialize an instance created from a generated subclass. */
+  initializeRemote(
+    connection: EpConnection,
+    instanceId: number,
+    typeDef: TypeDef,
+    options: EpResourceOptions = {},
+  ): void {
+    this.connection = connection;
+    this.instanceId = instanceId;
+    this.typeDef = typeDef;
+    this.setRemoteIdentity(options);
+  }
+
   /** @internal Update resource-level metadata returned by attach/reattach. */
   setRemoteIdentity(options: EpResourceOptions & { instanceId?: number }): void {
     if (options.instanceId != null) this.instanceId = options.instanceId;
@@ -204,6 +280,7 @@ export class EpResource implements IResource, IDynamicResource {
 
   /** @internal Seed or merge a property snapshot without implying a notification. */
   setPropertySnapshot(index: number, age: number, date: Date | undefined, value: unknown): void {
+    this.properties[index] = value;
     this.cache.set(index, value);
     this.propertyAges.set(index, age);
     this.propertyModificationDates.set(index, date);
@@ -235,6 +312,7 @@ export class EpResource implements IResource, IDynamicResource {
 
   /** @internal Apply a property value pushed by the server. */
   updateProperty(index: number, value: unknown, age?: number, date?: Date): void {
+    this.properties[index] = value;
     this.cache.set(index, value);
     if (age != null) {
       this.propertyAges.set(index, age);
@@ -262,11 +340,61 @@ export class EpResource implements IResource, IDynamicResource {
       this.eventOccurred.emit({ name: et.name, index, value });
       this.instance?.emitEventByIndex(index, value);
     }
+    this._EmitEventByIndex(index, value);
+  }
+
+  /** Invoke a remote function by index. Used by generated EpResource stubs. */
+  protected _Invoke(index: number, args: unknown = []): AsyncReply {
+    return this.requireConnection().invokeWithArguments(this.instanceId, index, normalizeArguments(args));
+  }
+
+  /** Older generated-stub alias for invoking by positional argument array. */
+  protected _InvokeByArrayArguments(index: number, args: readonly unknown[] = []): AsyncReply {
+    return this._Invoke(index, args);
+  }
+
+  /** Read a cached remote property by index. Used by generated EpResource stubs. */
+  protected GetResourceProperty<T = unknown>(index: number): T {
+    return this.properties[index] as T;
+  }
+
+  /** Set a remote property asynchronously by index. */
+  protected SetResourcePropertyAsync(index: number, value: unknown): AsyncReply<void> {
+    return this.requireConnection().set(this.instanceId, index, value).then(() => {
+      this.setLocalProperty(index, value);
+    }) as AsyncReply<void>;
+  }
+
+  /** camelCase alias for {@link SetResourcePropertyAsync}. */
+  protected setResourcePropertyAsync(index: number, value: unknown): AsyncReply<void> {
+    return this.SetResourcePropertyAsync(index, value);
+  }
+
+  /** Set a remote property by index and update the local cache optimistically. */
+  protected SetResourceProperty(index: number, value: unknown): AsyncReply<void> {
+    const reply = this.requireConnection().set(this.instanceId, index, value).then(() => undefined);
+    this.setLocalProperty(index, value);
+    return reply as AsyncReply<void>;
+  }
+
+  /** Override point for generated typed event dispatch. */
+  protected _EmitEventByIndex(_index: number, _value: unknown): void {
+    /* generated subclasses may override */
+  }
+
+  private setLocalProperty(index: number, value: unknown): void {
+    this.properties[index] = value;
+    this.cache.set(index, value);
+  }
+
+  private requireConnection(): EpConnection {
+    if (!this.connection) throw new Error("Remote resource is not attached to a connection.");
+    return this.connection;
   }
 
   /** Wrap an {@link EpResource} in an ergonomic dynamic proxy. */
-  static createProxy(resource: EpResource): EpResource & Record<string, unknown> {
-    return new Proxy(resource, proxyHandler) as EpResource & Record<string, unknown>;
+  static createProxy(resource: EpResource): EpResource & Record<string, any> {
+    return new Proxy(resource, proxyHandler) as EpResource & Record<string, any>;
   }
 
   // ---- IResource / IDestructible -----------------------------------------
@@ -294,14 +422,13 @@ export class EpResource implements IResource, IDynamicResource {
     return this.typeDef;
   }
 
-  getResourceProperty(index: number): unknown {
-    return this.cache.get(index);
+  getResourceProperty<T = unknown>(index: number): T {
+    return this.cache.get(index) as T;
   }
 
   /** Forward a write to the upstream connection this proxy is relaying — the same path the ergonomic proxy's `set` trap uses. */
-  setResourceProperty(index: number, value: unknown): void {
-    this.connection.set(this.instanceId, index, value);
-    this.cache.set(index, value);
+  setResourceProperty(index: number, value: unknown): AsyncReply<void> {
+    return this.SetResourceProperty(index, value);
   }
 
   getResourcePropertyAge(index: number): number {
@@ -351,3 +478,17 @@ const proxyHandler: ProxyHandler<EpResource> = {
     return Reflect.set(target, prop, value, receiver);
   },
 };
+
+function isTypeDef(value: unknown): value is TypeDef {
+  return value instanceof TypeDef ||
+    (
+      value != null &&
+      typeof value === "object" &&
+      Array.isArray((value as { members?: unknown }).members) &&
+      typeof (value as { getPropertyByIndex?: unknown }).getPropertyByIndex === "function"
+    );
+}
+
+function normalizeArguments(args: unknown): unknown {
+  return args == null ? [] : args;
+}
