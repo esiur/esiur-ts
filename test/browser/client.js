@@ -104,7 +104,7 @@ async function runBrowserClientTest() {
     config.epUrl,
     new EpConnectionContext({
       AuthenticationMode: AuthenticationMode.InitializerIdentity,
-      AuthenticationProtocol: "hash",
+      AuthenticationProtocol: "password-sha3-v1",
       AutoReconnect: true,
       ReconnectInterval: 25,
       Identity: "tester",

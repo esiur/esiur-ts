@@ -59,6 +59,8 @@ export enum TduIdentifier {
 
   // Typed
   Typed = 0x80,
+  TypeDef = 0x81,
+  TRU = 0x82,
 
   // Extension
   TypeContinuation = 0xc0,

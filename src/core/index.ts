@@ -5,6 +5,7 @@ export * from "./LogType.js";
 export * from "./AsyncException.js";
 export * from "./IDestructible.js";
 export * from "./AsyncReply.js";
+export * from "./AsyncStreamReply.js";
 export * from "./AsyncBag.js";
 export * from "./AsyncQueue.js";
 export * from "./EventHandler.js";

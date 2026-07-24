@@ -1,7 +1,7 @@
 import { TruIdentifier } from "./TruIdentifier.js";
 import { merge } from "./DC.js";
 import * as DC from "./DC.js";
-import { registerTruParser } from "./ParsedTdu.js";
+import { registerTruParser, registerTruParserAsync } from "./ParsedTdu.js";
 import type { ComposableTru } from "./Tdu.js";
 import type { ITypeDef } from "./types/ITypeDef.js";
 
@@ -272,3 +272,12 @@ export function registerTypeDefResolver(
 
 // Make typed TDUs decodable by wiring Tru parsing into ParsedTdu.
 registerTruParser((data, offset, warehouse) => Tru.parseSync(data, offset, warehouse));
+registerTruParserAsync((data, offset, warehouse, remoteResolver, requestSequence) =>
+  Tru.parseAsync(
+    data,
+    offset,
+    warehouse,
+    remoteResolver as RemoteTypeDefResolver | undefined,
+    requestSequence,
+  ),
+);

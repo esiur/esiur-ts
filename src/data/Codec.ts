@@ -6,9 +6,11 @@ import * as D from "./DataDeserializer.js";
 import { Decimal128 } from "./Decimal128.js";
 import { Uuid } from "./Uuid.js";
 import { merge } from "./DC.js";
-import { TruComposite, type Tru } from "./Tru.js";
+import { Tru, TruComposite, type RemoteTypeDefResolver } from "./Tru.js";
 import { TruIdentifier } from "./TruIdentifier.js";
 import { TypedList, TypedMap, TypedTuple, tupleIdentifier } from "./descriptors.js";
+import { IndexedStructure } from "./IndexedStructure.js";
+import { TypeDefInfo } from "./types/TypeDefInfo.js";
 import {
   GroupInt16Codec,
   GroupInt32Codec,
@@ -91,6 +93,17 @@ export function composeInternal(
   // values via the Tru family.
   if (Array.isArray(value))
     return listComposer(value, TduIdentifier.List, warehouse, connection);
+  if (value instanceof Map)
+    return mapComposer(value, warehouse, connection);
+
+  // A `Tru` value composes into its own dedicated, metadata-free TDU slot; a
+  // `TypeDefInfo` composes into its own dedicated slot wrapping a structure
+  // payload; any other `IndexedStructure` composes as a plain sparse
+  // `TypedMap<u8, dynamic>` (see `IndexedStructureCodec`).
+  if (value instanceof Tru) return S.truComposer(value, warehouse, connection);
+  if (value instanceof TypeDefInfo) return S.typeDefComposer(value, warehouse, connection);
+  if (value instanceof IndexedStructure)
+    return S.structureComposer(value, warehouse, connection);
 
   // Records, enums and other registered structured types are handled by the
   // resource layer through hooks, keeping `data/` independent of it.
@@ -156,6 +169,16 @@ function listComposer(
 
   const content = merge(...parts);
   return new Tdu(identifier, content, content.length);
+}
+
+/** Compose a bare JS `Map` as a self-describing Dynamic `Map` TDU (flattened key/value TDU stream). */
+function mapComposer(value: Map<unknown, unknown>, warehouse: unknown, connection: unknown): Tdu {
+  const flat: unknown[] = [];
+  for (const [k, v] of value) {
+    flat.push(k);
+    flat.push(v);
+  }
+  return listComposer(flat, TduIdentifier.Map, warehouse, connection);
 }
 
 /** Compose an explicitly-typed array as a Typed TDU with `TypedList<element>`. */
@@ -278,7 +301,7 @@ const dynamicParsers: D.Parser[] = [
   D.mapListParser,
 ];
 
-const typedParsers: D.Parser[] = [D.typedParser];
+const typedParsers: D.Parser[] = [D.typedParser, D.typeDefInfoParser, D.truParser];
 
 /** Dispatch an already-parsed TDU header to the matching value parser. */
 export function parseSyncTdu(tdu: ParsedTdu, warehouse: unknown = null): unknown {
@@ -311,4 +334,75 @@ export function parseSync(
 /** Decode one value at `offset` and return just the value. */
 export function parse(data: Uint8Array, offset = 0, warehouse: unknown = null): unknown {
   return parseSync(data, offset, warehouse).value;
+}
+
+// ---- async decode -------------------------------------------------------
+//
+// Parallel to the sync pipeline above, needed only because a `Tru`/`TypeDef`
+// value anywhere in a decoded tree may reference a not-yet-fetched remote
+// TypeDef. Most callers (regular request/reply decoding) never need this —
+// it exists for `RemoteTypeDef`'s new-format (`TduIdentifier.TypeDef`, 0x81)
+// decode path, which commonly contains member value-types that reference
+// other remote TypeDefs on the same connection.
+
+const dynamicAsyncParsers: D.AsyncParser[] = [
+  D.rawDataParserAsync,
+  D.stringParserAsync,
+  D.listParserAsync,
+  D.resourceListParserAsync,
+  D.recordListParserAsync,
+  D.resourceLinkParserAsync,
+  D.mapParserAsync,
+  D.mapListParserAsync,
+];
+
+const typedAsyncParsers: D.AsyncParser[] = [
+  D.typedParserAsync,
+  D.typeDefInfoParserAsync,
+  D.truParserAsync,
+];
+
+/** Async twin of {@link parseSyncTdu}. */
+export async function parseAsyncTdu(
+  tdu: ParsedTdu,
+  warehouse: unknown,
+  remoteResolver: RemoteTypeDefResolver | undefined,
+  requestSequence: readonly number[] | null,
+): Promise<unknown> {
+  switch (tdu.tduClass) {
+    case TduClass.Fixed:
+      // Fixed-class values are always primitives; no async resolution is ever needed.
+      return fixedParsers[tdu.exponent][tdu.index](tdu, warehouse);
+    case TduClass.Dynamic:
+      return dynamicAsyncParsers[tdu.index](tdu, warehouse, remoteResolver, requestSequence);
+    case TduClass.Typed:
+      return typedAsyncParsers[tdu.index](tdu, warehouse, remoteResolver, requestSequence);
+    case TduClass.Extension:
+      throw new Error("Extension TDUs are not supported.");
+    default:
+      throw new Error("Invalid TDU.");
+  }
+}
+
+/** Async twin of {@link parseSync}. */
+export async function parseAsync(
+  data: Uint8Array,
+  offset: number,
+  warehouse: unknown,
+  remoteResolver: RemoteTypeDefResolver | undefined,
+  requestSequence: readonly number[] | null,
+): Promise<{ value: unknown; length: number }> {
+  const tdu = await ParsedTdu.parseAsync(
+    data,
+    offset,
+    data.length,
+    warehouse,
+    remoteResolver,
+    requestSequence,
+  );
+  if (tdu.tduClass === TduClass.Invalid) throw new Error("DataType can't be parsed.");
+  return {
+    value: await parseAsyncTdu(tdu, warehouse, remoteResolver, requestSequence),
+    length: tdu.totalLength,
+  };
 }

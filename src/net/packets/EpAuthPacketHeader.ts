@@ -17,4 +17,6 @@ export enum EpAuthPacketHeader {
   AuthenticationProtocol = 14,
   AuthenticationData = 15,
   ErrorMessage = 16,
+  /** Fresh public nonce used with the authenticated session key to derive unique per-connection encryption keys. */
+  CipherNonce = 17,
 }

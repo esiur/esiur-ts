@@ -38,4 +38,16 @@ export class LocalTypeDef implements ITypeDef {
   setProperty(instance: object, name: string, value: unknown): void {
     (instance as { [key: string]: unknown })[name] = value;
   }
+
+  /**
+   * Invoke a `static` exported function by name (port of what dotnet reaches
+   * via `MethodInfo.Invoke(null, args)` for a static `FunctionDef`). The
+   * caller is responsible for having checked `FunctionTemplate.isStatic`.
+   */
+  invokeStaticFunction(name: string, args: unknown[]): unknown {
+    if (!this.ctor) throw new Error(`TypeDef '${this.name}' has no constructor.`);
+    const fn = (this.ctor as unknown as Record<string, (...a: unknown[]) => unknown>)[name];
+    if (typeof fn !== "function") throw new Error(`'${this.name}' has no static function '${name}'.`);
+    return fn(...args);
+  }
 }

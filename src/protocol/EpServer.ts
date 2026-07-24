@@ -2,6 +2,41 @@ import type { Warehouse } from "../resource/Warehouse.js";
 import { WSocket } from "../net/sockets/WSocket.js";
 import { EpConnection } from "./EpConnection.js";
 import type { IAuthenticationProvider } from "../security/IAuthenticationProvider.js";
+import type { VerifyClientCallbackAsync } from "ws";
+
+/**
+ * The WebSocket subprotocol a connecting peer must request (matches
+ * `WSocket`'s `EP_SUBPROTOCOL` and esiur-dotnet's `FrameworkWebSocket.SubProtocol`).
+ * Upgrades that don't request it -- exactly and case-sensitively -- are rejected
+ * with `400 Bad Request`, mirroring esiur-dotnet's `EsiurWebSocketEndpoint` and
+ * the raw-TCP upgrade path in `EpConnection.cs`.
+ */
+const EP_SUBPROTOCOL = "EP";
+
+/** Reject the upgrade unless the client requested the "EP" subprotocol. */
+const verifyEpSubprotocol: VerifyClientCallbackAsync = (info, callback) => {
+  const protocols = requestedProtocols(info.req.headers["sec-websocket-protocol"]);
+  if (protocols.includes(EP_SUBPROTOCOL)) {
+    callback(true);
+  } else {
+    callback(false, 400, `The '${EP_SUBPROTOCOL}' WebSocket subprotocol is required.`);
+  }
+};
+
+/** Always negotiate "EP" itself, regardless of what else the client offered. */
+function selectEpSubprotocol(protocols: Set<string>): string | false {
+  return protocols.has(EP_SUBPROTOCOL) ? EP_SUBPROTOCOL : false;
+}
+
+/** Split a raw `Sec-WebSocket-Protocol` header value into its comma-separated tokens. */
+function requestedProtocols(header: string | string[] | undefined): string[] {
+  const raw = Array.isArray(header) ? header.join(",") : header;
+  if (!raw) return [];
+  return raw
+    .split(",")
+    .map((protocol) => protocol.trim())
+    .filter((protocol) => protocol.length > 0);
+}
 
 export interface EpServerOptions {
   /** Port to listen on (0 = an ephemeral port). */
@@ -36,7 +71,12 @@ export class EpServer {
       options.warehouse.registerAuthenticationProvider(options.authenticationProvider);
 
     const { WebSocketServer } = await import("ws");
-    const wss = new WebSocketServer({ port: options.port, host: options.host });
+    const wss = new WebSocketServer({
+      port: options.port,
+      host: options.host,
+      verifyClient: verifyEpSubprotocol,
+      handleProtocols: selectEpSubprotocol,
+    });
     server.wss = wss;
 
     await new Promise<void>((resolve, reject) => {

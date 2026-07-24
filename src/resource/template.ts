@@ -1,4 +1,5 @@
 import type { Tru } from "../data/Tru.js";
+import { StreamMode } from "../data/types/StreamMode.js";
 
 /**
  * Lightweight TypeDef describing a resource's exported members, built from
@@ -21,6 +22,8 @@ export class ArgumentTemplate {
 
 export class PropertyTemplate {
   readonly memberType = MemberType.Property;
+  /** Named Warehouse rate policy applied by `@RateControl(name)`. */
+  ratePolicyName?: string;
   constructor(
     public name: string,
     public index: number,
@@ -32,6 +35,8 @@ export class PropertyTemplate {
 
 export class FunctionTemplate {
   readonly memberType = MemberType.Function;
+  /** Named Warehouse rate policy applied by `@RateControl(name)`. */
+  ratePolicyName?: string;
   constructor(
     public name: string,
     public index: number,
@@ -39,6 +44,10 @@ export class FunctionTemplate {
     public args: ArgumentTemplate[] = [],
     public isStatic = false,
     public annotations?: Map<string, string>,
+    /** `None` for an ordinary call; `Push`/`Pull` for a streamed one (see `@Export`'s `streamMode` option). */
+    public streamMode: StreamMode = StreamMode.None,
+    /** Whether an in-flight stream from this function can be halted/resumed. Meaningless when `streamMode` is `None`. */
+    public pausable = false,
   ) {}
 }
 
@@ -49,7 +58,9 @@ export class EventTemplate {
     public index: number,
     public argType: Tru | undefined,
     public annotations?: Map<string, string>,
-    public subscribable = false,
+    // Matches dotnet: an event requires an explicit Subscribe by default;
+    // `@AutoDelivered()` (port of C#'s `[AutoDelivery]`) opts out of that.
+    public subscribable = true,
   ) {}
 }
 

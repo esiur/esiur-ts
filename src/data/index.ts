@@ -16,6 +16,7 @@ export * from "./widths.js";
 export * from "./TruIdentifier.js";
 export * from "./Tru.js";
 export * from "./types/ITypeDef.js";
+export * from "./types/StreamMode.js";
 export * from "./descriptors.js";
 export * as Codec from "./Codec.js";
 export * as DataSerializer from "./DataSerializer.js";

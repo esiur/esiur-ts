@@ -1,4 +1,5 @@
 import { AsyncReply } from "../core/AsyncReply.js";
+import { AsyncStreamReply } from "../core/AsyncStreamReply.js";
 import { AsyncException } from "../core/AsyncException.js";
 import { ErrorType } from "../core/ErrorType.js";
 import { ExceptionCode } from "../core/ExceptionCode.js";
@@ -12,12 +13,19 @@ import { EpPacketReply } from "../net/packets/EpPacketReply.js";
 import { EpPacketNotification } from "../net/packets/EpPacketNotification.js";
 import type { PlainTdu } from "../data/PlainTdu.js";
 import { compose, parse, parseSync } from "../data/Codec.js";
-import { getUint64, merge } from "../data/DC.js";
+import { TduIdentifier } from "../data/TduIdentifier.js";
+import { TypeDefInfo } from "../data/types/TypeDefInfo.js";
+import { TypeDefKind, type ITypeDef } from "../data/types/ITypeDef.js";
+import { StreamMode } from "../data/types/StreamMode.js";
+import { Tru, TruComposite, TruTypeDef } from "../data/Tru.js";
+import { getUint32, getUint64, merge, uint32ToBytes } from "../data/DC.js";
+import { Endian } from "../data/Endian.js";
 import { typedMap } from "../data/descriptors.js";
 import { t } from "../data/descriptors.js";
 import { u8 } from "../data/widths.js";
 import { ResourceId } from "../data/ResourceId.js";
 import { WSocket } from "../net/sockets/WSocket.js";
+import type { ISocket } from "../net/sockets/ISocket.js";
 import { EpAuthPacket } from "../net/packets/EpAuthPacket.js";
 import { EpAuthPacketCommand } from "../net/packets/EpAuthPacketCommand.js";
 import { EpAuthPacketMethod } from "../net/packets/EpAuthPacketMethod.js";
@@ -31,10 +39,21 @@ import { AuthenticationRuling } from "../security/AuthenticationRuling.js";
 import type { AuthenticationSession } from "../security/AuthenticationSession.js";
 import type { IAuthenticationHandler } from "../security/IAuthenticationHandler.js";
 import type { IAuthenticationProvider } from "../security/IAuthenticationProvider.js";
+import type { IEncryptionProvider } from "../security/cryptography/IEncryptionProvider.js";
+import type { ISymetricCipher } from "../security/cryptography/ISymetricCipher.js";
+import type { EncryptionContext } from "../security/cryptography/EncryptionContext.js";
+import { randomBytes } from "../security/random.js";
+import { ResourceManagerContext } from "../security/management/ResourceManagerContext.js";
+import { ActionType } from "../security/permissions/ActionType.js";
 import type { Warehouse } from "../resource/Warehouse.js";
-import type { TypeDef } from "../resource/template.js";
+import type { TypeDef, MemberTemplate, FunctionTemplate } from "../resource/template.js";
+import type { IResource } from "../resource/IResource.js";
+import { isDynamicResource } from "../resource/IDynamicResource.js";
+import { LocalTypeDef } from "../resource/typedef.js";
+import { typeDefInfoFromTypeDef } from "../resource/typeDefInfoCompose.js";
 import { EpResource, type RemotePropertyValue } from "./EpResource.js";
 import { RemoteTypeDef } from "./RemoteTypeDef.js";
+import { ServerInvocationContext, isIterableResult } from "./ServerInvocationContext.js";
 
 /** Handles an inbound request packet (server-side dispatch). */
 export type RequestHandler = (
@@ -64,10 +83,14 @@ export interface EpConnectionOptions {
   authenticationMode?: AuthenticationMode;
   /** .NET-compatible alias for {@link authenticationMode}. */
   AuthenticationMode?: AuthenticationMode;
-  /** Authentication protocol name. Default `"hash"`. */
+  /** Authentication protocol name. Default `"password-sha3-v1"`. */
   authenticationProtocol?: string;
   /** .NET-compatible alias for {@link authenticationProtocol}. */
   AuthenticationProtocol?: string;
+  /** Transport encryption mode requested by the initiator. Default `None`. */
+  encryptionMode?: EncryptionMode;
+  /** .NET-compatible alias for {@link encryptionMode}. */
+  EncryptionMode?: EncryptionMode;
   /** Provider used to create the initiator authentication handler. */
   authenticationProvider?: IAuthenticationProvider;
   /** PascalCase alias for {@link authenticationProvider}. */
@@ -84,6 +107,18 @@ export interface EpConnectionOptions {
   domain?: string;
   /** .NET-compatible alias for {@link domain}. */
   Domain?: string;
+  /**
+   * Absolute `ws`/`wss` URL used verbatim as the socket transport, overriding
+   * whatever host/port was parsed from the `Warehouse.get`/`connect` path.
+   * Lets a resource path (e.g. `sys/counter`) and a WebSocket upgrade route
+   * that doesn't match it (e.g. an ASP.NET Core host mounting Esiur at
+   * `/esiur`) be specified independently — mirrors dotnet's
+   * `EpConnectionContext.WebSocketUri`, which is used as-is, never
+   * concatenated with the resource path.
+   */
+  webSocketUri?: string | URL;
+  /** .NET-compatible alias for {@link webSocketUri}. */
+  WebSocketUri?: string | URL;
 }
 
 /** .NET-compatible connection context accepted by `Warehouse.get` and `EpConnection.connect`. */
@@ -93,9 +128,11 @@ export class EpConnectionContext implements EpConnectionOptions {
   AuthenticationMode?: AuthenticationMode;
   AuthenticationProtocol?: string;
   AuthenticationProvider?: IAuthenticationProvider;
+  EncryptionMode?: EncryptionMode;
   Identity?: string;
   ResponderIdentity?: string;
   Domain?: string;
+  WebSocketUri?: string | URL;
 
   constructor(options?: EpConnectionOptions) {
     if (options) Object.assign(this, options);
@@ -139,6 +176,17 @@ export class EpConnection extends NetworkConnection {
 
   /** Remote resources attached through this connection (instance id → proxy state). */
   private readonly attachedResources = new Map<number, EpResource>();
+
+  /**
+   * The raw {@link EpResource} behind an id returned by {@link get}/{@link attach}
+   * (which hand back the ergonomic dot-access proxy instead). Needed to
+   * `warehouse.put()` a fetched resource for relaying to a third node — the
+   * warehouse machinery needs the real object, not a Proxy wrapper, so it can
+   * assign `.instance` and use it as an `IDynamicResource` directly.
+   */
+  getAttachedResource(instanceId: number): EpResource | undefined {
+    return this.attachedResources.get(instanceId);
+  }
   /** Remote TypeDefs currently needed by an in-flight parse (type id to placeholder). */
   private readonly neededTypeDefs = new Map<number, RemoteTypeDef>();
   /** Fully parsed remote TypeDefs (type id to definition). */
@@ -149,6 +197,28 @@ export class EpConnection extends NetworkConnection {
   private readonly typeDefsFetchBlockedOn = new Map<number, Set<number>>();
   /** Server-side notification subscriptions (instance id → unsubscribe). */
   private readonly subscriptions = new Map<number, () => void>();
+  /**
+   * Server-side explicit per-event subscriptions (instance id → subscribed
+   * event indices), consulted only for events where {@link EventTemplate.subscribable}
+   * is true — other events keep being pushed to every attached connection
+   * unconditionally, as `subscribeToInstance` already does.
+   */
+  private readonly eventSubscriptions = new Map<number, Set<number>>();
+  /**
+   * Per (instanceId, eventIndex) marker listener used to ref-count an
+   * upstream `.on()` subscription when relaying a `subscribable` event
+   * through an {@link EpResource} — keeps the upstream connection subscribed
+   * only while at least one downstream peer here still is.
+   */
+  private readonly relayListeners = new Map<string, (value: unknown) => void>();
+  /**
+   * In-flight streamed calls, keyed by the *originating* `InvokeFunction`/
+   * `StaticCall` request's callback id — the same id `PullStream`/
+   * `TerminateExecution`/`HaltExecution`/`ResumeExecution` reference as
+   * their "execution callback" (see `sendStreamRequest`, the client-side
+   * counterpart that keys these the same way).
+   */
+  private readonly invocations = new Map<number, ServerInvocationContext>();
 
   // ---- handshake --------------------------------------------------------------
 
@@ -166,7 +236,15 @@ export class EpConnection extends NetworkConnection {
   private hostName: string | null = null;
   private authenticationMode = AuthenticationMode.None;
   private encryptionMode = EncryptionMode.None;
-  private authenticationProtocol = "hash";
+  private encryptionProvider: IEncryptionProvider | null = null;
+  private symetricCipher: ISymetricCipher | null = null;
+  /** True once inbound records are being decrypted (mirrors dotnet's `_decryptInbound`). */
+  private decryptInbound = false;
+  /** True once outbound records are being encrypted. */
+  private encryptionActive = false;
+  /** Encryption protocols offered in this connection's own Initialize headers (initiator only). */
+  private offeredEncryptionProviders: string[] = [];
+  private authenticationProtocol = "password-sha3-v1";
   private authenticationProvider?: IAuthenticationProvider;
   private authenticationHandler?: IAuthenticationHandler;
   private localIdentity: string | null = null;
@@ -256,7 +334,10 @@ export class EpConnection extends NetworkConnection {
     if (!isConnectionOptions(warehouseOrOptions) && warehouseOrOptions)
       connection.warehouse = warehouseOrOptions;
     connection.applyOptions(config);
-    await connection.openClientSocket(url);
+    // `webSocketUri`, when set, is used verbatim as the socket transport —
+    // never combined with `url` — matching dotnet's `WebSocketUri` override.
+    const webSocketUri = config?.webSocketUri ?? config?.WebSocketUri;
+    await connection.openClientSocket(webSocketUri ? String(webSocketUri) : url);
     return connection;
   }
 
@@ -267,6 +348,7 @@ export class EpConnection extends NetworkConnection {
     const authenticationMode = options.authenticationMode ?? options.AuthenticationMode;
     const authenticationProtocol = options.authenticationProtocol ?? options.AuthenticationProtocol;
     const authenticationProvider = options.authenticationProvider ?? options.AuthenticationProvider;
+    const encryptionMode = options.encryptionMode ?? options.EncryptionMode;
     const identity = options.identity ?? options.Identity;
     const responderIdentity = options.responderIdentity ?? options.ResponderIdentity;
     const domain = options.domain ?? options.Domain;
@@ -274,6 +356,7 @@ export class EpConnection extends NetworkConnection {
     if (autoReconnect != null) this.autoReconnect = autoReconnect;
     if (reconnectInterval != null) this.reconnectInterval = reconnectInterval;
     if (authenticationMode != null) this.authenticationMode = authenticationMode;
+    if (encryptionMode != null) this.encryptionMode = encryptionMode;
     if (authenticationProtocol != null) this.authenticationProtocol = authenticationProtocol;
     if (authenticationProvider != null) this.authenticationProvider = authenticationProvider;
     if (identity != null) this.localIdentity = identity;
@@ -292,10 +375,36 @@ export class EpConnection extends NetworkConnection {
     }
     this.startInitiatorHandshake(this.domain);
 
-    const socket = new WSocket();
+    const socket = await this.createClientSocket(url);
     this.assign(socket);
     await socket.connect(url);
     await this.whenReady();
+  }
+
+  /**
+   * Choose the transport for `url`'s scheme. Unlike C#'s `CreateClientSocket`
+   * (which picks `TcpSocket` vs `FrameworkWebSocket` based on whether
+   * `WebSocketUri`/a browser runtime is in play, since dotnet's connect API
+   * takes a bare host/port), esiur-ts's `connect()`/`Warehouse.get()` always
+   * take a single URL string — so the URL's own scheme is the natural,
+   * explicit selector here: `tcp://host:port` dials a raw {@link TcpSocket}
+   * (Node-only; esiur-dotnet servers exposing only their native `TcpServer`,
+   * with no WebSocket upgrade route, are otherwise unreachable from
+   * esiur-ts), anything else (`ws://`/`wss://`/`ep://`/`eps://`) keeps using
+   * {@link WSocket} as before.
+   */
+  private async createClientSocket(url: string): Promise<ISocket> {
+    let scheme = "";
+    try {
+      scheme = new URL(url).protocol.slice(0, -1).toLowerCase();
+    } catch {
+      /* fall through to the default WebSocket transport */
+    }
+    if (scheme === "tcp") {
+      const { TcpSocket } = await import("../net/sockets/TcpSocket.js");
+      return new TcpSocket();
+    }
+    return new WSocket();
   }
 
   /** Send the initiator's Initialize packet. */
@@ -303,6 +412,8 @@ export class EpConnection extends NetworkConnection {
     try {
       const headers = new Map(this.localHeaders);
       if (this.domain) headers.set(EpAuthPacketHeader.Domain, this.domain);
+
+      if (this.encryptionMode !== EncryptionMode.None) this.prepareEncryptionOffer(headers);
 
       if (this.authenticationMode !== AuthenticationMode.None) {
         const handler = this.getOrCreateInitiatorAuthenticationHandler();
@@ -329,6 +440,165 @@ export class EpConnection extends NetworkConnection {
     }
   }
 
+  /** Initiator: offer supported cipher names and a fresh nonce before sending Initialize. */
+  private prepareEncryptionOffer(headers: Map<EpAuthPacketHeader, unknown>): void {
+    if (this.authenticationMode === AuthenticationMode.None)
+      throw new Error("Session-key encryption requires an authenticated session.");
+    if (
+      this.encryptionMode !== EncryptionMode.EncryptWithSessionKey &&
+      this.encryptionMode !== EncryptionMode.EncryptWithSessionKeyAndAddress
+    )
+      throw new Error(`Unsupported encryption mode \`${this.encryptionMode}\`.`);
+
+    const names = this.offeredEncryptionProviders.length > 0
+      ? this.offeredEncryptionProviders
+      : (this.warehouse?.getEncryptionProviderNames() ?? []);
+    const offered = [...new Set(names.filter((n) => n && this.warehouse?.tryGetEncryptionProvider(n)))];
+
+    if (offered.length === 0)
+      throw new Error("Encryption was requested but none of the offered providers are registered.");
+
+    this.offeredEncryptionProviders = offered;
+    this.localHeaders.set(EpAuthPacketHeader.SupportedCiphers, offered);
+    this.localHeaders.delete(EpAuthPacketHeader.CipherType);
+    const nonce = randomBytes(32);
+    this.localHeaders.set(EpAuthPacketHeader.CipherNonce, nonce);
+    headers.set(EpAuthPacketHeader.SupportedCiphers, offered);
+    headers.set(EpAuthPacketHeader.CipherNonce, nonce);
+  }
+
+  /**
+   * Responder: negotiate an offered cipher against this connection's
+   * registered providers, mutating `localHeaders` (the Acknowledge headers
+   * about to be sent) with the selection.
+   */
+  private negotiateEncryptionAsResponder(localHeaders: Map<EpAuthPacketHeader, unknown>): boolean {
+    this.encryptionMode = this.authPacket.encryptionMode;
+    if (this.encryptionMode === EncryptionMode.None) return true;
+
+    if (
+      this.encryptionMode !== EncryptionMode.EncryptWithSessionKey &&
+      this.encryptionMode !== EncryptionMode.EncryptWithSessionKeyAndAddress
+    )
+      return this.rejectEncryption("The requested encryption mode is not supported.");
+    if (this.authPacket.authMode === AuthenticationMode.None)
+      return this.rejectEncryption("Session-key encryption requires authentication.");
+
+    const offered = asStringArray(this.remoteHeaders.get(EpAuthPacketHeader.SupportedCiphers));
+    const selected = offered.find((name) => name && this.warehouse?.tryGetEncryptionProvider(name));
+    if (!selected) return this.rejectEncryption("No mutually supported encryption provider is available.");
+
+    const remoteNonce = this.remoteHeaders.get(EpAuthPacketHeader.CipherNonce);
+    if (!(remoteNonce instanceof Uint8Array) || remoteNonce.length < 16 || remoteNonce.length > 64)
+      return this.rejectEncryption("The initiator did not supply a valid cipher nonce.");
+
+    this.encryptionProvider = this.warehouse!.getEncryptionProvider(selected);
+    const localOffered = (this.warehouse?.getEncryptionProviderNames() ?? []).filter(
+      (n) => this.warehouse?.tryGetEncryptionProvider(n),
+    );
+    this.localHeaders.set(EpAuthPacketHeader.SupportedCiphers, localOffered);
+    this.localHeaders.set(EpAuthPacketHeader.CipherType, selected);
+    const nonce = randomBytes(32);
+    this.localHeaders.set(EpAuthPacketHeader.CipherNonce, nonce);
+
+    localHeaders.set(EpAuthPacketHeader.SupportedCiphers, localOffered);
+    localHeaders.set(EpAuthPacketHeader.CipherType, selected);
+    localHeaders.set(EpAuthPacketHeader.CipherNonce, nonce);
+    return true;
+  }
+
+  /** Initiator: accept the responder's cipher selection from its Acknowledge headers. */
+  private acceptEncryptionAsInitiator(): boolean {
+    if (this.encryptionMode === EncryptionMode.None) {
+      const selected = this.remoteHeaders.get(EpAuthPacketHeader.CipherType);
+      return selected == null || this.rejectEncryption("The responder selected encryption that was not requested.");
+    }
+
+    const selected = this.remoteHeaders.get(EpAuthPacketHeader.CipherType);
+    if (typeof selected !== "string" || !selected.trim() || !this.offeredEncryptionProviders.includes(selected))
+      return this.rejectEncryption("The responder did not select an offered encryption provider.");
+
+    const remoteNonce = this.remoteHeaders.get(EpAuthPacketHeader.CipherNonce);
+    if (!(remoteNonce instanceof Uint8Array) || remoteNonce.length < 16 || remoteNonce.length > 64)
+      return this.rejectEncryption("The responder did not supply a valid cipher nonce.");
+
+    const provider = this.warehouse?.tryGetEncryptionProvider(selected);
+    if (!provider) return this.rejectEncryption(`Encryption provider \`${selected}\` is not registered locally.`);
+
+    this.encryptionProvider = provider;
+    return true;
+  }
+
+  private rejectEncryption(message: string): false {
+    try {
+      this.sendAuthData(EpAuthPacketMethod.ErrorMustEncrypt, message);
+    } catch {
+      /* best effort */
+    }
+    this.failAuthentication(message, true);
+    return false;
+  }
+
+  /**
+   * Once a session key and negotiated provider are available, derive the
+   * session cipher (port of C# `PrepareSessionEncryption`). Async only
+   * because {@link IEncryptionProvider.createCipher} may need to resolve a
+   * Node-only crypto module once per session — see `AesEncryptionProvider.ts`.
+   */
+  private async prepareSessionEncryption(): Promise<void> {
+    if (this.encryptionMode === EncryptionMode.None || this.symetricCipher) return;
+    if (!this.sessionKey || this.sessionKey.length === 0)
+      throw new Error("The authentication provider did not derive a session key for encryption.");
+    if (!this.encryptionProvider) throw new Error("No encryption provider was negotiated.");
+
+    const initiator = this.direction === "initiator";
+    const initiatorNonce = asBytes(
+      initiator
+        ? this.localHeaders.get(EpAuthPacketHeader.CipherNonce)
+        : this.remoteHeaders.get(EpAuthPacketHeader.CipherNonce),
+    );
+    const responderNonce = asBytes(
+      initiator
+        ? this.remoteHeaders.get(EpAuthPacketHeader.CipherNonce)
+        : this.localHeaders.get(EpAuthPacketHeader.CipherNonce),
+    );
+    if (!initiatorNonce || !responderNonce) throw new Error("Missing negotiated cipher nonce.");
+
+    const offeredProtocols = initiator
+      ? this.offeredEncryptionProviders
+      : asStringArray(this.remoteHeaders.get(EpAuthPacketHeader.SupportedCiphers));
+    const authenticationProtocol = initiator
+      ? this.authenticationHandler?.protocol
+      : String(this.remoteHeaders.get(EpAuthPacketHeader.AuthenticationProtocol) ?? "");
+    const selectedProtocol = String(
+      initiator
+        ? this.remoteHeaders.get(EpAuthPacketHeader.CipherType)
+        : this.localHeaders.get(EpAuthPacketHeader.CipherType),
+    );
+
+    const context: EncryptionContext = {
+      key: this.sessionKey,
+      direction: initiator ? AuthenticationDirection.Initiator : AuthenticationDirection.Responder,
+      mode: this.encryptionMode,
+      protocol: selectedProtocol,
+      offeredProtocols,
+      authenticationMode: this.authenticationMode,
+      authenticationProtocol: authenticationProtocol ?? "",
+      domain: initiator ? this.domain : String(this.remoteHeaders.get(EpAuthPacketHeader.Domain) ?? ""),
+      initiatorNonce,
+      responderNonce,
+    };
+
+    this.symetricCipher = await this.encryptionProvider.createCipher(context);
+  }
+
+  /** Turn on record protection for both directions once the cipher is ready. */
+  private enableEncryption(): void {
+    if (!this.symetricCipher) throw new Error("Cannot enable encryption before creating a cipher.");
+    this.decryptInbound = true;
+    this.encryptionActive = true;
+  }
+
   /** Handle an auth-phase packet. */
   private handleAuthPacket(packet: EpAuthPacket): void {
     try {
@@ -352,6 +622,8 @@ export class EpConnection extends NetworkConnection {
     for (const [key, value] of remoteHeaders) this.remoteHeaders.set(key, value);
 
     const localHeaders = new Map(this.localHeaders);
+
+    if (!this.negotiateEncryptionAsResponder(localHeaders)) return;
 
     if (packet.authMode === AuthenticationMode.None) {
       if (!this.allowUnauthorized) {
@@ -442,6 +714,8 @@ export class EpConnection extends NetworkConnection {
     const { headers: remoteHeaders, authData: remoteAuthData } = this.parseAuthHeaders(packet);
     this.remoteHeaders.clear();
     for (const [key, value] of remoteHeaders) this.remoteHeaders.set(key, value);
+
+    if (!this.acceptEncryptionAsInitiator()) return;
 
     const authResult = this.requireAuthenticationHandler().process(remoteAuthData);
     if (authResult.ruling === AuthenticationRuling.Failed) {
@@ -626,6 +900,25 @@ export class EpConnection extends NetworkConnection {
   private completeAuthentication(result?: AuthenticationResult | null): void {
     if (result) this.storeAuthenticationResult(result);
     this.authSessionEstablished = true;
+
+    if (this.encryptionMode === EncryptionMode.None) {
+      this.finishAuthenticationReady();
+      return;
+    }
+
+    // Every call site above has already sent its final plaintext auth
+    // message (SessionEstablished/Established) before reaching this point,
+    // so it's safe to derive the cipher and flip to encrypted transport here
+    // — nothing more goes out unencrypted after readiness is published.
+    void this.prepareSessionEncryption()
+      .then(() => {
+        this.enableEncryption();
+        this.finishAuthenticationReady();
+      })
+      .catch((e) => this.failAuthentication(e));
+  }
+
+  private finishAuthenticationReady(): void {
     this.authenticated = true;
     this.readyReply?.trigger(true);
     this.authenticationProvider?.login?.(this.getAuthenticationSession());
@@ -651,6 +944,10 @@ export class EpConnection extends NetworkConnection {
       key: this.sessionKey,
       authenticated: this.authenticated,
       variables: this.variables,
+      encryptionMode: this.encryptionMode,
+      encryptionProvider: this.encryptionProvider,
+      symetricCipher: this.symetricCipher,
+      encryptionActive: this.encryptionActive,
     };
   }
 
@@ -671,14 +968,137 @@ export class EpConnection extends NetworkConnection {
     return this.sendRequest(EpPacketRequest.InvokeFunction, instanceId, u8(index), args);
   }
 
+  /** Invoke a `static` exported function `index` on TypeDef `typeId` — no resource instance involved. */
+  staticCall(typeId: number, index: number, ...args: unknown[]): AsyncReply {
+    return this.sendRequest(EpPacketRequest.StaticCall, typeId, u8(index), args);
+  }
+
+  /**
+   * Send a stream-flavored request: the callback id also drives
+   * `PullStream`/`TerminateExecution`/`HaltExecution`/`ResumeExecution`
+   * against the same remote invocation via the returned {@link AsyncStreamReply}.
+   */
+  sendStreamRequest<T = unknown>(
+    streamMode: StreamMode,
+    action: EpPacketRequest,
+    ...args: unknown[]
+  ): AsyncStreamReply<T> {
+    const callbackId = ++this.callbackCounter;
+    const reply = new AsyncStreamReply<T>(
+      streamMode,
+      () => this.sendRequest(EpPacketRequest.PullStream, callbackId),
+      () => this.sendRequest(EpPacketRequest.TerminateExecution, callbackId),
+      () => this.sendRequest(EpPacketRequest.HaltExecution, callbackId),
+      () => this.sendRequest(EpPacketRequest.ResumeExecution, callbackId),
+    );
+    this.requests.set(callbackId, reply);
+    this.send(EpPacket.composeRequest(action, callbackId, this.composeArgs(args)));
+    return reply;
+  }
+
+  /** Invoke a streaming function `index` on the resource with `instanceId`. */
+  invokeStream<T = unknown>(
+    streamMode: StreamMode,
+    instanceId: number,
+    index: number,
+    ...args: unknown[]
+  ): AsyncStreamReply<T> {
+    return this.sendStreamRequest<T>(
+      streamMode,
+      EpPacketRequest.InvokeFunction,
+      instanceId,
+      u8(index),
+      args,
+    );
+  }
+
   /** Set property `index` on the resource with `instanceId`. */
   set(instanceId: number, index: number, value: unknown): AsyncReply {
     return this.sendRequest(EpPacketRequest.SetProperty, instanceId, u8(index), value);
   }
 
+  /**
+   * Subscribe to event `index` on the resource with `instanceId` — required
+   * before the server pushes `EventOccurred` notifications for events where
+   * {@link RemoteEventDef.subscribable} is true (`autoDelivered` events are
+   * pushed unconditionally and never need this). The server errors
+   * (`AlreadyListened`) on a duplicate call for an already-subscribed event,
+   * so callers must track subscription state themselves — see
+   * {@link EpResource.on}, which does this per-event, ref-counted by listener
+   * count, rather than sending on every call.
+   */
+  subscribe(instanceId: number, index: number): AsyncReply {
+    return this.sendRequest(EpPacketRequest.Subscribe, instanceId, u8(index));
+  }
+
+  /** Unsubscribe from event `index` on the resource with `instanceId`. See {@link subscribe}. */
+  unsubscribe(instanceId: number, index: number): AsyncReply {
+    return this.sendRequest(EpPacketRequest.Unsubscribe, instanceId, u8(index));
+  }
+
   /** Resolve a resource path to a {@link ResourceId} reference. */
   getResourceIdByLink(link: string): AsyncReply {
     return this.sendRequest(EpPacketRequest.GetResourceIdByLink, link);
+  }
+
+  /** Stop receiving notifications for a resource on this connection (it keeps living for other subscribers). */
+  detach(instanceId: number): AsyncReply {
+    return this.sendRequest(EpPacketRequest.DetachResource, instanceId);
+  }
+
+  /** Rename a resource (single path segment — no `/`). */
+  moveResource(instanceId: number, newName: string): AsyncReply {
+    return this.sendRequest(EpPacketRequest.MoveResource, instanceId, newName);
+  }
+
+  /** Remove a resource from the peer's warehouse. */
+  deleteResource(instanceId: number): AsyncReply {
+    return this.sendRequest(EpPacketRequest.DeleteResource, instanceId);
+  }
+
+  /**
+   * Create a resource of a type already registered on the peer's warehouse.
+   * `properties` is keyed by wire property index; replies with the new
+   * resource's instance id.
+   */
+  createResource(
+    path: string,
+    typeIdOrName: number | string,
+    properties?: Map<number, unknown>,
+    attributes?: Map<string, unknown>,
+  ): AsyncReply<number> {
+    return this.sendRequest(
+      EpPacketRequest.CreateResource,
+      path,
+      typeIdOrName,
+      properties ?? new Map<number, unknown>(),
+      attributes ?? new Map<string, unknown>(),
+    ).then((reply) => Number(reply));
+  }
+
+  /**
+   * Resolve a resource path, replying with its children as `[id, link]`
+   * pairs (see `epRequestQueryResources`'s doc comment for why this isn't
+   * full auto-attaching resource references, unlike dotnet's `Query`).
+   * Distinct from {@link getResourceIdByLink}, which resolves a single link.
+   */
+  queryResources(path: string): AsyncReply<Array<[number, string]>> {
+    return this.sendRequest(EpPacketRequest.Query, path).then(
+      (reply) => (reply as Array<[number, string]>) ?? [],
+    );
+  }
+
+  /** Bulk-fetch a resource type's full TypeDef dependency graph in one round trip. */
+  fetchLinkedTypeDefs(path: string): AsyncReply<RemoteTypeDef[]> {
+    return this.sendRequest(EpPacketRequest.LinkTypeDefs, path).then(async (reply) => {
+      const payloads = (reply as unknown[]) ?? [];
+      const results: RemoteTypeDef[] = [];
+      for (const p of payloads) {
+        const data = this.expectTypeDefPayload(p, "LinkTypeDefs did not return raw TypeDef payloads.");
+        results.push(await this.parseTypeDefPayload(data, null));
+      }
+      return results;
+    });
   }
 
   /** Fetch and parse the runtime TypeDef for a remote resource id. */
@@ -695,6 +1115,19 @@ export class EpConnection extends NetworkConnection {
   /** Fetch and parse a runtime TypeDef by its remote TypeDef id. */
   fetchTypeDefById(typeDefId: number): AsyncReply<RemoteTypeDef> {
     return this.fetchTypeDef(typeDefId, null);
+  }
+
+  /** Batch-resolve full class names to their remote TypeDef ids. */
+  getTypeDefIds(fullNames: string[]): AsyncReply<number[]> {
+    return this.sendRequest(EpPacketRequest.TypeDefIdsByNames, fullNames).then((reply) => {
+      if (!Array.isArray(reply))
+        throw new AsyncException(
+          ErrorType.Management,
+          ExceptionCode.ParseError,
+          "TypeDefIdsByNames did not return an id array.",
+        );
+      return reply.map((v) => Number(v));
+    });
   }
 
   /** Fetch and parse a runtime TypeDef by id, resolving cyclic remote TypeDef references. */
@@ -765,7 +1198,7 @@ export class EpConnection extends NetworkConnection {
     data: Uint8Array,
     requestSequence: readonly number[] | null,
   ): AsyncReply<RemoteTypeDef> {
-    const typeDefId = readTypeDefPayloadId(data);
+    const typeDefId = readTypeDefPayloadId(data, this.warehouse);
     const cached = this.cachedTypeDefs.get(typeDefId);
     if (cached) return AsyncReply.fromResult(cached);
 
@@ -854,9 +1287,14 @@ export class EpConnection extends NetworkConnection {
     return false;
   }
 
-  /** Resolve and attach a remote resource by its path on this connection. */
+  /**
+   * Resolve and attach a remote resource by its path on this connection. When
+   * `typeDef` is omitted, its TypeDef is fetched from the server first (one
+   * extra round trip) — mirrors dotnet's `Get<T>`, which never needs a
+   * caller-supplied type because C# generates the proxy dynamically.
+   */
   get(path: string, typeDef?: TypeDef): AsyncReply {
-    return this.getResourceIdByLink(path).then((resourceRef) => {
+    return this.getResourceIdByLink(path).then(async (resourceRef) => {
       const instanceId = toInstanceId(resourceRef);
       if (instanceId == null)
         throw new AsyncException(
@@ -864,8 +1302,8 @@ export class EpConnection extends NetworkConnection {
           ExceptionCode.ResourceNotFound,
           `Remote resource '${path}' was not found.`,
         );
-      if (!typeDef) return resourceRef;
-      return this.attach(instanceId, typeDef);
+      const resolvedTypeDef = typeDef ?? (await this.fetchTypeDefByResourceId(instanceId)).template;
+      return this.attach(instanceId, resolvedTypeDef);
     });
   }
 
@@ -947,26 +1385,37 @@ export class EpConnection extends NetworkConnection {
   }
 
   /**
-   * Reattach an already-known resource by sending its last-known age. The peer
-   * returns only properties modified after that age.
+   * Reattach an already-known resource by link or instance id, sending its
+   * last-known age. The peer returns only properties modified after that
+   * age. Prefer the link — the remote node may have freed/recreated the
+   * resource since, so its id is not permanent, but the link is. The reply
+   * leads with the resolved id so an id change (link re-resolved to a
+   * different instance) can be detected and tracking re-keyed.
    */
-  reattach(instanceId: number, age: number, resource: EpResource): AsyncReply<EpResource> {
-    return this.sendRequest(EpPacketRequest.ReattachResource, instanceId, age).then((reply) => {
+  reattach(resourceLinkOrId: string | number, age: number, resource: EpResource): AsyncReply<EpResource> {
+    return this.sendRequest(EpPacketRequest.ReattachResource, resourceLinkOrId, age).then((reply) => {
       const list = reply as unknown[];
       const oldId = resource.instanceId;
+      const resolvedId = asNumber(list[0]);
       resource.setRemoteIdentity({
-        instanceId,
-        typeDefId: asNumber(list[0]),
-        age: asNumber(list[1]),
-        link: String(list[2] ?? ""),
-        hops: asNumber(list[3]),
+        instanceId: resolvedId,
+        typeDefId: asNumber(list[1]),
+        age: asNumber(list[2]),
+        link: String(list[3] ?? ""),
+        hops: asNumber(list[4]),
       });
 
-      const raw = list[4] as Uint8Array | undefined;
+      const raw = list[5] as Uint8Array | undefined;
       if (raw) resource.applyDelta(this.parsePropertyValueMap(raw));
 
-      if (oldId !== instanceId) this.attachedResources.delete(oldId);
-      this.attachedResources.set(instanceId, resource);
+      if (resolvedId !== oldId) {
+        // Only evict oldId's entry if it still points to this resource —
+        // if the remote node reused oldId for something else in the
+        // meantime, a blind delete would wrongly evict that unrelated
+        // resource's own valid tracking.
+        if (this.attachedResources.get(oldId) === resource) this.attachedResources.delete(oldId);
+      }
+      this.attachedResources.set(resolvedId, resource);
       return resource;
     });
   }
@@ -1048,12 +1497,13 @@ export class EpConnection extends NetworkConnection {
     if (!resource?.instance) return new Uint8Array(0);
 
     const instance = resource.instance;
+    const dyn = isDynamicResource(resource) ? resource : undefined;
     const bag = resource as unknown as Record<string, unknown>;
     const parts: Uint8Array[] = [];
     for (const p of instance.definition.properties) {
       parts.push(compose(instance.getAge(p.index) ?? 0, this.warehouse, this));
       parts.push(compose(instance.getModificationDate(p.index) ?? new Date(0), this.warehouse, this));
-      parts.push(compose(bag[p.name], this.warehouse, this));
+      parts.push(compose(dyn ? dyn.getResourceProperty(p.index) : bag[p.name], this.warehouse, this));
     }
     return merge(...parts);
   }
@@ -1063,6 +1513,7 @@ export class EpConnection extends NetworkConnection {
     if (!resource?.instance) return new Uint8Array(0);
 
     const instance = resource.instance;
+    const dyn = isDynamicResource(resource) ? resource : undefined;
     const bag = resource as unknown as Record<string, unknown>;
     const parts: Uint8Array[] = [];
     for (const p of instance.definition.properties) {
@@ -1071,7 +1522,7 @@ export class EpConnection extends NetworkConnection {
       parts.push(compose(u8(p.index), this.warehouse, this));
       parts.push(compose(propertyAge, this.warehouse, this));
       parts.push(compose(instance.getModificationDate(p.index) ?? new Date(0), this.warehouse, this));
-      parts.push(compose(bag[p.name], this.warehouse, this));
+      parts.push(compose(dyn ? dyn.getResourceProperty(p.index) : bag[p.name], this.warehouse, this));
     }
     return merge(...parts);
   }
@@ -1080,26 +1531,9 @@ export class EpConnection extends NetworkConnection {
     const resources = [...this.attachedResources.values()];
     const stats = { restored: 0, failed: 0 };
     for (const resource of resources) {
-      let instanceId = resource.instanceId;
-      if (resource.link) {
-        try {
-          const resolved = await this.getResourceIdByLink(resource.link);
-          instanceId = toInstanceId(resolved) ?? instanceId;
-        } catch (e) {
-          if (AsyncException.from(e).code === ExceptionCode.ResourceNotFound) {
-            stats.failed++;
-            continue;
-          }
-          throw e;
-        }
-      }
-
       try {
-        if (instanceId !== resource.instanceId) {
-          this.attachedResources.delete(resource.instanceId);
-          resource.instanceId = instanceId;
-        }
-        await this.reattach(instanceId, resource.age, resource);
+        await this.reattach(resource.link || resource.instanceId, resource.age, resource);
+        resource.resubscribeAfterReconnect();
         stats.restored++;
       } catch (e) {
         if (AsyncException.from(e).code === ExceptionCode.ResourceNotFound) {
@@ -1112,6 +1546,25 @@ export class EpConnection extends NetworkConnection {
     this.lastRestoreStats = stats;
   }
 
+  // ---- outbound (encrypted transport) ------------------------------------------
+
+  private static readonly ENCRYPTED_RECORD_HEADER_SIZE = 4;
+
+  /**
+   * Wrap outbound bytes in an AES-GCM-protected record once encryption is
+   * active (port of C# `SendAsync`'s `ComposeEncryptedRecord` path):
+   * `[4-byte BE protected-length][cipher.encrypt(message)]`. Plain
+   * pass-through otherwise.
+   */
+  override send(message: Uint8Array): void {
+    if (!this.encryptionActive || !this.symetricCipher) {
+      super.send(message);
+      return;
+    }
+    const protectedPayload = this.symetricCipher.encrypt(message);
+    super.send(merge(uint32ToBytes(protectedPayload.length, Endian.Big), protectedPayload));
+  }
+
   // ---- inbound ----------------------------------------------------------------
 
   protected override dataReceived(buffer: NetworkBuffer): void {
@@ -1121,6 +1574,37 @@ export class EpConnection extends NetworkConnection {
     let offset = 0;
     const ends = msg.length;
     while (offset < ends) {
+      if (this.decryptInbound) {
+        const remaining = ends - offset;
+        const headerSize = EpConnection.ENCRYPTED_RECORD_HEADER_SIZE;
+        if (remaining < headerSize) {
+          buffer.holdFor(msg, offset, remaining, headerSize);
+          return;
+        }
+
+        const protectedLength = getUint32(msg, offset, Endian.Big);
+        const totalLength = headerSize + protectedLength;
+        if (remaining < totalLength) {
+          buffer.holdFor(msg, offset, remaining, totalLength);
+          return;
+        }
+
+        const protectedPayload = msg.subarray(offset + headerSize, offset + totalLength);
+        offset += totalLength;
+
+        let plaintext: Uint8Array;
+        try {
+          plaintext = this.symetricCipher!.decrypt(protectedPayload);
+        } catch (e) {
+          this.failAuthentication(e, true);
+          this.close();
+          return;
+        }
+
+        this.dispatchPlaintext(plaintext);
+        continue;
+      }
+
       // Auth phase: consume auth packets until the session is established; the
       // handshake may finish mid-buffer and the rest continues as Ep packets.
       if (!this.authenticated) {
@@ -1141,6 +1625,30 @@ export class EpConnection extends NetworkConnection {
         buffer.holdFor(msg, offset, size, size + -consumed);
         return;
       }
+      offset += consumed;
+      this.dispatch(this.packet);
+    }
+  }
+
+  /**
+   * Parse and dispatch every complete packet within an already-decrypted
+   * record. Unlike the plaintext path above, a truncated packet here is a
+   * genuine protocol error rather than "need more data" — the whole record
+   * was already fully received and authenticated before decryption.
+   */
+  private dispatchPlaintext(plaintext: Uint8Array): void {
+    let offset = 0;
+    const ends = plaintext.length;
+    while (offset < ends) {
+      if (!this.authenticated) {
+        const consumed = this.authPacket.parse(plaintext, offset, ends);
+        if (consumed <= 0) throw new Error("Truncated encrypted auth packet.");
+        offset += consumed;
+        this.handleAuthPacket(this.authPacket);
+        continue;
+      }
+      const consumed = this.packet.parse(plaintext, offset, ends);
+      if (consumed <= 0) throw new Error("Truncated encrypted packet.");
       offset += consumed;
       this.dispatch(this.packet);
     }
@@ -1167,27 +1675,130 @@ export class EpConnection extends NetworkConnection {
     if (this.warehouse) {
       switch (action) {
         case EpPacketRequest.InvokeFunction:
-          this.epRequestInvokeFunction(callbackId, tdu);
+          void this.epRequestInvokeFunction(callbackId, tdu);
+          return;
+        case EpPacketRequest.StaticCall:
+          void this.epRequestStaticCall(callbackId, tdu);
           return;
         case EpPacketRequest.SetProperty:
-          this.epRequestSetProperty(callbackId, tdu);
+          void this.epRequestSetProperty(callbackId, tdu);
+          return;
+        case EpPacketRequest.Subscribe:
+          void this.epRequestSubscribe(callbackId, tdu);
+          return;
+        case EpPacketRequest.Unsubscribe:
+          void this.epRequestUnsubscribe(callbackId, tdu);
           return;
         case EpPacketRequest.AttachResource:
-          this.epRequestAttachResource(callbackId, tdu);
+          void this.epRequestAttachResource(callbackId, tdu);
           return;
         case EpPacketRequest.ReattachResource:
-          this.epRequestReattachResource(callbackId, tdu);
+          void this.epRequestReattachResource(callbackId, tdu);
           return;
         case EpPacketRequest.GetResourceIdByLink:
           this.epRequestGetResourceIdByLink(callbackId, tdu);
+          return;
+        case EpPacketRequest.TypeDefById:
+          void this.epRequestTypeDefById(callbackId, tdu);
+          return;
+        case EpPacketRequest.TypeDefByResourceId:
+          void this.epRequestTypeDefByResourceId(callbackId, tdu);
+          return;
+        case EpPacketRequest.TypeDefIdsByNames:
+          void this.epRequestTypeDefIdsByNames(callbackId, tdu);
+          return;
+        case EpPacketRequest.Query:
+          void this.epRequestQueryResources(callbackId, tdu);
+          return;
+        case EpPacketRequest.LinkTypeDefs:
+          void this.epRequestLinkTypeDefs(callbackId, tdu);
+          return;
+        case EpPacketRequest.DetachResource:
+          void this.epRequestDetachResource(callbackId, tdu);
+          return;
+        case EpPacketRequest.CreateResource:
+          void this.epRequestCreateResource(callbackId, tdu);
+          return;
+        case EpPacketRequest.DeleteResource:
+          void this.epRequestDeleteResource(callbackId, tdu);
+          return;
+        case EpPacketRequest.MoveResource:
+          void this.epRequestMoveResource(callbackId, tdu);
+          return;
+        case EpPacketRequest.PullStream:
+          void this.epRequestPullStream(callbackId, tdu);
+          return;
+        case EpPacketRequest.TerminateExecution:
+          void this.epRequestTerminateExecution(callbackId, tdu);
+          return;
+        case EpPacketRequest.HaltExecution:
+          void this.epRequestHaltExecution(callbackId, tdu);
+          return;
+        case EpPacketRequest.ResumeExecution:
+          void this.epRequestResumeExecution(callbackId, tdu);
           return;
       }
     }
     this.onRequest?.(this, action, callbackId, tdu);
   }
 
+  /**
+   * Evaluate permissions/rate-control/auditing managers for one operation
+   * (port of C# `TryApplyManagers`). Sends the denial error itself and
+   * returns `false` when the operation isn't admitted; otherwise waits out
+   * any rate-control-assigned delay and returns `true`.
+   *
+   * Scope note: dotnet additionally tracks repeated rate-control denials
+   * per connection and, past a threshold, blocks the connection outright
+   * (`IsRateControlBlocked`/`DenyRateControlledRequest`) — a secondary
+   * DoS-hardening layer on top of this per-operation check, not ported here.
+   */
+  private async tryApplyManagers(
+    member: MemberTemplate | null,
+    resource: IResource | null,
+    action: ActionType,
+    callbackId: number,
+    denialErrorType: ErrorType,
+    denialCode: ExceptionCode,
+    supportsDelay = false,
+  ): Promise<boolean> {
+    if (!this.warehouse) return true;
+
+    const context = new ResourceManagerContext(
+      this.warehouse,
+      this,
+      this.getAuthenticationSession(),
+      resource,
+      member,
+      action,
+      this,
+      [],
+      null,
+      supportsDelay,
+    );
+
+    try {
+      const evaluation = this.warehouse.evaluateManagers(context);
+      if (!evaluation.isAllowed) {
+        this.sendError(denialErrorType, callbackId, denialCode);
+        return false;
+      }
+      if (evaluation.delay > 0) {
+        if (!supportsDelay) {
+          this.sendError(denialErrorType, callbackId, denialCode);
+          return false;
+        }
+        await new Promise<void>((resolve) => setTimeout(resolve, evaluation.delay));
+      }
+      return true;
+    } catch {
+      this.sendError(denialErrorType, callbackId, denialCode);
+      return false;
+    }
+  }
+
   /** Server handler: send current property values and subscribe the peer to changes. */
-  private epRequestAttachResource(callbackId: number, tdu: PlainTdu | null): void {
+  private async epRequestAttachResource(callbackId: number, tdu: PlainTdu | null): Promise<void> {
     if (!tdu || !this.warehouse) {
       this.sendError(ErrorType.Management, callbackId, ExceptionCode.ParseError);
       return;
@@ -1200,7 +1811,20 @@ export class EpConnection extends NetworkConnection {
       return;
     }
 
+    if (
+      !(await this.tryApplyManagers(
+        null,
+        resource,
+        ActionType.Attach,
+        callbackId,
+        ErrorType.Management,
+        ExceptionCode.AccessDenied,
+      ))
+    )
+      return;
+
     const instance = resource.instance;
+    if (!instance) return;
     const propertyValues = this.composePropertyValueArray(instanceId);
 
     const typeDef = this.warehouse.getLocalTypeDefByType(resource.constructor);
@@ -1218,8 +1842,15 @@ export class EpConnection extends NetworkConnection {
     );
   }
 
-  /** Server handler: send only properties modified after the caller's known age. */
-  private epRequestReattachResource(callbackId: number, tdu: PlainTdu | null): void {
+  /**
+   * Server handler: send only properties modified after the caller's known
+   * age. Accepts either a resource link (string) or a previously-known
+   * instance id (number) — the id is not permanent (the remote node may
+   * free/recreate a resource from memory), but the link is, so reconnecting
+   * clients resolve by link. Reply leads with the resolved id so the caller
+   * can detect it changed since its last attach.
+   */
+  private async epRequestReattachResource(callbackId: number, tdu: PlainTdu | null): Promise<void> {
     if (!tdu || !this.warehouse) {
       this.sendError(ErrorType.Management, callbackId, ExceptionCode.ParseError);
       return;
@@ -1233,22 +1864,48 @@ export class EpConnection extends NetworkConnection {
       return;
     }
 
-    const instanceId = Number(parsed[0]);
+    const linkOrId = parsed[0];
     const sinceAge = asNumber(parsed[1]);
-    const resource = this.warehouse.getById(instanceId);
+
+    let resource: IResource | undefined;
+    if (typeof linkOrId === "string") {
+      try {
+        resource = await this.warehouse.query(linkOrId);
+      } catch {
+        resource = undefined;
+      }
+    } else {
+      resource = this.warehouse.getById(Number(linkOrId));
+    }
+
     if (!resource?.instance) {
       this.sendError(ErrorType.Management, callbackId, ExceptionCode.ResourceNotFound);
       return;
     }
 
+    if (
+      !(await this.tryApplyManagers(
+        null,
+        resource,
+        ActionType.Attach,
+        callbackId,
+        ErrorType.Management,
+        ExceptionCode.AccessDenied,
+      ))
+    )
+      return;
+
     const instance = resource.instance;
+    if (!instance) return;
+    const resolvedId = instance.id;
     const typeDef = this.warehouse.getLocalTypeDefByType(resource.constructor);
-    const propertyValues = this.composePropertyValueMap(instanceId, sinceAge);
-    this.subscribeToInstance(instanceId);
+    const propertyValues = this.composePropertyValueMap(resolvedId, sinceAge);
+    this.subscribeToInstance(resolvedId);
 
     this.sendReply(
       EpPacketReply.Completed,
       callbackId,
+      resolvedId,
       typeDef.id,
       instance.age,
       instance.link ?? "",
@@ -1277,6 +1934,443 @@ export class EpConnection extends NetworkConnection {
     );
   }
 
+  /** Server handler: compose and reply with a registered TypeDef by its numeric id. */
+  private async epRequestTypeDefById(callbackId: number, tdu: PlainTdu | null): Promise<void> {
+    if (!tdu || !this.warehouse) {
+      this.sendError(ErrorType.Management, callbackId, ExceptionCode.ParseError);
+      return;
+    }
+
+    const id = Number(this.decode(tdu));
+    let local: ITypeDef;
+    try {
+      local = this.warehouse.getLocalTypeDefById(id);
+    } catch {
+      this.sendError(ErrorType.Management, callbackId, ExceptionCode.TypeDefNotFound);
+      return;
+    }
+    if (!(local instanceof LocalTypeDef)) {
+      this.sendError(ErrorType.Management, callbackId, ExceptionCode.TypeDefNotFound);
+      return;
+    }
+
+    if (
+      !(await this.tryApplyManagers(
+        null,
+        null,
+        ActionType.ViewTypeDef,
+        callbackId,
+        ErrorType.Management,
+        ExceptionCode.NotAllowed,
+      ))
+    )
+      return;
+
+    const info = typeDefInfoFromTypeDef(local.id, local.kind, local.template);
+    this.sendReply(EpPacketReply.Completed, callbackId, compose(info, this.warehouse, this));
+  }
+
+  /** Server handler: compose and reply with a resource's TypeDef. */
+  private async epRequestTypeDefByResourceId(callbackId: number, tdu: PlainTdu | null): Promise<void> {
+    if (!tdu || !this.warehouse) {
+      this.sendError(ErrorType.Management, callbackId, ExceptionCode.ParseError);
+      return;
+    }
+
+    const resourceId = Number(this.decode(tdu));
+    const resource = this.warehouse.getById(resourceId);
+    if (!resource?.instance) {
+      this.sendError(ErrorType.Management, callbackId, ExceptionCode.ResourceNotFound);
+      return;
+    }
+
+    if (
+      !(await this.tryApplyManagers(
+        null,
+        resource,
+        ActionType.ViewTypeDef,
+        callbackId,
+        ErrorType.Management,
+        ExceptionCode.NotAllowed,
+      ))
+    )
+      return;
+
+    // A relayed EpResource has no LocalTypeDef registration of its own on
+    // this warehouse — forward the id the upstream connection originally
+    // assigned this type (mirrors dotnet's RemoteTypeDef, which inherits
+    // TypeDef.Id and is composed unchanged when relayed onward).
+    let id: number;
+    let kind: TypeDefKind;
+    if (resource instanceof EpResource) {
+      id = resource.typeDefId ?? 0;
+      kind = TypeDefKind.Resource;
+    } else {
+      const local = this.warehouse.getLocalTypeDefByType(resource.constructor);
+      id = local.id;
+      kind = local.kind;
+    }
+
+    const info = typeDefInfoFromTypeDef(id, kind, resource.instance.definition);
+    this.sendReply(EpPacketReply.Completed, callbackId, compose(info, this.warehouse, this));
+  }
+
+  /** Server handler: batch name -> id lookup. Misses are skipped, not errored. */
+  private async epRequestTypeDefIdsByNames(callbackId: number, tdu: PlainTdu | null): Promise<void> {
+    if (!tdu || !this.warehouse) {
+      this.sendError(ErrorType.Management, callbackId, ExceptionCode.ParseError);
+      return;
+    }
+
+    let names: unknown[];
+    try {
+      names = (this.decode(tdu) as unknown[]) ?? [];
+    } catch {
+      this.sendError(ErrorType.Management, callbackId, ExceptionCode.ParseError);
+      return;
+    }
+
+    const resolved = names
+      .map((n) => this.warehouse!.getLocalTypeDefByName(String(n)))
+      .filter((td): td is ITypeDef => td != null);
+
+    if (resolved.length === 0) {
+      this.sendError(ErrorType.Management, callbackId, ExceptionCode.TypeDefNotFound);
+      return;
+    }
+
+    if (
+      !(await this.tryApplyManagers(
+        null,
+        null,
+        ActionType.ViewTypeDef,
+        callbackId,
+        ErrorType.Management,
+        ExceptionCode.NotAllowed,
+      ))
+    )
+      return;
+
+    this.sendReply(
+      EpPacketReply.Completed,
+      callbackId,
+      resolved.map((td) => td.id),
+    );
+  }
+
+  /**
+   * Server handler (Query, 0xB): resolve a link, reply with the resource's
+   * children as `{id, link}` descriptors, filtered to what the caller is
+   * allowed to Attach. Distinct from {@link epRequestGetResourceIdByLink},
+   * which resolves a single link rather than listing children.
+   *
+   * Dotnet replies with full resource references that auto-attach on
+   * decode; esiur-ts has no compose-side counterpart for that at all yet
+   * (`LocalResource8/16/32` TDUs are decode-only — see `ResourceId.ts` /
+   * `DataDeserializer.ts` — and nothing turns a decoded `ResourceId` into an
+   * attached `EpResource` either). Building that bidirectional
+   * resource-reference wire support is its own substantial feature; this
+   * intentionally replies with plain, already-composable descriptors
+   * instead — the caller can `attach()`/`get()` any id it wants from there.
+   */
+  private async epRequestQueryResources(callbackId: number, tdu: PlainTdu | null): Promise<void> {
+    if (!tdu || !this.warehouse) {
+      this.sendError(ErrorType.Management, callbackId, ExceptionCode.ParseError);
+      return;
+    }
+
+    const link = String(this.decode(tdu) ?? "");
+    let resource: IResource | undefined;
+    try {
+      resource = await this.warehouse.query(link);
+    } catch {
+      resource = undefined;
+    }
+    if (!resource?.instance) {
+      this.sendError(ErrorType.Management, callbackId, ExceptionCode.ResourceNotFound);
+      return;
+    }
+
+    const children = await resource.instance.store.children<IResource>(resource);
+    const allowed = children.filter((child) => this.isActionAllowed(child, ActionType.Attach));
+    // [id, link] pairs — Codec.compose has no generic plain-object composer,
+    // only Map/Array/etc.; a nested array composes fine through the same
+    // dynamic-List path every other multi-field reply in this file uses.
+    const descriptors = allowed.map((child) => [child.instance!.id, child.instance!.link ?? ""]);
+    this.sendReply(EpPacketReply.Completed, callbackId, descriptors);
+  }
+
+  /**
+   * Server handler (LinkTypeDefs, 0xC): resolve a link, reply with the
+   * composed TypeDef payloads for the resource's type and every type it
+   * transitively references through property/argument/return `Tru`s — a
+   * bulk fetch of a type's full dependency graph in one round trip. Remote
+   * (relayed) types are unsupported, matching dotnet.
+   */
+  private async epRequestLinkTypeDefs(callbackId: number, tdu: PlainTdu | null): Promise<void> {
+    if (!tdu || !this.warehouse) {
+      this.sendError(ErrorType.Management, callbackId, ExceptionCode.ParseError);
+      return;
+    }
+
+    const link = String(this.decode(tdu) ?? "");
+    let resource: IResource | undefined;
+    try {
+      resource = await this.warehouse.query(link);
+    } catch {
+      resource = undefined;
+    }
+    if (!resource?.instance) {
+      this.sendError(ErrorType.Management, callbackId, ExceptionCode.ResourceNotFound);
+      return;
+    }
+
+    const local = this.warehouse.getLocalTypeDefByType(resource.constructor);
+    if (!(local instanceof LocalTypeDef)) {
+      this.sendError(ErrorType.Management, callbackId, ExceptionCode.NotSupported);
+      return;
+    }
+
+    if (
+      !(await this.tryApplyManagers(
+        null,
+        resource,
+        ActionType.ViewTypeDef,
+        callbackId,
+        ErrorType.Management,
+        ExceptionCode.NotAllowed,
+      ))
+    )
+      return;
+
+    const closure = new Map<number, LocalTypeDef>();
+    collectTypeDefDependencies(local, closure);
+    const payloads = [...closure.values()].map((td) =>
+      compose(typeDefInfoFromTypeDef(td.id, td.kind, td.template), this.warehouse, this),
+    );
+    this.sendReply(EpPacketReply.Completed, callbackId, payloads);
+  }
+
+  /**
+   * Silent (no error reply) permission check, for filtering a list of
+   * candidates (e.g. Query's children) rather than gating a single request.
+   */
+  private isActionAllowed(resource: IResource | null, action: ActionType): boolean {
+    if (!this.warehouse) return true;
+    const context = new ResourceManagerContext(
+      this.warehouse,
+      this,
+      this.getAuthenticationSession(),
+      resource,
+      null,
+      action,
+      this,
+    );
+    try {
+      return this.warehouse.evaluateManagers(context).isAllowed;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Server handler: pure per-connection bookkeeping — stop notifying *this*
+   * connection about a resource; the resource itself keeps living in the
+   * warehouse for other subscribers. The cleanup closure is the same one
+   * {@link subscribeToInstance} stores on attach.
+   */
+  private async epRequestDetachResource(callbackId: number, tdu: PlainTdu | null): Promise<void> {
+    if (!tdu || !this.warehouse) {
+      this.sendError(ErrorType.Management, callbackId, ExceptionCode.ParseError);
+      return;
+    }
+
+    const resourceId = Number(this.decode(tdu));
+    const resource = this.warehouse.getById(resourceId);
+    if (!resource?.instance) {
+      this.sendError(ErrorType.Management, callbackId, ExceptionCode.ResourceNotFound);
+      return;
+    }
+
+    if (
+      !(await this.tryApplyManagers(
+        null,
+        resource,
+        ActionType.Detach,
+        callbackId,
+        ErrorType.Management,
+        ExceptionCode.NotAllowed,
+      ))
+    )
+      return;
+
+    this.subscriptions.get(resourceId)?.();
+    this.subscriptions.delete(resourceId);
+    this.sendReply(EpPacketReply.Completed, callbackId);
+  }
+
+  /**
+   * Server handler: rename a resource within its current parent (dotnet's
+   * MoveResource never actually re-parents — same restriction here, no `/`
+   * allowed in the new name). Unlike dotnet, which gets away with a bare
+   * `Instance.Name = name` assignment, ts's `MemoryStore.link()` tracks a
+   * resource's path via a separate `instance.variables` entry rather than
+   * deriving it from `Instance.name` — so the rename has to go through
+   * `IStore.move()`, which keeps both in sync.
+   */
+  private async epRequestMoveResource(callbackId: number, tdu: PlainTdu | null): Promise<void> {
+    if (!tdu || !this.warehouse) {
+      this.sendError(ErrorType.Management, callbackId, ExceptionCode.ParseError);
+      return;
+    }
+
+    let args: unknown[];
+    try {
+      args = this.decode(tdu) as unknown[];
+    } catch {
+      this.sendError(ErrorType.Management, callbackId, ExceptionCode.ParseError);
+      return;
+    }
+
+    const resourceId = Number(args[0]);
+    const newName = String(args[1] ?? "");
+    if (newName.includes("/")) {
+      this.sendError(ErrorType.Management, callbackId, ExceptionCode.NotSupported);
+      return;
+    }
+
+    const resource = this.warehouse.getById(resourceId);
+    if (!resource?.instance) {
+      this.sendError(ErrorType.Management, callbackId, ExceptionCode.ResourceNotFound);
+      return;
+    }
+
+    if (
+      !(await this.tryApplyManagers(
+        null,
+        resource,
+        ActionType.Rename,
+        callbackId,
+        ErrorType.Management,
+        ExceptionCode.RenameDenied,
+      ))
+    )
+      return;
+
+    const store = resource.instance.store;
+    const relativeLink = store.link(resource) ?? resource.instance.name;
+    const parts = relativeLink.split("/");
+    parts[parts.length - 1] = newName;
+    await store.move(resource, parts.join("/"));
+    this.sendReply(EpPacketReply.Completed, callbackId);
+  }
+
+  /** Server handler: remove a resource from the warehouse and its store. */
+  private async epRequestDeleteResource(callbackId: number, tdu: PlainTdu | null): Promise<void> {
+    if (!tdu || !this.warehouse) {
+      this.sendError(ErrorType.Management, callbackId, ExceptionCode.ParseError);
+      return;
+    }
+
+    const resourceId = Number(this.decode(tdu));
+    const resource = this.warehouse.getById(resourceId);
+    if (!resource?.instance) {
+      this.sendError(ErrorType.Management, callbackId, ExceptionCode.ResourceNotFound);
+      return;
+    }
+
+    if (
+      !(await this.tryApplyManagers(
+        null,
+        resource,
+        ActionType.Delete,
+        callbackId,
+        ErrorType.Management,
+        ExceptionCode.DeleteDenied,
+      ))
+    )
+      return;
+
+    if (this.warehouse.remove(resource)) this.sendReply(EpPacketReply.Completed, callbackId);
+    else this.sendError(ErrorType.Management, callbackId, ExceptionCode.DeleteFailed);
+  }
+
+  /**
+   * Server handler: create a resource of a type already registered on this
+   * warehouse (no dynamic/generic creation — matches dotnet's
+   * `Activator.CreateInstance`-on-a-known-compiled-`Type` restriction).
+   */
+  private async epRequestCreateResource(callbackId: number, tdu: PlainTdu | null): Promise<void> {
+    if (!tdu || !this.warehouse) {
+      this.sendError(ErrorType.Management, callbackId, ExceptionCode.ParseError);
+      return;
+    }
+
+    let args: unknown[];
+    try {
+      args = this.decode(tdu) as unknown[];
+    } catch {
+      this.sendError(ErrorType.Management, callbackId, ExceptionCode.ParseError);
+      return;
+    }
+
+    const path = String(args[0] ?? "");
+    const typeIdOrName = args[1];
+    const props = (args[2] as Map<number, unknown> | undefined) ?? new Map<number, unknown>();
+    const attrs = (args[3] as Map<string, unknown> | undefined) ?? undefined;
+
+    let local: ITypeDef | undefined;
+    try {
+      local =
+        typeof typeIdOrName === "string"
+          ? this.warehouse.getLocalTypeDefByName(typeIdOrName)
+          : this.warehouse.getLocalTypeDefById(Number(typeIdOrName));
+    } catch {
+      local = undefined;
+    }
+    if (!local || !(local instanceof LocalTypeDef)) {
+      this.sendError(ErrorType.Management, callbackId, ExceptionCode.ClassNotFound);
+      return;
+    }
+
+    const parts = path.replace(/^\/+/, "").split("/");
+    const parentPath = parts.slice(0, -1).join("/");
+    let parent: IResource | undefined;
+    try {
+      parent = await this.warehouse.query(parentPath);
+    } catch {
+      parent = undefined;
+    }
+    if (!parent?.instance) {
+      this.sendError(ErrorType.Management, callbackId, ExceptionCode.StoreNotFound);
+      return;
+    }
+
+    if (
+      !(await this.tryApplyManagers(
+        null,
+        parent,
+        ActionType.CreateResource,
+        callbackId,
+        ErrorType.Management,
+        ExceptionCode.CreateDenied,
+      ))
+    )
+      return;
+
+    try {
+      const instance = local.createInstance() as IResource;
+      for (const [index, value] of props) {
+        const name = local.template.getPropertyByIndex(index)?.name;
+        if (name) local.setProperty(instance, name, value);
+      }
+      const put = await this.warehouse.put(path, instance, { attributes: attrs });
+      this.sendReply(EpPacketReply.Completed, callbackId, put.instance!.id);
+    } catch (e) {
+      this.sendError(ErrorType.Exception, callbackId, ExceptionCode.RuntimeException, String(e));
+    }
+  }
+
   private subscribeToInstance(instanceId: number): void {
     const resource = this.warehouse?.getById(instanceId);
     if (!resource?.instance || this.subscriptions.has(instanceId)) return;
@@ -1289,13 +2383,15 @@ export class EpConnection extends NetworkConnection {
         info.property.index,
         info.value,
       );
-    const onEvent = (info: { event: { index: number }; value: unknown }): void =>
+    const onEvent = (info: { event: { index: number; subscribable?: boolean }; value: unknown }): void => {
+      if (info.event.subscribable && !this.eventSubscriptions.get(instanceId)?.has(info.event.index)) return;
       this.sendNotification(
         EpPacketNotification.EventOccurred,
         instanceId,
         info.event.index,
         info.value,
       );
+    };
     instance.propertyModified.add(onProp);
     instance.eventOccurred.add(onEvent);
     this.subscriptions.set(instanceId, () => {
@@ -1305,7 +2401,7 @@ export class EpConnection extends NetworkConnection {
   }
 
   /** Server handler: resolve the resource, invoke the function by index, reply with its result. */
-  private epRequestInvokeFunction(callbackId: number, tdu: PlainTdu | null): void {
+  private async epRequestInvokeFunction(callbackId: number, tdu: PlainTdu | null): Promise<void> {
     if (!tdu || !this.warehouse) {
       this.sendError(ErrorType.Management, callbackId, ExceptionCode.ParseError);
       return;
@@ -1335,16 +2431,44 @@ export class EpConnection extends NetworkConnection {
       return;
     }
 
+    if (
+      !(await this.tryApplyManagers(
+        ft,
+        resource,
+        ActionType.Execute,
+        callbackId,
+        ErrorType.Management,
+        ExceptionCode.AccessDenied,
+        /* supportsDelay */ true,
+      ))
+    )
+      return;
+
     let result: unknown;
     try {
-      result = (resource as unknown as Record<string, (...a: unknown[]) => unknown>)[ft.name](
-        ...args,
-      );
+      // A relayed EpResource has no real class method matching `ft.name` —
+      // only its own bespoke invoke-by-index, which forwards the call to
+      // the upstream connection it's a proxy for.
+      result =
+        resource instanceof EpResource
+          ? resource.invoke(index, args)
+          : (resource as unknown as Record<string, (...a: unknown[]) => unknown>)[ft.name](
+              ...args,
+            );
     } catch (e) {
       this.sendError(ErrorType.Exception, callbackId, ExceptionCode.RuntimeException, String(e));
       return;
     }
 
+    this.replyWithFunctionResult(callbackId, ft, result);
+  }
+
+  /** Shared invoke-result reply tail for {@link epRequestInvokeFunction} and {@link epRequestStaticCall}. */
+  private replyWithFunctionResult(callbackId: number, ft: FunctionTemplate, result: unknown): void {
+    if (ft.streamMode !== StreamMode.None) {
+      this.beginStreamedReply(callbackId, ft, result);
+      return;
+    }
     if (isThenable(result)) {
       result.then(
         (r) => this.sendReply(EpPacketReply.Completed, callbackId, r),
@@ -1356,8 +2480,250 @@ export class EpConnection extends NetworkConnection {
     }
   }
 
+  /**
+   * Register a streaming call's result and reply `Stream` on `callbackId`
+   * (the "execution callback" `PullStream`/etc. later reference). A `Push`
+   * source is pumped immediately; a `Pull` source just sits registered until
+   * an explicit `PullStream` request drives it.
+   */
+  private beginStreamedReply(callbackId: number, ft: FunctionTemplate, result: unknown): void {
+    if (!isIterableResult(result)) {
+      this.sendError(ErrorType.Management, callbackId, ExceptionCode.NotSupported);
+      return;
+    }
+
+    const context = new ServerInvocationContext(result, ft.streamMode, ft.pausable);
+    this.invocations.set(callbackId, context);
+    this.sendReply(EpPacketReply.Stream, callbackId);
+
+    if (ft.streamMode === StreamMode.Push) void this.pumpStream(callbackId, context);
+  }
+
+  /** Drive a `Push`-mode stream to completion, sending one `Chunk` reply per item. */
+  private async pumpStream(executionCallbackId: number, context: ServerInvocationContext): Promise<void> {
+    try {
+      for (;;) {
+        const r = await context.pullAsync();
+        if (r.done) break;
+        this.sendReply(EpPacketReply.Chunk, executionCallbackId, r.value);
+      }
+      this.invocations.delete(executionCallbackId);
+      this.sendReply(EpPacketReply.Completed, executionCallbackId);
+    } catch (e) {
+      this.invocations.delete(executionCallbackId);
+      this.sendError(ErrorType.Exception, executionCallbackId, ExceptionCode.RuntimeException, String(e));
+    }
+  }
+
+  /** Server handler (PullStream): advance a `Pull`-mode stream by one item. */
+  private async epRequestPullStream(callbackId: number, tdu: PlainTdu | null): Promise<void> {
+    if (!tdu || !this.warehouse) {
+      this.sendError(ErrorType.Management, callbackId, ExceptionCode.ParseError);
+      return;
+    }
+
+    const executionCallbackId = Number(this.decode(tdu));
+    const context = this.invocations.get(executionCallbackId);
+    if (!context || context.streamMode !== StreamMode.Pull) {
+      this.sendError(ErrorType.Management, callbackId, ExceptionCode.NotAllowed);
+      return;
+    }
+
+    if (
+      !(await this.tryApplyManagers(
+        null,
+        null,
+        ActionType.PullStream,
+        callbackId,
+        ErrorType.Management,
+        ExceptionCode.NotAllowed,
+      ))
+    )
+      return;
+
+    try {
+      const r = await context.pullAsync();
+      if (r.done) {
+        this.invocations.delete(executionCallbackId);
+        this.sendReply(EpPacketReply.Completed, executionCallbackId);
+      } else {
+        this.sendReply(EpPacketReply.Chunk, executionCallbackId, r.value);
+      }
+      this.sendReply(EpPacketReply.Completed, callbackId);
+    } catch (e) {
+      this.invocations.delete(executionCallbackId);
+      this.sendError(ErrorType.Exception, executionCallbackId, ExceptionCode.RuntimeException, String(e));
+      this.sendError(ErrorType.Exception, callbackId, ExceptionCode.RuntimeException, String(e));
+    }
+  }
+
+  /** Server handler (TerminateExecution): stop a stream and release its iterator. */
+  private async epRequestTerminateExecution(callbackId: number, tdu: PlainTdu | null): Promise<void> {
+    if (!tdu || !this.warehouse) {
+      this.sendError(ErrorType.Management, callbackId, ExceptionCode.ParseError);
+      return;
+    }
+
+    const executionCallbackId = Number(this.decode(tdu));
+    const context = this.invocations.get(executionCallbackId);
+    if (!context) {
+      this.sendError(ErrorType.Management, callbackId, ExceptionCode.NotAllowed);
+      return;
+    }
+
+    if (
+      !(await this.tryApplyManagers(
+        null,
+        null,
+        ActionType.TerminateExecution,
+        callbackId,
+        ErrorType.Management,
+        ExceptionCode.NotAllowed,
+      ))
+    )
+      return;
+
+    this.invocations.delete(executionCallbackId);
+    await context.terminate();
+    this.sendReply(EpPacketReply.Completed, executionCallbackId);
+    this.sendReply(EpPacketReply.Completed, callbackId);
+  }
+
+  /** Server handler (HaltExecution): pause a pausable stream. */
+  private async epRequestHaltExecution(callbackId: number, tdu: PlainTdu | null): Promise<void> {
+    if (!tdu || !this.warehouse) {
+      this.sendError(ErrorType.Management, callbackId, ExceptionCode.ParseError);
+      return;
+    }
+
+    const executionCallbackId = Number(this.decode(tdu));
+    const context = this.invocations.get(executionCallbackId);
+    if (!context) {
+      this.sendError(ErrorType.Management, callbackId, ExceptionCode.NotAllowed);
+      return;
+    }
+
+    if (
+      !(await this.tryApplyManagers(
+        null,
+        null,
+        ActionType.HaltExecution,
+        callbackId,
+        ErrorType.Management,
+        ExceptionCode.NotAllowed,
+      ))
+    )
+      return;
+
+    try {
+      context.halt();
+      this.sendReply(EpPacketReply.Completed, callbackId);
+    } catch {
+      this.sendError(ErrorType.Management, callbackId, ExceptionCode.NotAllowed);
+    }
+  }
+
+  /** Server handler (ResumeExecution): resume a halted stream. */
+  private async epRequestResumeExecution(callbackId: number, tdu: PlainTdu | null): Promise<void> {
+    if (!tdu || !this.warehouse) {
+      this.sendError(ErrorType.Management, callbackId, ExceptionCode.ParseError);
+      return;
+    }
+
+    const executionCallbackId = Number(this.decode(tdu));
+    const context = this.invocations.get(executionCallbackId);
+    if (!context) {
+      this.sendError(ErrorType.Management, callbackId, ExceptionCode.NotAllowed);
+      return;
+    }
+
+    if (
+      !(await this.tryApplyManagers(
+        null,
+        null,
+        ActionType.ResumeExecution,
+        callbackId,
+        ErrorType.Management,
+        ExceptionCode.NotAllowed,
+      ))
+    )
+      return;
+
+    try {
+      context.resume();
+      this.sendReply(EpPacketReply.Completed, callbackId);
+    } catch {
+      this.sendError(ErrorType.Management, callbackId, ExceptionCode.NotAllowed);
+    }
+  }
+
+  /**
+   * Server handler (StaticCall): invoke a `static` exported function by
+   * TypeDef id + function index — class-level, no resource instance
+   * involved.
+   */
+  private async epRequestStaticCall(callbackId: number, tdu: PlainTdu | null): Promise<void> {
+    if (!tdu || !this.warehouse) {
+      this.sendError(ErrorType.Management, callbackId, ExceptionCode.ParseError);
+      return;
+    }
+
+    let parsed: unknown[];
+    try {
+      parsed = this.decode(tdu) as unknown[];
+    } catch {
+      this.sendError(ErrorType.Management, callbackId, ExceptionCode.ParseError);
+      return;
+    }
+
+    const typeId = Number(parsed[0]);
+    const index = Number(parsed[1]);
+    const args = (parsed[2] as unknown[]) ?? [];
+
+    let local: ITypeDef;
+    try {
+      local = this.warehouse.getLocalTypeDefById(typeId);
+    } catch {
+      this.sendError(ErrorType.Management, callbackId, ExceptionCode.TypeDefNotFound);
+      return;
+    }
+    if (!(local instanceof LocalTypeDef)) {
+      this.sendError(ErrorType.Management, callbackId, ExceptionCode.TypeDefNotFound);
+      return;
+    }
+
+    const ft = local.template.getFunctionByIndex(index);
+    if (!ft || !ft.isStatic) {
+      this.sendError(ErrorType.Management, callbackId, ExceptionCode.MethodNotFound);
+      return;
+    }
+
+    if (
+      !(await this.tryApplyManagers(
+        ft,
+        null,
+        ActionType.Execute,
+        callbackId,
+        ErrorType.Management,
+        ExceptionCode.InvokeDenied,
+        /* supportsDelay */ true,
+      ))
+    )
+      return;
+
+    let result: unknown;
+    try {
+      result = local.invokeStaticFunction(ft.name, args);
+    } catch (e) {
+      this.sendError(ErrorType.Exception, callbackId, ExceptionCode.RuntimeException, String(e));
+      return;
+    }
+
+    this.replyWithFunctionResult(callbackId, ft, result);
+  }
+
   /** Server handler: resolve the resource and set a property by index. */
-  private epRequestSetProperty(callbackId: number, tdu: PlainTdu | null): void {
+  private async epRequestSetProperty(callbackId: number, tdu: PlainTdu | null): Promise<void> {
     if (!tdu || !this.warehouse) {
       this.sendError(ErrorType.Management, callbackId, ExceptionCode.ParseError);
       return;
@@ -1380,7 +2746,148 @@ export class EpConnection extends NetworkConnection {
       return;
     }
 
-    (resource as unknown as Record<string, unknown>)[pt.name] = value;
+    if (
+      !(await this.tryApplyManagers(
+        pt,
+        resource,
+        ActionType.SetProperty,
+        callbackId,
+        ErrorType.Management,
+        ExceptionCode.AccessDenied,
+        /* supportsDelay */ true,
+      ))
+    )
+      return;
+
+    if (isDynamicResource(resource)) resource.setResourceProperty(pt.index, value);
+    else (resource as unknown as Record<string, unknown>)[pt.name] = value;
+    this.sendReply(EpPacketReply.Completed, callbackId);
+  }
+
+  /**
+   * Server handler: an already-attached connection asks to start receiving a
+   * `subscribable` event's occurrences. Errors `AlreadyListened` on a
+   * duplicate call — callers must track subscription state themselves (see
+   * {@link EpResource.on}) rather than relying on this being a no-op.
+   */
+  private async epRequestSubscribe(callbackId: number, tdu: PlainTdu | null): Promise<void> {
+    if (!tdu || !this.warehouse) {
+      this.sendError(ErrorType.Management, callbackId, ExceptionCode.ParseError);
+      return;
+    }
+
+    const parsed = this.decode(tdu) as unknown[];
+    const resourceId = Number(parsed[0]);
+    const index = Number(parsed[1]);
+
+    const resource = this.warehouse.getById(resourceId);
+    if (!resource?.instance) {
+      this.sendError(ErrorType.Management, callbackId, ExceptionCode.ResourceNotFound);
+      return;
+    }
+    if (!this.subscriptions.has(resourceId)) {
+      this.sendError(ErrorType.Management, callbackId, ExceptionCode.NotAttached);
+      return;
+    }
+    const et = resource.instance.definition.getEventByIndex(index);
+    if (!et) {
+      this.sendError(ErrorType.Management, callbackId, ExceptionCode.GeneralFailure);
+      return;
+    }
+    if (!et.subscribable) {
+      this.sendError(ErrorType.Management, callbackId, ExceptionCode.NotSubscribable);
+      return;
+    }
+
+    if (
+      !(await this.tryApplyManagers(
+        et,
+        resource,
+        ActionType.Subscribe,
+        callbackId,
+        ErrorType.Management,
+        ExceptionCode.AccessDenied,
+      ))
+    )
+      return;
+
+    const subscribed = this.eventSubscriptions.get(resourceId) ?? new Set<number>();
+    if (subscribed.has(index)) {
+      this.sendError(ErrorType.Management, callbackId, ExceptionCode.AlreadyListened);
+      return;
+    }
+    subscribed.add(index);
+    this.eventSubscriptions.set(resourceId, subscribed);
+
+    // Relaying through a proxy: this resource only receives the event at all
+    // if *it* is subscribed upstream. Ref-count via .on() so the upstream
+    // wire subscription stays alive for as long as any downstream peer
+    // (there may be several) needs it.
+    if (resource instanceof EpResource) {
+      const key = `${resourceId}:${index}`;
+      const listener = (): void => {};
+      this.relayListeners.set(key, listener);
+      resource.on(et.name, listener);
+    }
+
+    this.sendReply(EpPacketReply.Completed, callbackId);
+  }
+
+  /** Server handler: the mirror of {@link epRequestSubscribe}. */
+  private async epRequestUnsubscribe(callbackId: number, tdu: PlainTdu | null): Promise<void> {
+    if (!tdu || !this.warehouse) {
+      this.sendError(ErrorType.Management, callbackId, ExceptionCode.ParseError);
+      return;
+    }
+
+    const parsed = this.decode(tdu) as unknown[];
+    const resourceId = Number(parsed[0]);
+    const index = Number(parsed[1]);
+
+    const resource = this.warehouse.getById(resourceId);
+    if (!resource?.instance) {
+      this.sendError(ErrorType.Management, callbackId, ExceptionCode.ResourceNotFound);
+      return;
+    }
+    if (!this.subscriptions.has(resourceId)) {
+      this.sendError(ErrorType.Management, callbackId, ExceptionCode.NotAttached);
+      return;
+    }
+    const et = resource.instance.definition.getEventByIndex(index);
+    if (!et) {
+      this.sendError(ErrorType.Management, callbackId, ExceptionCode.GeneralFailure);
+      return;
+    }
+
+    const subscribed = this.eventSubscriptions.get(resourceId);
+    if (!subscribed?.has(index)) {
+      this.sendError(ErrorType.Management, callbackId, ExceptionCode.AlreadyUnsubscribed);
+      return;
+    }
+
+    if (
+      !(await this.tryApplyManagers(
+        et,
+        resource,
+        ActionType.Unsubscribe,
+        callbackId,
+        ErrorType.Management,
+        ExceptionCode.AccessDenied,
+      ))
+    )
+      return;
+
+    subscribed.delete(index);
+
+    if (resource instanceof EpResource) {
+      const key = `${resourceId}:${index}`;
+      const listener = this.relayListeners.get(key);
+      if (listener) {
+        resource.off(et.name, listener);
+        this.relayListeners.delete(key);
+      }
+    }
+
     this.sendReply(EpPacketReply.Completed, callbackId);
   }
 
@@ -1409,6 +2916,9 @@ export class EpConnection extends NetworkConnection {
       case EpPacketReply.Completed:
         this.replyCompleted(callbackId, tdu);
         break;
+      case EpPacketReply.Stream:
+        this.replyStream(callbackId);
+        break;
       case EpPacketReply.Propagated:
         this.replyPropagated(callbackId, tdu);
         break;
@@ -1421,18 +2931,56 @@ export class EpConnection extends NetworkConnection {
       case EpPacketReply.Progress:
         this.replyProgress(callbackId, tdu);
         break;
+      case EpPacketReply.Chunk:
+        this.replyChunk(callbackId, tdu);
+        break;
+      case EpPacketReply.Warning:
+        this.replyWarning(callbackId, tdu);
+        break;
     }
   }
 
   private decode(tdu: PlainTdu | null): unknown {
-    return tdu ? parse(tdu.data, tdu.tduOffset, this.warehouse) : undefined;
+    if (!tdu) return undefined;
+    // A top-level `TduIdentifier.TypeDef` (0x81) value is never generically
+    // decoded here: its `PropertyDefInfo.valueType`/`FunctionDefInfo.returnType`/
+    // etc. fields commonly reference other not-yet-fetched remote TypeDefs on
+    // this connection, which only the async, resolver-aware
+    // `RemoteTypeDef.parseAsyncInto` (driven by `finishTypeDefRequest`) can
+    // resolve. Hand back the raw TDU bytes instead, matching the shape the
+    // legacy wire format already produced (a `RawData` payload) so
+    // `expectTypeDefPayload`/`RemoteTypeDef.parse*` work unchanged either way.
+    if (tdu.identifier === TduIdentifier.TypeDef)
+      return tdu.data.subarray(tdu.tduOffset, tdu.tduOffset + tdu.totalLength);
+    return parse(tdu.data, tdu.tduOffset, this.warehouse);
   }
 
   private replyCompleted(callbackId: number, tdu: PlainTdu | null): void {
     const req = this.requests.get(callbackId);
     if (!req) return;
     this.requests.delete(callbackId);
+    // A `Completed` reply for a streamed invocation signals both "the call
+    // is done" (the normal `trigger`, inherited unchanged) and "no more
+    // chunks are coming" — without the latter, `for await` consumers of an
+    // `AsyncStreamReply` would hang waiting on a chunk that will never arrive.
+    if (req instanceof AsyncStreamReply) req.triggerStreamCompleted();
     req.trigger(this.decode(tdu));
+  }
+
+  private replyStream(callbackId: number): void {
+    const req = this.requests.get(callbackId);
+    if (req instanceof AsyncStreamReply) req.triggerStreamStarted();
+  }
+
+  private replyChunk(callbackId: number, tdu: PlainTdu | null): void {
+    this.requests.get(callbackId)?.triggerChunk(this.decode(tdu));
+  }
+
+  private replyWarning(callbackId: number, tdu: PlainTdu | null): void {
+    const args = (this.decode(tdu) as unknown[]) ?? [];
+    this.requests
+      .get(callbackId)
+      ?.triggerWarning(Number(args[0] ?? 0), String(args[1] ?? ""));
   }
 
   private replyPropagated(callbackId: number, tdu: PlainTdu | null): void {
@@ -1480,6 +3028,7 @@ export class EpConnection extends NetworkConnection {
     // Drop notification subscriptions and fail any in-flight requests.
     for (const unsubscribe of this.subscriptions.values()) unsubscribe();
     this.subscriptions.clear();
+    this.eventSubscriptions.clear();
 
     const pending = [...this.requests.values()];
     this.requests.clear();
@@ -1553,6 +3102,33 @@ function nullResult(): AuthenticationResult {
   return new AuthenticationResult(AuthenticationRuling.Succeeded, null, null, null, null);
 }
 
+/**
+ * Walk `local`'s properties/functions/events for `Tru`s referencing another
+ * local type (`TruTypeDef`, recursing through `TruComposite` sub-types for
+ * typed lists/maps/tuples), collecting the full transitive closure. Used by
+ * `LinkTypeDefs` to bulk-fetch a type's dependency graph in one round trip.
+ */
+function collectTypeDefDependencies(local: LocalTypeDef, closure: Map<number, LocalTypeDef>): void {
+  if (closure.has(local.id)) return;
+  closure.set(local.id, local);
+
+  const visitTru = (tru: Tru | undefined): void => {
+    if (!tru) return;
+    if (tru instanceof TruTypeDef) {
+      if (tru.typeDef instanceof LocalTypeDef) collectTypeDefDependencies(tru.typeDef, closure);
+      return;
+    }
+    if (tru instanceof TruComposite) for (const sub of tru.subTypes) visitTru(sub);
+  };
+
+  for (const p of local.template.properties) visitTru(p.valueType);
+  for (const f of local.template.functions) {
+    visitTru(f.returnType);
+    for (const a of f.args) visitTru(a.type);
+  }
+  for (const e of local.template.events) visitTru(e.argType);
+}
+
 function asNumber(value: unknown): number {
   if (typeof value === "number") return value;
   if (typeof value === "bigint") return Number(value);
@@ -1564,7 +3140,37 @@ function asDate(value: unknown): Date | undefined {
   return value instanceof Date ? value : undefined;
 }
 
-function readTypeDefPayloadId(data: Uint8Array): number {
+function asBytes(value: unknown): Uint8Array | undefined {
+  return value instanceof Uint8Array ? value : undefined;
+}
+
+function asStringArray(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return value.filter((v): v is string => typeof v === "string");
+}
+
+function readTypeDefPayloadId(data: Uint8Array, warehouse: unknown): number {
+  if (data.length < 1)
+    throw new AsyncException(
+      ErrorType.Management,
+      ExceptionCode.ParseError,
+      "TypeDef payload is too short.",
+    );
+
+  if ((data[0] & 0xc7) === TduIdentifier.TypeDef) {
+    // No fixed-offset shortcut exists in the new format (matching dotnet) —
+    // the id is `TypeDefField.Id` inside the indexed structure, so extracting
+    // it requires a full (small) decode.
+    const parsed = parseSync(data, 0, warehouse);
+    if (!(parsed.value instanceof TypeDefInfo))
+      throw new AsyncException(
+        ErrorType.Management,
+        ExceptionCode.ParseError,
+        "Invalid TypeDefInfo payload.",
+      );
+    return parsed.value.id;
+  }
+
   if (data.length < 9)
     throw new AsyncException(
       ErrorType.Management,

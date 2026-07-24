@@ -8,3 +8,4 @@ export * from "./typedef.js";
 export * from "./records.js";
 export * from "./enums.js";
 export * from "./Warehouse.js";
+export * from "./reactive.js";

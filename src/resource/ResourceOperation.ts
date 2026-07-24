@@ -9,6 +9,9 @@ export enum ResourceOperation {
   SystemReloading = 6,
   SystemReloaded = 7,
   SystemTerminating = 8,
+  /** Second termination phase; intentionally shares dotnet's `SystemTerminating` value. */
+  // eslint-disable-next-line @typescript-eslint/no-duplicate-enum-values
+  SystemTerminated = 8,
   Save = 9,
   Load = 10,
   Pause = 11,

@@ -5,13 +5,14 @@ import { AuthenticationRuling } from "../AuthenticationRuling.js";
 import { AuthenticationMode } from "../AuthenticationMode.js";
 import type { IAuthenticationHandler } from "../IAuthenticationHandler.js";
 import { sha3 } from "../sha3.js";
+import { randomBytes } from "../random.js";
 import type { PasswordAuthenticationProvider } from "./PasswordAuthenticationProvider.js";
 
-/** Implements Esiur's `"hash"` SHA3 nonce/challenge-response authentication. */
+/** Implements Esiur's `"password-sha3-v1"` SHA3 nonce/challenge-response authentication. */
 export class PasswordAuthenticationHandler implements IAuthenticationHandler {
   static readonly nonceLength = 20;
 
-  readonly protocol = "hash";
+  readonly protocol = "password-sha3-v1";
   private readonly localNonce = randomBytes(PasswordAuthenticationHandler.nonceLength);
   private remoteNonce: Uint8Array | null = null;
   private localSalt: Uint8Array | null = null;
@@ -424,17 +425,6 @@ function fixedTimeEquals(a: Uint8Array | null, b: Uint8Array | null): boolean {
   let diff = 0;
   for (let i = 0; i < a.length; i++) diff |= a[i] ^ b[i];
   return diff === 0;
-}
-
-function randomBytes(length: number): Uint8Array {
-  const out = new Uint8Array(length);
-  const crypto = globalThis.crypto as
-    | { getRandomValues?: (target: Uint8Array) => Uint8Array }
-    | undefined;
-  if (!crypto?.getRandomValues)
-    throw new Error("Secure random bytes are unavailable in this environment.");
-  crypto.getRandomValues(out);
-  return out;
 }
 
 function failed(): AuthenticationResult {

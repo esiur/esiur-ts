@@ -9,6 +9,14 @@ import { SocketState } from "./SocketState.js";
 const textEncoder = new TextEncoder();
 
 /**
+ * The WebSocket subprotocol esiur-dotnet's `FrameworkWebSocket` requires be
+ * negotiated (`FrameworkWebSocket.SubProtocol`, `Net/Sockets/FrameworkWebSocket.cs`).
+ * A current esiur-dotnet server rejects the upgrade with `400 Bad Request`
+ * if the client doesn't request it.
+ */
+const EP_SUBPROTOCOL = "EP";
+
+/**
  * WebSocket transport (port of C# `WSocket`). Unlike the C# version it does no
  * frame parsing — both the browser `WebSocket` and Node's global `WebSocket`
  * (and `ws`) deliver already-deframed binary messages. Works in any environment
@@ -41,6 +49,18 @@ export class WSocket implements ISocket {
 
         this.attach(ws);
         ws.addEventListener("open", () => {
+          if (ws.protocol && ws.protocol !== EP_SUBPROTOCOL) {
+            this.state = SocketState.Closed;
+            ws.close();
+            reply.triggerError(
+              new AsyncException(
+                new Error(
+                  `The server did not negotiate the required '${EP_SUBPROTOCOL}' WebSocket subprotocol (got '${ws.protocol}').`,
+                ),
+              ),
+            );
+            return;
+          }
           this.state = SocketState.Established;
           reply.trigger(true);
           this.receiver?.networkConnect(this);
@@ -113,11 +133,11 @@ function toBytes(data: unknown): Uint8Array {
   return new Uint8Array(0);
 }
 
-type WebSocketConstructor = new (url: string) => WebSocket;
+type WebSocketConstructor = new (url: string, protocols?: string | string[]) => WebSocket;
 
 async function createWebSocket(url: string): Promise<WebSocket> {
   const ctor = await getWebSocketConstructor();
-  return new ctor(url);
+  return new ctor(url, EP_SUBPROTOCOL);
 }
 
 async function getWebSocketConstructor(): Promise<WebSocketConstructor> {

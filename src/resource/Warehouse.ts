@@ -1,7 +1,4 @@
 import { AsyncReply } from "../core/AsyncReply.js";
-import { AsyncException } from "../core/AsyncException.js";
-import { ErrorType } from "../core/ErrorType.js";
-import { ExceptionCode } from "../core/ExceptionCode.js";
 import { EventHandler } from "../core/EventHandler.js";
 import type { IResource, IResourceContext, IStore } from "./IResource.js";
 import { Instance } from "./Instance.js";
@@ -14,6 +11,18 @@ import { Record } from "./records.js";
 import type { EnumType } from "./enums.js";
 import { EpConnection, type EpConnectionOptions } from "../protocol/EpConnection.js";
 import type { IAuthenticationProvider } from "../security/IAuthenticationProvider.js";
+import type { IEncryptionProvider } from "../security/cryptography/IEncryptionProvider.js";
+import { getResourceManagerTypes } from "./decorators.js";
+import type { IResourceManager } from "../security/management/IResourceManager.js";
+import type { IPermissionsManager } from "../security/permissions/IPermissionsManager.js";
+import type { IRateControlManager } from "../security/management/IRateControlManager.js";
+import type { IAuditingManager } from "../security/management/IAuditingManager.js";
+import type { ResourceManagerContext } from "../security/management/ResourceManagerContext.js";
+import { ResourceManagerEvaluation } from "../security/management/ResourceManagerEvaluation.js";
+import { ActionType } from "../security/permissions/ActionType.js";
+import { Ruling } from "../security/permissions/Ruling.js";
+import type { RatePolicy } from "../security/ratelimiting/RatePolicy.js";
+import { NamedRateControlManager } from "../security/ratelimiting/NamedRateControlManager.js";
 
 export interface WarehouseRemoteGetOptions extends EpConnectionOptions {
   /** TypeDef for the remote resource proxy. Required when the URL includes a resource path. */
@@ -64,6 +73,17 @@ export class Warehouse {
   private readonly typeDefsByEnum = new Map<EnumType, ITypeDef>();
   private typeDefCounter = 0;
   private readonly authenticationProviders = new Map<string, IAuthenticationProvider>();
+  private readonly encryptionProviders = new Map<string, IEncryptionProvider>();
+  private readonly resourceManagers = new Map<Function, IResourceManager>();
+  private readonly defaultResourceManagerTypes = new Set<Function>();
+  private readonly ratePolicies = new Map<string, RatePolicy>();
+
+  constructor() {
+    // Built in and always-on, matching dotnet's own Warehouse construction —
+    // bridges `@RateControl(name)`-tagged members into the named rate-policy
+    // registry (see `addRatePolicy`/`tryGetRatePolicy`).
+    this.registerManager(new NamedRateControlManager(), true);
+  }
 
   /** Register an authentication provider under its default protocol name. */
   registerAuthenticationProvider(provider: IAuthenticationProvider): void;
@@ -112,6 +132,280 @@ export class Warehouse {
   /** .NET-compatible alias for {@link tryGetAuthenticationProvider}. */
   TryGetAuthenticationProvider(name: string): IAuthenticationProvider | undefined {
     return this.tryGetAuthenticationProvider(name);
+  }
+
+  /** Register an encryption provider under its default protocol name. */
+  registerEncryptionProvider(provider: IEncryptionProvider): void;
+  /** Register an encryption provider under an explicit protocol name. */
+  registerEncryptionProvider(name: string, provider: IEncryptionProvider): void;
+  registerEncryptionProvider(
+    nameOrProvider: string | IEncryptionProvider,
+    provider?: IEncryptionProvider,
+  ): void {
+    const name = typeof nameOrProvider === "string" ? nameOrProvider : nameOrProvider.defaultName;
+    const resolved = provider ?? (nameOrProvider as IEncryptionProvider);
+    if (this.encryptionProviders.has(name))
+      throw new Error(`An encryption provider named '${name}' is already registered.`);
+    this.encryptionProviders.set(name, resolved);
+  }
+
+  /** .NET-compatible alias for {@link registerEncryptionProvider}. */
+  RegisterEncryptionProvider(provider: IEncryptionProvider): void;
+  /** .NET-compatible alias for {@link registerEncryptionProvider}. */
+  RegisterEncryptionProvider(name: string, provider: IEncryptionProvider): void;
+  RegisterEncryptionProvider(
+    nameOrProvider: string | IEncryptionProvider,
+    provider?: IEncryptionProvider,
+  ): void {
+    if (typeof nameOrProvider === "string") this.registerEncryptionProvider(nameOrProvider, provider!);
+    else this.registerEncryptionProvider(nameOrProvider);
+  }
+
+  /** Unregister an encryption provider previously registered under `name`. */
+  unregisterEncryptionProvider(name: string, provider: IEncryptionProvider): boolean {
+    return this.encryptionProviders.get(name) === provider && this.encryptionProviders.delete(name);
+  }
+
+  /** Resolve an encryption provider by protocol name, throwing when missing. */
+  getEncryptionProvider(name: string): IEncryptionProvider {
+    const provider = this.tryGetEncryptionProvider(name);
+    if (!provider) throw new Error(`No encryption provider named '${name}'.`);
+    return provider;
+  }
+
+  /** .NET-compatible alias for {@link getEncryptionProvider}. */
+  GetEncryptionProvider(name: string): IEncryptionProvider {
+    return this.getEncryptionProvider(name);
+  }
+
+  /** Try to resolve an encryption provider by protocol name. */
+  tryGetEncryptionProvider(name: string): IEncryptionProvider | undefined {
+    return this.encryptionProviders.get(name);
+  }
+
+  /** .NET-compatible alias for {@link tryGetEncryptionProvider}. */
+  TryGetEncryptionProvider(name: string): IEncryptionProvider | undefined {
+    return this.tryGetEncryptionProvider(name);
+  }
+
+  /** Names of every registered encryption provider. */
+  getEncryptionProviderNames(): string[] {
+    return [...this.encryptionProviders.keys()];
+  }
+
+  /** .NET-compatible alias for {@link getEncryptionProviderNames}. */
+  GetEncryptionProviderNames(): string[] {
+    return this.getEncryptionProviderNames();
+  }
+
+  // ---- resource managers (permissions / rate control / auditing) --------------
+
+  /**
+   * Register a manager instance by its concrete type (port of C#
+   * `RegisterManager`). Type-level `@PermissionsManager`/`@RateControlManager`/
+   * `@AuditingManager` associations and `resolveResourceManagers` can only
+   * reference instances registered here.
+   */
+  registerManager(manager: IResourceManager, useAsDefault = false): void {
+    if (
+      manager.managerCategory !== "permissions" &&
+      manager.managerCategory !== "rateControl" &&
+      manager.managerCategory !== "auditing"
+    )
+      throw new Error(`Manager \`${manager.constructor.name}\` does not implement a supported manager category.`);
+
+    const managerCtor = manager.constructor as Function;
+    if (this.resourceManagers.has(managerCtor))
+      throw new Error(`A resource manager of type \`${managerCtor.name}\` is already registered.`);
+
+    this.resourceManagers.set(managerCtor, manager);
+    if (useAsDefault) this.defaultResourceManagerTypes.add(managerCtor);
+  }
+
+  /** Compatibility registration for Warehouse-wide permissions (registered managers default to on). */
+  registerPermissionsManager(manager: IPermissionsManager, useAsDefault = true): void {
+    this.registerManager(manager, useAsDefault);
+  }
+
+  registerRateControlManager(manager: IRateControlManager, useAsDefault = false): void {
+    this.registerManager(manager, useAsDefault);
+  }
+
+  registerAuditingManager(manager: IAuditingManager, useAsDefault = false): void {
+    this.registerManager(manager, useAsDefault);
+  }
+
+  /** Enable/disable a registered manager as a Warehouse-wide default. Multiple defaults per category are allowed. */
+  setDefaultManager(managerCtor: Function, enabled = true): void {
+    if (!this.resourceManagers.has(managerCtor))
+      throw new Error(`Resource manager \`${managerCtor.name}\` is not registered.`);
+    if (!enabled && managerCtor === NamedRateControlManager)
+      throw new Error("The built-in named rate-control manager cannot be disabled.");
+
+    if (enabled) this.defaultResourceManagerTypes.add(managerCtor);
+    else this.defaultResourceManagerTypes.delete(managerCtor);
+  }
+
+  tryGetManager<T extends IResourceManager = IResourceManager>(managerCtor: Function): T | undefined {
+    return this.resourceManagers.get(managerCtor) as T | undefined;
+  }
+
+  removeManager(managerCtor: Function): boolean {
+    if (managerCtor === NamedRateControlManager) return false;
+    this.defaultResourceManagerTypes.delete(managerCtor);
+    return this.resourceManagers.delete(managerCtor);
+  }
+
+  getDefaultManagers(): IResourceManager[] {
+    return [...this.defaultResourceManagerTypes]
+      .map((ctor) => this.resourceManagers.get(ctor))
+      .filter((m): m is IResourceManager => m != null);
+  }
+
+  private isRegisteredManager(manager: IResourceManager): boolean {
+    return this.resourceManagers.get(manager.constructor as Function) === manager;
+  }
+
+  /** Resolve the managers a resource type declared via `@PermissionsManager`/`@RateControlManager`/`@AuditingManager`. */
+  resolveResourceManagers(resourceCtor: Function): IResourceManager[] {
+    const resolved: IResourceManager[] = [];
+    for (const managerCtor of getResourceManagerTypes(resourceCtor)) {
+      const manager = this.tryGetManager(managerCtor);
+      if (!manager)
+        throw new Error(
+          `Resource manager \`${managerCtor.name}\` declared by \`${resourceCtor.name}\` is not registered.`,
+        );
+      if (!resolved.includes(manager)) resolved.push(manager);
+    }
+    return resolved;
+  }
+
+  /**
+   * Ask every applicable manager, using independent deny-overrides
+   * aggregation for permissions/rate-control/auditing (port of C#
+   * `EvaluateManagers`). When `managers` isn't supplied, resolves them from
+   * the target resource's type (dotnet also folds in per-instance managers
+   * via `Instance.Managers`; this port has no per-instance manager override
+   * concept, only the type-level `@...Manager` decorators).
+   */
+  evaluateManagers(
+    context: ResourceManagerContext,
+    managers?: Iterable<IResourceManager>,
+  ): ResourceManagerEvaluation {
+    const local = managers
+      ? [...managers]
+      : context.resource
+        ? this.resolveResourceManagers(context.resource.constructor as Function)
+        : [];
+
+    const combined: IResourceManager[] = [];
+    for (const manager of [...this.getDefaultManagers(), ...local])
+      if (manager && !combined.includes(manager)) combined.push(manager);
+
+    let permissionsAllowed = false;
+    let permissionsDenied = false;
+    let rateAllowed = false;
+    let rateDenied = false;
+    let auditingAllowed = false;
+    let auditingDenied = false;
+    let delay = 0;
+    let permissionsReason: string | undefined;
+    let rateReason: string | undefined;
+    let auditingReason: string | undefined;
+
+    for (const manager of combined) {
+      context.delay = 0;
+      context.denialReason = undefined;
+
+      try {
+        if (!this.isRegisteredManager(manager))
+          throw new Error(`Resource manager \`${manager.constructor.name}\` is not registered with this Warehouse.`);
+
+        if (manager.managerCategory === "permissions") {
+          const ruling = (manager as IPermissionsManager).applicable(
+            context.resource,
+            context.session,
+            context.action,
+            context.member,
+            context.inquirer,
+          );
+          permissionsDenied ||= ruling === Ruling.Denied;
+          permissionsAllowed ||= ruling === Ruling.Allowed;
+          if (ruling === Ruling.Denied && permissionsReason == null)
+            permissionsReason =
+              context.denialReason ?? `Permissions manager \`${manager.constructor.name}\` denied the operation.`;
+        } else if (manager.managerCategory === "rateControl") {
+          const ruling = (manager as IRateControlManager).applicable(context);
+          rateDenied ||= ruling === Ruling.Denied;
+          rateAllowed ||= ruling === Ruling.Allowed;
+          if (context.delay > delay) delay = context.delay;
+          if (ruling === Ruling.Denied && rateReason == null)
+            rateReason =
+              context.denialReason ?? `Rate-control manager \`${manager.constructor.name}\` denied the operation.`;
+        } else if (manager.managerCategory === "auditing") {
+          const ruling = (manager as IAuditingManager).applicable(context);
+          auditingDenied ||= ruling === Ruling.Denied;
+          auditingAllowed ||= ruling === Ruling.Allowed;
+          if (ruling === Ruling.Denied && auditingReason == null)
+            auditingReason =
+              context.denialReason ?? `Auditing manager \`${manager.constructor.name}\` denied the operation.`;
+        }
+      } catch (error) {
+        if (manager.managerCategory === "permissions") {
+          permissionsDenied = true;
+          permissionsReason ??= "A permissions manager failed while evaluating the operation.";
+        } else if (manager.managerCategory === "rateControl") {
+          rateDenied = true;
+          rateReason ??= "A rate-control manager failed while evaluating the operation.";
+        } else if (manager.managerCategory === "auditing") {
+          auditingDenied = true;
+          auditingReason ??= "An auditing manager failed while evaluating the operation.";
+        }
+        void error;
+      }
+    }
+
+    const permissions = permissionsDenied
+      ? Ruling.Denied
+      : permissionsAllowed
+        ? Ruling.Allowed
+        : defaultPermissions(context.action);
+    const rateControl = rateDenied ? Ruling.Denied : rateAllowed ? Ruling.Allowed : Ruling.DontCare;
+    const auditing = auditingDenied ? Ruling.Denied : auditingAllowed ? Ruling.Allowed : Ruling.DontCare;
+
+    context.delay = delay;
+    context.denialReason =
+      permissions === Ruling.Denied ? permissionsReason : auditing === Ruling.Denied ? auditingReason : rateReason;
+
+    return new ResourceManagerEvaluation(
+      permissions,
+      rateControl,
+      auditing,
+      delay,
+      permissionsReason,
+      rateReason,
+      auditingReason,
+    );
+  }
+
+  /** Register a named rate policy referenced by `@RateControl(name)`. */
+  addRatePolicy(policy: RatePolicy): void;
+  addRatePolicy(name: string, policy: RatePolicy): void;
+  addRatePolicy(nameOrPolicy: string | RatePolicy, policy?: RatePolicy): void {
+    const resolved = typeof nameOrPolicy === "string" ? policy! : nameOrPolicy;
+    if (typeof nameOrPolicy === "string") resolved.name = nameOrPolicy;
+    if (!resolved.name?.trim()) throw new Error("The rate policy must have a name.");
+    if (this.ratePolicies.has(resolved.name))
+      throw new Error(`A rate policy named \`${resolved.name}\` is already registered.`);
+    this.ratePolicies.set(resolved.name, resolved);
+  }
+
+  tryGetRatePolicy(name: string): RatePolicy | undefined {
+    return name?.trim() ? this.ratePolicies.get(name) : undefined;
+  }
+
+  removeRatePolicy(name: string): boolean {
+    return name?.trim() ? this.ratePolicies.delete(name) : false;
   }
 
   /** Build (cached) the decorated TypeDef surface for a resource class. */
@@ -170,6 +464,12 @@ export class Warehouse {
     const td = this.typeDefs.get(id);
     if (!td) throw new Error(`TypeDef ${id} not found.`);
     return td;
+  }
+
+  /** Resolve a type definition registered on this warehouse by its class name. */
+  getLocalTypeDefByName(name: string): ITypeDef | undefined {
+    for (const td of this.typeDefs.values()) if (td.name === name) return td;
+    return undefined;
   }
 
   /** Look up an active resource by its numeric instance id. */
@@ -277,13 +577,8 @@ export class Warehouse {
       const connection = await EpConnection.connect(remote.socketUrl, this, remoteOptions);
       if (!remote.resourcePath) return connection;
 
-      if (!remoteOptions.typeDef)
-        throw new AsyncException(
-          ErrorType.Management,
-          ExceptionCode.NotSupported,
-          "Remote Warehouse.get(path) requires a TypeDef or resource constructor.",
-        );
-
+      // `typeDef` is optional here too: EpConnection.get fetches it from the
+      // server when omitted.
       return (await connection.get(remote.resourcePath, remoteOptions.typeDef)) as T;
     }
 
@@ -318,12 +613,24 @@ export class Warehouse {
     for (const s of this.stores) await s.handle(ResourceOperation.Open);
   }
 
-  /** Close the warehouse: terminate all resources. */
+  /**
+   * Close the warehouse: terminate all resources in two fully-settled phases
+   * (`Terminate` then `SystemTerminated`), matching C# `Warehouse.Close()`.
+   * Each phase notifies every resource even if some throw; errors from both
+   * phases are aggregated rather than aborting the remaining resources.
+   */
   close(): AsyncReply<boolean> {
     const reply = new AsyncReply<boolean>();
     (async () => {
-      for (const r of this.resources.values()) await r.handle(ResourceOperation.Terminate);
+      const resources = new Set<IResource>([...this.resources.values(), ...this.stores]);
+      const terminateErrors = await settleOperation(resources, ResourceOperation.Terminate);
+      const systemTerminatedErrors = await settleOperation(resources, ResourceOperation.SystemTerminated);
       this.opened = false;
+
+      const errors = [...terminateErrors, ...systemTerminatedErrors];
+      if (errors.length === 1) throw errors[0];
+      if (errors.length > 1)
+        throw new AggregateError(errors, "One or more resources failed while closing the warehouse.");
     })().then(
       () => reply.trigger(true),
       (e) => reply.triggerError(e),
@@ -331,15 +638,73 @@ export class Warehouse {
     return reply;
   }
 
-  /** Remove a resource from the warehouse. */
+  /**
+   * Remove a resource from the warehouse: drops it from the id/store maps,
+   * tells its owning store to release it, destroys it, and clears its
+   * `.instance`. Kept synchronous (matching dotnet's `Warehouse.Remove`) —
+   * `MemoryStore.remove()`'s own mutation already runs synchronously despite
+   * its `AsyncReply` return type, so the result isn't awaited here.
+   *
+   * Deferred: recursive cascade-delete of a *store* resource's own children
+   * (dotnet does this too) isn't implemented — `IStore.children()` returns
+   * an `AsyncBag`, making that a genuinely async, separate piece of work.
+   */
   remove(resource: IResource): boolean {
     if (!resource.instance) return false;
+    const store = resource.instance.store;
     this.resources.delete(resource.instance.id);
     if (isStore(resource)) {
       this.stores.delete(resource);
       this.storeDisconnected.emit(resource);
     }
+    if (store && (store as unknown as IResource) !== resource) store.remove(resource);
+    resource.destroy();
+    resource.instance = undefined;
     return true;
+  }
+}
+
+/** Dispatch `operation` to every resource, collecting (not throwing on) per-resource errors. */
+async function settleOperation(
+  resources: Iterable<IResource>,
+  operation: ResourceOperation,
+): Promise<unknown[]> {
+  const errors: unknown[] = [];
+  await Promise.all(
+    [...resources].map(async (r) => {
+      try {
+        await r.handle(operation);
+      } catch (e) {
+        errors.push(e);
+      }
+    }),
+  );
+  return errors;
+}
+
+/**
+ * Fallback ruling when no permissions manager voted either way (port of C#
+ * `Warehouse.DefaultPermissions`) — read-ish/connection-lifecycle actions
+ * default to allowed for backward compatibility; mutating/administrative
+ * actions default to denied (fail closed).
+ */
+function defaultPermissions(action: ActionType): Ruling {
+  switch (action) {
+    case ActionType.GetProperty:
+    case ActionType.ViewTypeDef:
+    case ActionType.ReceiveEvent:
+    case ActionType.Attach:
+    case ActionType.Execute:
+    case ActionType.Detach:
+    case ActionType.Subscribe:
+    case ActionType.Unsubscribe:
+    case ActionType.PullStream:
+    case ActionType.TerminateExecution:
+    case ActionType.HaltExecution:
+    case ActionType.ResumeExecution:
+      return Ruling.Allowed;
+    default:
+      return Ruling.Denied;
   }
 }
 
@@ -357,9 +722,13 @@ function parseRemoteEpUrl(path: string): RemoteEpUrl | undefined {
   }
 
   const scheme = url.protocol.slice(0, -1).toLowerCase();
-  let socketScheme: "ws" | "wss";
+  let socketScheme: "ws" | "wss" | "tcp";
   if (scheme === "ep" || scheme === "ws") socketScheme = "ws";
   else if (scheme === "eps" || scheme === "wss") socketScheme = "wss";
+  // `tcp://host:port` dials a raw TCP socket (Node-only) instead of a
+  // WebSocket — for esiur-dotnet servers exposing only their native
+  // `TcpServer`, with no WebSocket upgrade route.
+  else if (scheme === "tcp") socketScheme = "tcp";
   else return undefined;
 
   const resourcePath = decodeURIComponent(url.pathname.replace(/^\/+/, ""));

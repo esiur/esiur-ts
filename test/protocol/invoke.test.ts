@@ -7,6 +7,25 @@ import { MemoryStore } from "../../src/stores/MemoryStore.js";
 import { Resource } from "../../src/resource/Resource.js";
 import { Export } from "../../src/resource/decorators.js";
 import { t } from "../../src/data/descriptors.js";
+import type { IPermissionsManager } from "../../src/security/permissions/IPermissionsManager.js";
+import { Ruling } from "../../src/security/permissions/Ruling.js";
+
+/**
+ * Matches esiur-dotnet's current default: any action not explicitly allowed
+ * by `Warehouse.DefaultPermissions` (e.g. `SetProperty`) is denied unless a
+ * permissions manager opines. This test isn't exercising the Permissions
+ * system itself, so it registers a manager that allows everything.
+ */
+class AllowAllPermissionsManager implements IPermissionsManager {
+  readonly managerCategory = "permissions" as const;
+  readonly settings = undefined;
+  applicable(): Ruling {
+    return Ruling.Allowed;
+  }
+  initialize(): boolean {
+    return true;
+  }
+}
 
 class HelloResource extends Resource {
   @Export(t.i32) accessor counts = 0;
@@ -26,6 +45,7 @@ class HelloResource extends Resource {
 describe("EpConnection remote invoke (TS ↔ TS)", () => {
   it("invokes remote functions (sync + async) and sets a remote property", async () => {
     const wh = new Warehouse();
+    wh.registerManager(new AllowAllPermissionsManager(), true);
     await wh.put("sys", new MemoryStore());
     const hello = await wh.put("sys/hello", new HelloResource());
     await wh.open();

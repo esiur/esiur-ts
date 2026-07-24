@@ -3,6 +3,7 @@ import type { IResource, IStore } from "./IResource.js";
 import type { Warehouse } from "./Warehouse.js";
 import type { TypeDef, PropertyTemplate, EventTemplate } from "./template.js";
 import { EventSource } from "./decorators.js";
+import { isDynamicResource } from "./IDynamicResource.js";
 
 /** Payload for {@link Instance.propertyModified}. */
 export interface PropertyModificationInfo {
@@ -58,11 +59,19 @@ export class Instance {
     this.store_ = store;
     this.resourceRef = new WeakRef(resource);
     this.instanceAge = age;
-    this.definition = warehouse.getTypeDef(resource.constructor);
+
+    // A dynamic resource (e.g. a remote EpResource proxy relayed into this
+    // warehouse) carries its own TypeDef and current property state directly
+    // — there's no real constructor-per-remote-type to look TypeDef up from,
+    // and unlike a freshly-`new`ed local resource it may already have live
+    // data (fetched before being `put()`), so ages/dates must be seeded from
+    // it rather than starting at zero.
+    const dyn = isDynamicResource(resource) ? resource : undefined;
+    this.definition = dyn ? dyn.resourceDefinition : warehouse.getTypeDef(resource.constructor);
 
     for (let i = 0; i < this.definition.properties.length; i++) {
-      this.ages.push(0);
-      this.modificationDates.push(undefined);
+      this.ages.push(dyn ? dyn.getResourcePropertyAge(i) : 0);
+      this.modificationDates.push(dyn ? dyn.getResourcePropertyDate(i) : undefined);
     }
 
     // Forward exported events raised by the resource through this instance.
@@ -105,6 +114,10 @@ export class Instance {
 
   getModificationDate(index: number): Date | undefined {
     return index < this.modificationDates.length ? this.modificationDates[index] : undefined;
+  }
+
+  setModificationDate(index: number, date: Date | undefined): void {
+    if (index < this.modificationDates.length) this.modificationDates[index] = date;
   }
 
   /** Notify that an exported property changed (called by the generated setter). */

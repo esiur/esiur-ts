@@ -4,7 +4,7 @@ import { t } from "../../src/data/descriptors.js";
 import { EpConnection, EpConnectionContext } from "../../src/protocol/EpConnection.js";
 import { EpResource, type RemotePropertyChange } from "../../src/protocol/EpResource.js";
 import { EpServer } from "../../src/protocol/EpServer.js";
-import { Export, event, type EventSource } from "../../src/resource/decorators.js";
+import { AutoDelivered, Export, event, type EventSource } from "../../src/resource/decorators.js";
 import { Resource } from "../../src/resource/Resource.js";
 import { Warehouse } from "../../src/resource/Warehouse.js";
 import { AuthenticationMode } from "../../src/security/AuthenticationMode.js";
@@ -15,6 +15,25 @@ import {
   PasswordHash,
 } from "../../src/security/providers/index.js";
 import { MemoryStore } from "../../src/stores/MemoryStore.js";
+import type { IPermissionsManager } from "../../src/security/permissions/IPermissionsManager.js";
+import { Ruling } from "../../src/security/permissions/Ruling.js";
+
+/**
+ * Matches esiur-dotnet's current default: any action not explicitly allowed
+ * by `Warehouse.DefaultPermissions` (e.g. `SetProperty`) is denied unless a
+ * permissions manager opines. This test isn't exercising the Permissions
+ * system itself, so it registers a manager that allows everything.
+ */
+class AllowAllPermissionsManager implements IPermissionsManager {
+  readonly managerCategory = "permissions" as const;
+  readonly settings = undefined;
+  applicable(): Ruling {
+    return Ruling.Allowed;
+  }
+  initialize(): boolean {
+    return true;
+  }
+}
 
 const clientPassword = Uint8Array.of(1, 2, 3, 4, 5);
 const serverSalt = Uint8Array.of(6, 7, 8, 9, 10);
@@ -22,7 +41,10 @@ const serverSalt = Uint8Array.of(6, 7, 8, 9, 10);
 class FunctionalService extends Resource {
   @Export(t.i32) accessor level = 1;
   @Export(t.string) accessor status = "idle";
-  @Export(t.string) message: EventSource<string> = event<string>();
+  // This test exercises general event delivery, not the subscribe/unsubscribe
+  // flow itself (see subscribe.test.ts for that), so opt out of the new
+  // subscribable-by-default requirement.
+  @Export(t.string) @AutoDelivered() message: EventSource<string> = event<string>();
 
   @Export(t.string, [t.string])
   greet(name: string): string {
@@ -87,6 +109,7 @@ describe("complete authenticated server/client flow", () => {
   it("serves a resource to an authenticated client, pushes updates/events, and reconnects", async () => {
     const serverWarehouse = new Warehouse();
     serverWarehouse.RegisterAuthenticationProvider(new FunctionalServerAuthenticationProvider());
+    serverWarehouse.registerManager(new AllowAllPermissionsManager(), true);
     await serverWarehouse.put("sys", new MemoryStore());
     const service = await serverWarehouse.put("sys/service", new FunctionalService());
     await serverWarehouse.open();
@@ -104,7 +127,7 @@ describe("complete authenticated server/client flow", () => {
       `ep://localhost:${server.port}`,
       new EpConnectionContext({
         AuthenticationMode: AuthenticationMode.InitializerIdentity,
-        AuthenticationProtocol: "hash",
+        AuthenticationProtocol: "password-sha3-v1",
         AutoReconnect: true,
         ReconnectInterval: 25,
         Identity: "tester",

@@ -1,12 +1,25 @@
-import { parseSync } from "../data/Codec.js";
+import { parseAsync, parseSync } from "../data/Codec.js";
 import * as DC from "../data/DC.js";
 import { Tru, type RemoteTypeDefResolver, type Tru as TruType } from "../data/Tru.js";
+import { TduIdentifier } from "../data/TduIdentifier.js";
 import {
   TypeDefKind,
   type ITypeDef,
   type TypeDefConstant,
   type TypeDefProperty,
 } from "../data/types/ITypeDef.js";
+import { TypeDefInfo } from "../data/types/TypeDefInfo.js";
+import type { MemberDefInfo } from "../data/types/MemberDefInfo.js";
+import type { PropertyDefInfo } from "../data/types/PropertyDefInfo.js";
+import type { FunctionDefInfo } from "../data/types/FunctionDefInfo.js";
+import type { EventDefInfo } from "../data/types/EventDefInfo.js";
+import type { ConstantDefInfo } from "../data/types/ConstantDefInfo.js";
+import type { ArgumentDefInfo } from "../data/types/ArgumentDefInfo.js";
+import { MemberDefFlags } from "../data/types/MemberDefFlags.js";
+import { PropertyDefFlags } from "../data/types/PropertyDefFlags.js";
+import { FunctionDefFlags } from "../data/types/FunctionDefFlags.js";
+import { EventDefFlags } from "../data/types/EventDefFlags.js";
+import { ArgumentDefFlags } from "../data/types/ArgumentDefFlags.js";
 import {
   ArgumentTemplate,
   EventTemplate,
@@ -15,44 +28,89 @@ import {
   TypeDef,
 } from "../resource/template.js";
 
-export interface RemoteArgumentDef {
+/**
+ * Documentation/semantics metadata shared by every member kind, introduced
+ * alongside the `IndexedStructure`-based wire format. Absent (`undefined`)
+ * for members decoded from the legacy manual byte format.
+ */
+export interface RemoteMemberMetadata {
+  deprecated?: boolean;
+  deprecationMessage?: string;
+  description?: string;
+  usage?: string;
+  examples?: unknown[];
+  tags?: string[];
+  unit?: string;
+  minimum?: unknown;
+  maximum?: unknown;
+  allowedValues?: unknown[];
+  pattern?: string;
+  format?: string;
+  preconditions?: string[];
+  postconditions?: string[];
+  /** {@link import("../data/types/OperationEffects.js").OperationEffects} bitmask. */
+  effects?: number;
+  warnings?: string[];
+  relatedMembers?: number[];
+}
+
+export interface RemoteArgumentDef extends RemoteMemberMetadata {
   index: number;
   name: string;
   type?: TruType;
   optional: boolean;
+  variadic?: boolean;
+  defaultValue?: unknown;
   annotations?: Map<string, string>;
 }
 
-export interface RemoteFunctionDef {
+export interface RemoteFunctionDef extends RemoteMemberMetadata {
   index: number;
   name: string;
   returnType?: TruType;
   arguments: RemoteArgumentDef[];
   inherited: boolean;
   isStatic: boolean;
+  readOnly?: boolean;
+  idempotent?: boolean;
+  cancellable?: boolean;
+  pausable?: boolean;
+  /** {@link import("../data/types/StreamMode.js").StreamMode} bitmask. */
+  streamMode?: number;
   annotations?: Map<string, string>;
 }
 
-export interface RemotePropertyDef {
+export interface RemotePropertyDef extends RemoteMemberMetadata {
   index: number;
   name: string;
   valueType?: TruType;
   inherited: boolean;
+  /** Legacy 2-bit permission field; not populated by the new-format decoder (unused downstream — see `readOnly`/`constant`/`volatile`). */
   permission: number;
   hasHistory: boolean;
+  readOnly?: boolean;
+  constant?: boolean;
+  volatile?: boolean;
+  orderingControl?: number;
+  historyControl?: number;
+  defaultValue?: unknown;
   annotations?: Map<string, string>;
 }
 
-export interface RemoteEventDef {
+export interface RemoteEventDef extends RemoteMemberMetadata {
   index: number;
   name: string;
   argumentType?: TruType;
+  argumentName?: string;
   inherited: boolean;
   subscribable: boolean;
+  autoDelivered?: boolean;
+  orderingControl?: number;
+  historyControl?: number;
   annotations?: Map<string, string>;
 }
 
-export interface RemoteConstantDef {
+export interface RemoteConstantDef extends RemoteMemberMetadata {
   index: number;
   name: string;
   valueType?: TruType;
@@ -222,6 +280,11 @@ export class RemoteTypeDef implements ITypeDef {
         inherited: p.inherited,
         permission: p.permission,
         hasHistory: p.hasHistory,
+        readOnly: p.readOnly,
+        constant: p.constant,
+        volatile: p.volatile,
+        deprecated: p.deprecated,
+        description: p.description,
         annotations: mapToObject(p.annotations),
       })),
       functions: this.remoteFunctions.map((f) => ({
@@ -230,11 +293,18 @@ export class RemoteTypeDef implements ITypeDef {
         returnType: f.returnType?.toString(),
         inherited: f.inherited,
         isStatic: f.isStatic,
+        readOnly: f.readOnly,
+        idempotent: f.idempotent,
+        cancellable: f.cancellable,
+        pausable: f.pausable,
+        deprecated: f.deprecated,
+        description: f.description,
         arguments: f.arguments.map((a) => ({
           index: a.index,
           name: a.name,
           type: a.type?.toString(),
           optional: a.optional,
+          variadic: a.variadic,
           annotations: mapToObject(a.annotations),
         })),
         annotations: mapToObject(f.annotations),
@@ -245,6 +315,9 @@ export class RemoteTypeDef implements ITypeDef {
         argumentType: e.argumentType?.toString(),
         inherited: e.inherited,
         subscribable: e.subscribable,
+        autoDelivered: e.autoDelivered,
+        deprecated: e.deprecated,
+        description: e.description,
         annotations: mapToObject(e.annotations),
       })),
       constants: this.remoteConstants.map((c) => ({
@@ -253,12 +326,23 @@ export class RemoteTypeDef implements ITypeDef {
         type: c.valueType?.toString(),
         value: c.value,
         inherited: c.inherited,
+        deprecated: c.deprecated,
+        description: c.description,
         annotations: mapToObject(c.annotations),
       })),
     };
   }
 
   static parse(data: Uint8Array, warehouse: unknown = null): RemoteTypeDef {
+    if ((data[0] & 0xc7) === TduIdentifier.TypeDef) {
+      const parsed = parseSync(data, 0, warehouse);
+      if (parsed.length !== data.length || !(parsed.value instanceof TypeDefInfo))
+        throw new Error("Invalid TypeDefInfo payload.");
+      const typeDef = new RemoteTypeDef();
+      applyInfo(typeDef, parsed.value);
+      return typeDef;
+    }
+
     let offset = 0;
     const flags = data[offset++];
     const hasParent = (flags & 0x80) > 0;
@@ -359,6 +443,14 @@ export class RemoteTypeDef implements ITypeDef {
     remoteResolver?: RemoteTypeDefResolver,
     requestSequence: readonly number[] | null = null,
   ): Promise<RemoteTypeDef> {
+    if ((data[0] & 0xc7) === TduIdentifier.TypeDef) {
+      const parsed = await parseAsync(data, 0, warehouse, remoteResolver, requestSequence);
+      if (parsed.length !== data.length || !(parsed.value instanceof TypeDefInfo))
+        throw new Error("Invalid TypeDefInfo payload.");
+      applyInfo(target, parsed.value);
+      return target;
+    }
+
     let offset = 0;
     const flags = data[offset++];
     const hasParent = (flags & 0x80) > 0;
@@ -481,6 +573,148 @@ export class RemoteTypeDef implements ITypeDef {
     return target;
   }
 }
+
+// ---- new-format (IndexedStructure/TduIdentifier.TypeDef) conversion -------
+
+/**
+ * Populate `target` from a decoded new-format {@link TypeDefInfo} (port of C#
+ * `RemoteTypeDef.ApplyInfo`/`ApplyMember`/`ToProperty`/`ToFunction`/
+ * `ToArgument`/`ToEvent`/`ToConstant`). The member lists are already fully
+ * decoded objects by this point (see `hydrateTypeDefInfo` in
+ * `DataDeserializer.ts`) — this is purely field remapping onto the existing
+ * `Remote*Def` shapes, no further byte parsing.
+ */
+function applyInfo(target: RemoteTypeDef, info: TypeDefInfo): void {
+  const properties = (info.properties ?? []).map((p) => toRemoteProperty(p));
+  const functions = (info.functions ?? []).map((f) => toRemoteFunction(f));
+  const events = (info.events ?? []).map((e) => toRemoteEvent(e));
+  const constants = (info.constants ?? []).map((c) => toRemoteConstant(c));
+
+  target.hydrate(
+    info.id,
+    info.kind,
+    info.name,
+    info.version,
+    info.parent,
+    info.annotations,
+    properties,
+    functions,
+    events,
+    constants,
+  );
+}
+
+function toRemoteProperty(p: PropertyDefInfo): RemotePropertyDef {
+  const flags = p.flags;
+  return {
+    index: p.index,
+    name: p.name,
+    valueType: p.valueType,
+    inherited: (flags & MemberDefFlags.Inherited) !== 0,
+    // Legacy 2-bit permission field; the new format has no equivalent (and
+    // nothing downstream consumes it — see `readOnly`/`constant`/`volatile`).
+    permission: 0,
+    hasHistory: (flags & PropertyDefFlags.Historical) !== 0 || p.historyControl !== 0,
+    readOnly: (flags & PropertyDefFlags.ReadOnly) !== 0,
+    constant: (flags & PropertyDefFlags.Constant) !== 0,
+    volatile: (flags & PropertyDefFlags.Volatile) !== 0,
+    orderingControl: p.orderingControl,
+    historyControl: p.historyControl,
+    defaultValue: p.defaultValue,
+    annotations: p.annotations,
+    ...memberMetadata(p),
+  };
+}
+
+function toRemoteFunction(f: FunctionDefInfo): RemoteFunctionDef {
+  const flags = f.flags;
+  return {
+    index: f.index,
+    name: f.name,
+    returnType: f.returnType,
+    arguments: (f.arguments ?? []).map(toRemoteArgument),
+    inherited: (flags & MemberDefFlags.Inherited) !== 0,
+    isStatic: (flags & FunctionDefFlags.Static) !== 0,
+    readOnly: (flags & FunctionDefFlags.ReadOnly) !== 0,
+    idempotent: (flags & FunctionDefFlags.Idempotent) !== 0,
+    cancellable: (flags & FunctionDefFlags.Cancellable) !== 0,
+    pausable: (flags & FunctionDefFlags.Pausable) !== 0,
+    streamMode: f.streamMode,
+    annotations: f.annotations,
+    ...memberMetadata(f),
+  };
+}
+
+function toRemoteEvent(e: EventDefInfo): RemoteEventDef {
+  const flags = e.flags;
+  return {
+    index: e.index,
+    name: e.name,
+    argumentType: e.argumentType,
+    argumentName: e.argumentName,
+    inherited: (flags & MemberDefFlags.Inherited) !== 0,
+    // The new format has no direct "subscribable" bit; an auto-delivered
+    // event is pushed without a subscription, so treat non-auto-delivered
+    // events as subscribable (matches typical Subscribe/Unsubscribe usage).
+    subscribable: (flags & EventDefFlags.AutoDelivered) === 0,
+    autoDelivered: (flags & EventDefFlags.AutoDelivered) !== 0,
+    orderingControl: e.orderingControl,
+    historyControl: e.historyControl,
+    annotations: e.annotations,
+    ...memberMetadata(e),
+  };
+}
+
+function toRemoteConstant(c: ConstantDefInfo): RemoteConstantDef {
+  const flags = c.flags;
+  return {
+    index: c.index,
+    name: c.name,
+    valueType: c.valueType,
+    value: c.value,
+    inherited: (flags & MemberDefFlags.Inherited) !== 0,
+    annotations: c.annotations,
+    ...memberMetadata(c),
+  };
+}
+
+function toRemoteArgument(a: ArgumentDefInfo): RemoteArgumentDef {
+  const flags = a.flags;
+  return {
+    index: a.index,
+    name: a.name,
+    type: a.valueType,
+    optional: (flags & ArgumentDefFlags.Optional) !== 0,
+    variadic: (flags & ArgumentDefFlags.Variadic) !== 0,
+    defaultValue: a.defaultValue,
+    annotations: a.annotations,
+  };
+}
+
+/** Extract the shared documentation/semantics metadata fields common to every member kind. */
+function memberMetadata(m: MemberDefInfo): RemoteMemberMetadata {
+  const meta: RemoteMemberMetadata = {};
+  if ((m.flags & MemberDefFlags.Deprecated) !== 0) meta.deprecated = true;
+  if (m.deprecationMessage !== undefined) meta.deprecationMessage = m.deprecationMessage;
+  if (m.description !== undefined) meta.description = m.description;
+  if (m.usage !== undefined) meta.usage = m.usage;
+  if (m.examples !== undefined) meta.examples = m.examples;
+  if (m.tags !== undefined) meta.tags = m.tags;
+  if (m.unit !== undefined) meta.unit = m.unit;
+  if (m.minimum !== undefined) meta.minimum = m.minimum;
+  if (m.maximum !== undefined) meta.maximum = m.maximum;
+  if (m.allowedValues !== undefined) meta.allowedValues = m.allowedValues;
+  if (m.pattern !== undefined) meta.pattern = m.pattern;
+  if (m.format !== undefined) meta.format = m.format;
+  if (m.preconditions !== undefined) meta.preconditions = m.preconditions;
+  if (m.postconditions !== undefined) meta.postconditions = m.postconditions;
+  if (m.effects !== undefined) meta.effects = m.effects;
+  if (m.warnings !== undefined) meta.warnings = m.warnings;
+  if (m.relatedMembers !== undefined) meta.relatedMembers = m.relatedMembers;
+  return meta;
+}
+
+// ---- legacy manual-byte-format helpers -------------------------------------
 
 function parseFunction(
   data: Uint8Array,

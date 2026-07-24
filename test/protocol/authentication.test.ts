@@ -172,7 +172,7 @@ describe("EpConnection password authentication", () => {
         AuthenticationMode: AuthenticationMode.InitializerIdentity,
         AutoReconnect: true,
         Identity: "tester",
-        AuthenticationProtocol: "hash",
+        AuthenticationProtocol: "password-sha3-v1",
         Domain: "test",
       }),
     );

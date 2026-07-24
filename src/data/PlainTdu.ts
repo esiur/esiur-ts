@@ -1,5 +1,6 @@
 import { TduClass } from "./TduClass.js";
 import { TduIdentifier } from "./TduIdentifier.js";
+import { DEFAULT_MAXIMUM_PAYLOAD_LENGTH, ensurePacketSize } from "./ParserGuard.js";
 
 /**
  * A measured-but-undecoded TDU (port of C# `PlainTdu`). Used by the packet layer
@@ -30,7 +31,12 @@ export class PlainTdu {
   }
 
   /** Measure the TDU at `offset` without decoding its value. */
-  static parse(data: Uint8Array, offset: number, ends: number): PlainTdu {
+  static parse(
+    data: Uint8Array,
+    offset: number,
+    ends: number,
+    maximumPayloadLength: number = DEFAULT_MAXIMUM_PAYLOAD_LENGTH,
+  ): PlainTdu {
     const start = offset;
     const h = data[offset++];
     const cls = (h >> 6) as TduClass;
@@ -68,6 +74,10 @@ export class PlainTdu {
 
     let cl = 0;
     for (let i = 0; i < cll; i++) cl = cl * 256 + data[offset++];
+    // Reject an oversized declaration before it can be used to size a buffer
+    // or justify waiting for more bytes — checked ahead of the completeness
+    // test below, which would otherwise treat it as merely "incomplete".
+    ensurePacketSize(cl, maximumPayloadLength);
     if (ends - offset < cl) return PlainTdu.invalid(cl - (ends - offset));
 
     const t = new PlainTdu();

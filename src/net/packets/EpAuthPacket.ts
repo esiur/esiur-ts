@@ -21,6 +21,10 @@ export class EpAuthPacket {
   encryptionMode: EncryptionMode = EncryptionMode.None;
   hasTdu = false;
   tdu: PlainTdu | null = null;
+  errorCode = 0;
+  sessionId: Uint8Array | null = null;
+  /** IAuth reference, set by auth-flow logic (not read from `data[]` by {@link parse}). */
+  reference = 0;
 
   private dataLengthNeeded = 0;
 

@@ -71,8 +71,11 @@ export class Tdu {
       }
     } else if (
       this.tduClass === TduClass.Dynamic ||
-      this.tduClass === TduClass.Extension
+      this.tduClass === TduClass.Extension ||
+      (this.tduClass === TduClass.Typed && this.identifier !== TduIdentifier.Typed)
     ) {
+      // Dynamic/Extension, and Typed-but-not-plain-Typed (TypeDef/TRU): a
+      // plain framed payload with no metadata prefix.
       const header = framedHeader(idByte, length);
       if (length === 0) {
         this.composed = header;
@@ -81,7 +84,7 @@ export class Tdu {
         this.contentOffset = header.length;
       }
     } else {
-      // Typed: metadata bytes precede the payload.
+      // Typed identifier itself (0x80): metadata bytes precede the payload.
       if (metadata == null)
         throw new Error("Metadata must be provided for typed TDUs.");
       const metadataData = metadata.compose(connection);
@@ -97,6 +100,9 @@ export class Tdu {
     if (this.identifier !== other.identifier) return false;
     if (this.tduClass !== TduClass.Typed || other.tduClass !== TduClass.Typed)
       return false;
+    // TypeDef/TRU carry no metadata — the identifier alone fully describes
+    // the outer type, so two TDUs with the same identifier already match.
+    if (this.identifier !== TduIdentifier.Typed) return true;
     if (this.metadata == null || other.metadata == null) return false;
     return this.metadata.match(other.metadata);
   }

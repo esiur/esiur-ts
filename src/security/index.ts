@@ -11,3 +11,7 @@ export * from "./IAuthenticationHandler.js";
 export * from "./IAuthenticationProvider.js";
 export * from "./sha3.js";
 export * from "./providers/index.js";
+export * from "./cryptography/index.js";
+export * from "./permissions/index.js";
+export * from "./management/index.js";
+export * from "./ratelimiting/index.js";

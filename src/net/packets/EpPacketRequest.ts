@@ -6,7 +6,8 @@ export enum EpPacketRequest {
   Subscribe = 0x2,
   Unsubscribe = 0x3,
   // Inquire
-  TypeDefByName = 0x8,
+  /** Batch name → id lookup (request: `string[]`, reply: `ulong[]`). */
+  TypeDefIdsByNames = 0x8,
   TypeDefById = 0x9,
   TypeDefByResourceId = 0xa,
   Query = 0xb,
@@ -28,4 +29,5 @@ export enum EpPacketRequest {
   PullStream = 0x1c,
   TerminateExecution = 0x1d,
   HaltExecution = 0x1e,
+  ResumeExecution = 0x1f,
 }

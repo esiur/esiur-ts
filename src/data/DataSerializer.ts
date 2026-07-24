@@ -3,6 +3,10 @@ import { TduIdentifier } from "./TduIdentifier.js";
 import { Decimal128 } from "./Decimal128.js";
 import { Uuid } from "./Uuid.js";
 import * as DC from "./DC.js";
+import { composeInternal } from "./Codec.js";
+import { IndexedStructure } from "./IndexedStructure.js";
+import { toIndexedMap } from "./IndexedStructureCodec.js";
+import type { Tru } from "./Tru.js";
 
 /**
  * Primitive value composers (port of the primitive parts of C#
@@ -137,6 +141,38 @@ export function uuidComposer(value: Uuid): Tdu {
 
 export function rawDataComposer(value: Uint8Array): Tdu {
   return new Tdu(TduIdentifier.RawData, value, value.length);
+}
+
+/** Compose an {@link IndexedStructure} as a sparse `TypedMap<u8, dynamic>` (`Typed`, 0x80). */
+export function structureComposer(
+  value: IndexedStructure | null,
+  warehouse: unknown,
+  connection: unknown,
+): Tdu {
+  if (value == null) return new Tdu(TduIdentifier.Null, null, 0);
+  return composeInternal(toIndexedMap(value), warehouse, connection);
+}
+
+/** Compose a standalone {@link Tru} value into its own dedicated, metadata-free slot (0x82). */
+export function truComposer(value: Tru, _warehouse: unknown, connection: unknown): Tdu {
+  const data = value.compose(connection);
+  return new Tdu(TduIdentifier.TRU, data, data.length, null, connection);
+}
+
+/** Compose a {@link TypeDefInfo}-shaped structure into its dedicated wire slot (0x81). */
+export function typeDefComposer(
+  value: IndexedStructure | null,
+  warehouse: unknown,
+  connection: unknown,
+): Tdu {
+  const structure = structureComposer(value, warehouse, connection);
+  return new Tdu(
+    TduIdentifier.TypeDef,
+    structure.composed,
+    structure.composed.length,
+    null,
+    connection,
+  );
 }
 
 /**
