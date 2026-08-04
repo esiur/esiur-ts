@@ -28,7 +28,9 @@ clients. `EpServer` is Node-only and always uses `ws`.
 ```ts
 import { Warehouse } from "esiur";
 
-const resource = await Warehouse.default.get("ep://127.0.0.1:10901/sys/counter");
+declare const port: number; // Supplied and validated by your application's configuration.
+
+const resource = await Warehouse.default.get(`ep://127.0.0.1:${port}/sys/counter`);
 
 console.log(resource.count);
 resource.on("changed", () => console.log("updated:", resource.count));
@@ -40,7 +42,7 @@ await resource.increment();
 just the connection:
 
 ```ts
-const connection = await Warehouse.default.get("ep://127.0.0.1:10901");
+const connection = await Warehouse.default.get(`ep://127.0.0.1:${port}`);
 ```
 
 A path can be resolved without knowing the remote type ahead of time — the
@@ -51,7 +53,7 @@ a typed reference instead:
 
 ```ts
 const resource = await Warehouse.default.get(
-  "ep://127.0.0.1:10901/sys/counter",
+  `ep://127.0.0.1:${port}/sys/counter`,
   Counter,
 );
 ```
@@ -76,15 +78,16 @@ class Greeter extends Resource {
 }
 
 const warehouse = new Warehouse();
+declare const port: number; // Supplied and validated by your application's configuration.
 await warehouse.put("sys", new MemoryStore());
 await warehouse.put("sys/greeter", new Greeter());
 await warehouse.open();
 
-const server = await EpServer.listen({ port: 10901, warehouse });
+const server = await EpServer.listen({ port, warehouse });
 ```
 
 Any client — TypeScript, JavaScript, or a .NET Esiur client — can then attach
-to `ep://host:10901/sys/greeter`, read/write `visits`, call `greet()`, and
+to `ep://host:${ESIUR_PORT}/sys/greeter`, read/write `visits`, call `greet()`, and
 receive property-change notifications, all without any code generation step.
 
 ### Events
@@ -178,9 +181,10 @@ import {
 
 const warehouse = new Warehouse();
 warehouse.registerAuthenticationProvider(new MyPasswordProvider());
+declare const port: number; // Supplied and validated by your application's configuration.
 
 const connection = await warehouse.get(
-  "ep://localhost:10901",
+  `ep://localhost:${port}`,
   new EpConnectionContext({
     authenticationMode: AuthenticationMode.InitializerIdentity,
     identity: "alice",

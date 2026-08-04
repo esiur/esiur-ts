@@ -374,6 +374,7 @@ export class EpConnection extends NetworkConnection {
   }
 
   private async openClientSocket(url: string): Promise<void> {
+    requireExplicitEndpointPort(url);
     this.reconnectUrl = url;
     this.manualClose = false;
     try {
@@ -3145,6 +3146,42 @@ export class EpConnection extends NetworkConnection {
     clearTimeout(this.reconnectTimer);
     this.reconnectTimer = undefined;
   }
+}
+
+/** Reject URL handling that would otherwise inherit a transport's default port. */
+function requireExplicitEndpointPort(value: string): URL {
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    throw new Error(`Invalid EP endpoint: ${value}`);
+  }
+
+  const schemeEnd = value.indexOf("://");
+  const authorityStart = schemeEnd < 0 ? -1 : schemeEnd + 3;
+  const authorityEnd =
+    authorityStart < 0
+      ? -1
+      : ["/", "?", "#"]
+          .map((separator) => value.indexOf(separator, authorityStart))
+          .filter((index) => index >= 0)
+          .reduce((first, index) => Math.min(first, index), value.length);
+  const authority =
+    authorityStart < 0 ? "" : value.slice(authorityStart, authorityEnd).split("@").at(-1) ?? "";
+  const portText = authority.startsWith("[")
+    ? authority.slice(authority.indexOf("]") + 1).replace(/^:/, "")
+    : authority.slice(authority.lastIndexOf(":") + 1);
+  const hasPortSeparator = authority.startsWith("[")
+    ? authority.indexOf("]") >= 0 && authority[authority.indexOf("]") + 1] === ":"
+    : authority.lastIndexOf(":") > 0;
+  const port = Number(portText);
+
+  if (!url.hostname || !hasPortSeparator || !/^\d+$/.test(portText) || port <= 0 || port > 65535)
+    throw new Error(
+      `EP endpoints must include an explicit port (for example, ep://host:port): ${value}`,
+    );
+
+  return url;
 }
 
 function isThenable(value: unknown): value is PromiseLike<unknown> {

@@ -17,22 +17,28 @@ class HelloStub extends Resource {
 
 /**
  * Cross-language test: the TypeScript client connects to the *real C# Esiur
- * server* (interop/Program.cs, EpServer on tcp/ws 10518 with
+ * server* (interop/Program.cs, EpServer on the caller-provided port with
  * AllowUnauthorizedAccess) and completes the anonymous IIP handshake.
  *
  * Run the C# server first:
+ *   set ESIUR_INTEROP_PORT to an available port
  *   dotnet interop/bin/Release/net10.0/InteropServer.dll
  * then: npx vitest run interop/client.test.ts
  */
 describe("cross-language: TS client ↔ C# Esiur server", () => {
+  const port = Number(process.env.ESIUR_INTEROP_PORT);
+  if (!Number.isInteger(port) || port <= 0 || port > 65535)
+    throw new Error("Set ESIUR_INTEROP_PORT to the interop server's port.");
+  const endpoint = `ws://127.0.0.1:${port}`;
+
   it("completes the anonymous handshake over WebSocket", async () => {
-    const client = await EpConnection.connect("ws://127.0.0.1:10518");
+    const client = await EpConnection.connect(endpoint);
     expect(client.isConnected).toBe(true);
     client.close();
   }, 15000);
 
   it("resolves a resource link to a resource id (request/reply both ways)", async () => {
-    const client = await EpConnection.connect("ws://127.0.0.1:10518");
+    const client = await EpConnection.connect(endpoint);
 
     // TS composes the link string → C# parses it, queries the resource, and
     // replies with a resource reference → TS decodes it to a ResourceId.
@@ -49,7 +55,7 @@ describe("cross-language: TS client ↔ C# Esiur server", () => {
   }, 15000);
 
   it("attaches a C# resource: reads properties, invokes a function, tracks changes", async () => {
-    const client = await EpConnection.connect("ws://127.0.0.1:10518");
+    const client = await EpConnection.connect(endpoint);
     const rid = (await client.getResourceIdByLink("sys/hello")) as ResourceId;
 
     const res = (await client.attach(rid.id, getTemplate(HelloStub))) as Record<

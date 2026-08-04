@@ -66,6 +66,9 @@ export class EpServer {
 
   /** Start listening and accepting connections bound to `warehouse`. */
   static async listen(options: EpServerOptions): Promise<EpServer> {
+    if (!Number.isInteger(options.port) || options.port < 0 || options.port > 65535)
+      throw new RangeError("EpServer.listen requires an explicit port from 0 through 65535.");
+
     const server = new EpServer(options.warehouse);
     if (options.authenticationProvider)
       options.warehouse.registerAuthenticationProvider(options.authenticationProvider);

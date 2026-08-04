@@ -11,7 +11,9 @@ if (typeof globalThis.WebSocket === "undefined") {
 
 const args = parseArgs(process.argv.slice(2));
 const host = args.host ?? "127.0.0.1";
-const port = Number(args.port ?? 10901);
+const port = Number(args.port);
+if (!args.url && (!Number.isInteger(port) || port <= 0 || port > 65535))
+  throw new Error("Supply --port with the server's configured port, or supply --url.");
 const epUrl = args.url ?? `ep://${host}:${port}`;
 const serverUrl = toWebSocketUrl(epUrl);
 const resourcePath = args["resource-path"] ?? args.resource ?? "sys/recovery";

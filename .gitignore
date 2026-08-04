@@ -12,7 +12,8 @@ coverage/
 *.pem
 
 # .NET build artifacts
-bin/
+bin/*
+!bin/esiur.js
 obj/
 *.dll
 *.exe

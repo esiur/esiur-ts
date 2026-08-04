@@ -19,6 +19,13 @@ class RemoteGreeter extends Resource {
 }
 
 describe("Warehouse remote EP get", () => {
+  it("rejects an EP URL without an explicit port", async () => {
+    const warehouse = new Warehouse();
+    await expect(warehouse.get("ep://127.0.0.1/sys/resource")).rejects.toThrow(
+      /explicit port/i,
+    );
+  });
+
   it("returns an EpConnection for a bare ep:// URL", async () => {
     const serverWh = new Warehouse();
     await serverWh.put("sys", new MemoryStore());

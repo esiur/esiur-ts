@@ -792,11 +792,39 @@ function parseRemoteEpUrl(path: string): RemoteEpUrl | undefined {
   else if (scheme === "tcp") socketScheme = "tcp";
   else return undefined;
 
+  const port = getExplicitPort(path);
+  if (port == null)
+    throw new Error(
+      `EP endpoints must include an explicit port (for example, ep://host:port): ${path}`,
+    );
+
   const resourcePath = decodeURIComponent(url.pathname.replace(/^\/+/, ""));
+  const hostname = url.hostname.includes(":") && !url.hostname.startsWith("[")
+    ? `[${url.hostname}]`
+    : url.hostname;
   return {
-    socketUrl: `${socketScheme}://${url.host}`,
+    socketUrl: `${socketScheme}://${hostname}:${port}`,
     resourcePath,
   };
+}
+
+function getExplicitPort(value: string): number | undefined {
+  const schemeEnd = value.indexOf("://");
+  if (schemeEnd < 0) return undefined;
+
+  const authorityStart = schemeEnd + 3;
+  const separatorIndexes = ["/", "?", "#"]
+    .map((separator) => value.indexOf(separator, authorityStart))
+    .filter((index) => index >= 0);
+  const authorityEnd = separatorIndexes.length > 0 ? Math.min(...separatorIndexes) : value.length;
+  const authority = value.slice(authorityStart, authorityEnd).split("@").at(-1) ?? "";
+  const closingBracket = authority.indexOf("]");
+  const colon = authority.startsWith("[") ? closingBracket + 1 : authority.lastIndexOf(":");
+  if (colon <= 0 || authority[colon] !== ":") return undefined;
+
+  const portText = authority.slice(colon + 1);
+  const port = Number(portText);
+  return /^\d+$/.test(portText) && port > 0 && port <= 65535 ? port : undefined;
 }
 
 function normalizeRemoteOptions(

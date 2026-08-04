@@ -19,6 +19,17 @@ class Greeter extends Resource {
 }
 
 describe("EpServer + EpConnection.connect (end-to-end API)", () => {
+  it("requires callers to supply a server port", async () => {
+    const wh = new Warehouse();
+    await expect(
+      EpServer.listen({ warehouse: wh } as unknown as Parameters<typeof EpServer.listen>[0]),
+    ).rejects.toThrow(/explicit port/i);
+  });
+
+  it("rejects client endpoints without an explicit port", async () => {
+    await expect(EpConnection.connect("ws://127.0.0.1")).rejects.toThrow(/explicit port/i);
+  });
+
   it("hosts a warehouse and serves a remote client", async () => {
     const wh = new Warehouse();
     await wh.put("sys", new MemoryStore());

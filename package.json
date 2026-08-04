@@ -1,6 +1,6 @@
 {
   "name": "esiur",
-  "version": "3.0.0",
+  "version": "3.0.1",
   "description": "Distributed Object Framework for TypeScript - real-time properties, async invocation and events over the Esiur EP protocol.",
   "type": "module",
   "exports": {
