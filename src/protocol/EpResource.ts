@@ -1,11 +1,14 @@
 import { EventHandler } from "../core/EventHandler.js";
 import { AsyncReply } from "../core/AsyncReply.js";
+import { AsyncException } from "../core/AsyncException.js";
 import type { DestroyedEvent } from "../core/IDestructible.js";
 import { TypeDef } from "../resource/template.js";
 import type { Instance } from "../resource/Instance.js";
 import type { IResource, IResourceContext } from "../resource/IResource.js";
 import type { IDynamicResource } from "../resource/IDynamicResource.js";
 import { ResourceOperation } from "../resource/ResourceOperation.js";
+import { ResourceCursor } from "../resource/ResourceCursor.js";
+import type { ResourceJournalPage, ResourceJournalQuery } from "../resource/ResourceJournal.js";
 import type { EpConnection } from "./EpConnection.js";
 
 /** Notification payload for a remote property change. */
@@ -14,7 +17,9 @@ export interface RemotePropertyChange {
   index: number;
   value: unknown;
   age?: number;
+  cursor?: ResourceCursor;
   date?: Date;
+  recordedAt?: Date;
 }
 
 /** Snapshot metadata for one remote property value. */
@@ -26,8 +31,9 @@ export interface RemotePropertyValue {
 }
 
 export interface EpResourceOptions {
-  typeDefId?: number;
+  typeDefId?: bigint;
   age?: number;
+  cursor?: ResourceCursor;
   link?: string;
   hops?: number;
 }
@@ -67,6 +73,10 @@ export class EpResource implements IResource, IDynamicResource {
   readonly propertyAges = new Map<number, number>();
   /** Property index to last known modification date. */
   readonly propertyModificationDates = new Map<number, Date | undefined>();
+  /** Per-property revision cursors used to reject duplicate/out-of-order notifications. */
+  readonly propertyCursors = new Map<number, ResourceCursor>();
+  /** Per-event replay cursors retained across reconnects. */
+  readonly eventCursors = new Map<number, ResourceCursor>();
   /** Fires when a property is updated by a notification. */
   readonly propertyModified = new EventHandler<RemotePropertyChange>();
   /** Fires when a remote event occurs. */
@@ -82,9 +92,11 @@ export class EpResource implements IResource, IDynamicResource {
   private readonly subscribedEvents = new Set<number>();
   /** Event indices with a subscription-reconciliation loop currently running. */
   private readonly reconciling = new Set<number>();
+  private readonly subscriptionWaiters = new Map<number, AsyncReply<this>[]>();
 
-  typeDefId?: number;
+  typeDefId?: bigint;
   age = 0;
+  cursor = ResourceCursor.empty();
   link = "";
   hops = 0;
 
@@ -153,8 +165,41 @@ export class EpResource implements IResource, IDynamicResource {
     const event = this.typeDef.getEventByName(name);
     if (!event) throw new Error(`Unknown event "${name}".`);
     getOrCreate(this.eventListeners, event.index).add(callback);
-    if (event.subscribable) this.reconcileSubscription(event.index);
+    if (event.subscribable || event.historical) this.reconcileSubscription(event.index);
     return this;
+  }
+
+  /** Register a listener and resolve once any required wire subscription is active. */
+  onAsync(name: string, callback: (value: unknown) => void): AsyncReply<this> {
+    const reply = new AsyncReply<this>();
+    if (name.startsWith(":")) {
+      this.on(name, callback);
+      reply.trigger(this);
+      return reply;
+    }
+    const event = this.typeDef.getEventByName(name);
+    if (!event) throw new Error(`Unknown event "${name}".`);
+    getOrCreate(this.eventListeners, event.index).add(callback);
+    if (event.subscribable || event.historical)
+      this.reconcileSubscription(event.index, reply);
+    else reply.trigger(this);
+    return reply;
+  }
+
+  /** Replay retained occurrences after a cursor, then continue with live delivery. */
+  onFromAsync(
+    name: string,
+    after: ResourceCursor,
+    callback: (value: unknown) => void,
+  ): AsyncReply<this> {
+    const event = this.typeDef.getEventByName(name);
+    if (!event) throw new Error(`Unknown event "${name}".`);
+    if (!event.historical) throw new Error(`Event "${name}" is not historical.`);
+    this.eventCursors.set(event.index, after);
+    const reply = new AsyncReply<this>();
+    getOrCreate(this.eventListeners, event.index).add(callback);
+    this.reconcileSubscription(event.index, reply);
+    return reply;
   }
 
   /** Remove a listener registered with {@link on}. */
@@ -167,7 +212,7 @@ export class EpResource implements IResource, IDynamicResource {
     const event = this.typeDef.getEventByName(name);
     if (!event) return this;
     this.eventListeners.get(event.index)?.delete(callback);
-    if (event.subscribable) this.reconcileSubscription(event.index);
+    if (event.subscribable || event.historical) this.reconcileSubscription(event.index);
     return this;
   }
 
@@ -178,30 +223,53 @@ export class EpResource implements IResource, IDynamicResource {
    * is in flight is coalesced into whatever the state actually is once the
    * in-flight request settles, rather than replaying every transition.
    */
-  private reconcileSubscription(index: number): void {
+  private reconcileSubscription(index: number, waiter?: AsyncReply<this>): void {
+    if (waiter) {
+      const waiters = this.subscriptionWaiters.get(index) ?? [];
+      waiters.push(waiter);
+      this.subscriptionWaiters.set(index, waiters);
+    }
     if (this.reconciling.has(index)) return;
     this.reconciling.add(index);
     (async () => {
       for (;;) {
         const desired = (this.eventListeners.get(index)?.size ?? 0) > 0;
         const actual = this.subscribedEvents.has(index);
-        if (desired === actual) return;
+        if (desired === actual) {
+          this.completeSubscriptionReconciliation(index);
+          return;
+        }
         try {
           if (desired) {
-            await this.connection.subscribe(this.instanceId, index);
+            await this.connection.subscribe(
+              this.instanceId,
+              index,
+              this.eventCursors.get(index) ?? this.cursor,
+            );
             this.subscribedEvents.add(index);
           } else {
             await this.connection.unsubscribe(this.instanceId, index);
             this.subscribedEvents.delete(index);
           }
-        } catch {
+        } catch (error) {
           // Leave `subscribedEvents` as-is; the next on()/off() call that
           // changes the listener count re-triggers reconciliation, so a
           // transient failure here just needs another transition to retry.
+          this.completeSubscriptionReconciliation(index, error);
           return;
         }
       }
-    })().finally(() => this.reconciling.delete(index));
+    })();
+  }
+
+  private completeSubscriptionReconciliation(index: number, error?: unknown): void {
+    this.reconciling.delete(index);
+    const waiters = this.subscriptionWaiters.get(index);
+    this.subscriptionWaiters.delete(index);
+    for (const waiter of waiters ?? []) {
+      if (error == null) waiter.trigger(this);
+      else waiter.triggerError(AsyncException.from(error));
+    }
   }
 
   /**
@@ -219,7 +287,7 @@ export class EpResource implements IResource, IDynamicResource {
     for (const index of this.eventListeners.keys()) {
       if ((this.eventListeners.get(index)?.size ?? 0) === 0) continue;
       const event = this.typeDef.getEventByIndex(index);
-      if (event?.subscribable) this.reconcileSubscription(index);
+      if (event?.subscribable || event?.historical) this.reconcileSubscription(index);
     }
   }
 
@@ -273,7 +341,18 @@ export class EpResource implements IResource, IDynamicResource {
   setRemoteIdentity(options: EpResourceOptions & { instanceId?: number }): void {
     if (options.instanceId != null) this.instanceId = options.instanceId;
     if (options.typeDefId != null) this.typeDefId = options.typeDefId;
-    if (options.age != null) this.age = options.age;
+    if (options.cursor) {
+      const generationChanged = !this.cursor.isEmpty &&
+        !this.cursor.generation.equals(options.cursor.generation);
+      this.cursor = options.cursor;
+      this.age = Number(options.cursor.revision);
+      if (generationChanged) {
+        this.propertyCursors.clear();
+        this.eventCursors.clear();
+        for (const event of this.typeDef.events)
+          this.eventCursors.set(event.index, options.cursor);
+      }
+    } else if (options.age != null) this.age = options.age;
     if (options.link != null) this.link = options.link;
     if (options.hops != null) this.hops = options.hops;
   }
@@ -283,6 +362,8 @@ export class EpResource implements IResource, IDynamicResource {
     this.properties[index] = value;
     this.cache.set(index, value);
     this.propertyAges.set(index, age);
+    if (!this.cursor.isEmpty)
+      this.propertyCursors.set(index, new ResourceCursor(this.cursor.generation, BigInt(age)));
     this.propertyModificationDates.set(index, date);
     if (age > this.age) this.age = age;
     // Mirror into `instance` (silently — no propertyModified emit) when this
@@ -310,35 +391,70 @@ export class EpResource implements IResource, IDynamicResource {
       this.setPropertySnapshot(pv.index, pv.age, pv.date, pv.value);
   }
 
+  /** Query retained property changes and event occurrences without subscribing. */
+  queryJournal(query: ResourceJournalQuery = {}): AsyncReply<ResourceJournalPage> {
+    return this.requireConnection().queryResourceJournal(this.instanceId, query);
+  }
+
   /** @internal Apply a property value pushed by the server. */
-  updateProperty(index: number, value: unknown, age?: number, date?: Date): void {
+  updateProperty(index: number, value: unknown, cursor?: ResourceCursor, date?: Date): void {
+    const previous = this.propertyCursors.get(index);
+    if (
+      cursor && previous && previous.generation.equals(cursor.generation) &&
+      previous.revision >= cursor.revision
+    ) return;
+    const recordedAt = date ?? new Date();
+    if (cursor) {
+      this.propertyCursors.set(index, cursor);
+      this.observeCursor(cursor);
+    }
     this.properties[index] = value;
     this.cache.set(index, value);
-    if (age != null) {
-      this.propertyAges.set(index, age);
-      if (age > this.age) this.age = age;
+    if (cursor) {
+      this.propertyAges.set(index, Number(cursor.revision));
     }
-    if (date != null) this.propertyModificationDates.set(index, date);
+    this.propertyModificationDates.set(index, recordedAt);
     const pt = this.typeDef.getPropertyByIndex(index);
     if (pt) {
-      this.propertyModified.emit({ name: pt.name, index, value, age, date });
-      // Relay: if this proxy has been put() into a warehouse, forward the
-      // change through its Instance so a third node attached to it (via
-      // subscribeToInstance) gets notified too. Live PropertyModified
-      // notifications don't carry the origin's age/date on the wire, so
-      // this self-increments the Instance's own age like any local write
-      // would (matching how a relayed EmitModification loses origin-age
-      // fidelity in dotnet too).
-      this.instance?.modified(pt.name, value);
+      this.propertyModified.emit({
+        name: pt.name,
+        index,
+        value,
+        age: cursor ? Number(cursor.revision) : undefined,
+        cursor,
+        date: recordedAt,
+        recordedAt,
+      });
+      if (cursor) this.instance?.applyRemotePropertyModification(pt, value, cursor, recordedAt);
+      else this.instance?.modified(pt.name, value);
     }
   }
 
   /** @internal Apply an event occurrence pushed by the server. */
-  applyEvent(index: number, value: unknown): void {
+  applyEvent(index: number, value: unknown, cursor?: ResourceCursor, date?: Date): void {
+    const previous = this.eventCursors.get(index);
+    if (
+      cursor && previous && previous.generation.equals(cursor.generation) &&
+      previous.revision >= cursor.revision
+    ) return;
+    const recordedAt = date ?? new Date();
+    if (cursor) {
+      this.eventCursors.set(index, cursor);
+      this.observeCursor(cursor);
+    }
     const et = this.typeDef.getEventByIndex(index);
     if (et) {
-      this.eventOccurred.emit({ name: et.name, index, value });
-      this.instance?.emitEventByIndex(index, value);
+      this.eventOccurred.emit({
+        name: et.name,
+        index,
+        value,
+        age: cursor ? Number(cursor.revision) : undefined,
+        cursor,
+        date: recordedAt,
+        recordedAt,
+      });
+      if (cursor) this.instance?.applyRemoteEvent(et, value, cursor, recordedAt);
+      else this.instance?.emitEventByIndex(index, value);
     }
     this._EmitEventByIndex(index, value);
   }
@@ -385,6 +501,17 @@ export class EpResource implements IResource, IDynamicResource {
   private setLocalProperty(index: number, value: unknown): void {
     this.properties[index] = value;
     this.cache.set(index, value);
+  }
+
+  private observeCursor(cursor: ResourceCursor): void {
+    if (
+      this.cursor.isEmpty ||
+      !this.cursor.generation.equals(cursor.generation) ||
+      cursor.revision > this.cursor.revision
+    ) {
+      this.cursor = cursor;
+      this.age = Number(cursor.revision);
+    }
   }
 
   private requireConnection(): EpConnection {

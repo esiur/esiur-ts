@@ -1,6 +1,7 @@
 import { TduClass } from "./TduClass.js";
 import { TduIdentifier } from "./TduIdentifier.js";
 import { merge } from "./DC.js";
+import { ensureRemoteTypeMetadataDepth } from "./ParserGuard.js";
 
 /** Type-representation metadata that can serialize itself (implemented by Tru). */
 export interface ComposableTru {
@@ -87,6 +88,7 @@ export class Tdu {
       // Typed identifier itself (0x80): metadata bytes precede the payload.
       if (metadata == null)
         throw new Error("Metadata must be provided for typed TDUs.");
+      ensureRemoteTypeMetadataDepth(connection, metadata);
       const metadataData = metadata.compose(connection);
       const content = merge(metadataData, (data ?? new Uint8Array(0)).subarray(0, length));
       const header = framedHeader(idByte, content.length);

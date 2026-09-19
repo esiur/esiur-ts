@@ -28,9 +28,7 @@ clients. `EpServer` is Node-only and always uses `ws`.
 ```ts
 import { Warehouse } from "esiur";
 
-declare const port: number; // Supplied and validated by your application's configuration.
-
-const resource = await Warehouse.default.get(`ep://127.0.0.1:${port}/sys/counter`);
+const resource = await Warehouse.default.get("ep://127.0.0.1/sys/counter");
 
 console.log(resource.count);
 resource.on("changed", () => console.log("updated:", resource.count));
@@ -38,11 +36,12 @@ await resource.increment();
 ```
 
 `Warehouse.get` accepts local paths and EP URLs. `ep://` is transported as
-`ws://`; `eps://` is transported as `wss://`. A bare EP URL (no path) returns
-just the connection:
+`ws://`; `eps://` is transported as `wss://`. Port `51018` is used when the
+endpoint omits a port; include a port only to override that default. A bare EP
+URL (no path) returns just the connection:
 
 ```ts
-const connection = await Warehouse.default.get(`ep://127.0.0.1:${port}`);
+const connection = await Warehouse.default.get("ep://127.0.0.1");
 ```
 
 A path can be resolved without knowing the remote type ahead of time — the
@@ -53,7 +52,7 @@ a typed reference instead:
 
 ```ts
 const resource = await Warehouse.default.get(
-  `ep://127.0.0.1:${port}/sys/counter`,
+  "ep://127.0.0.1/sys/counter",
   Counter,
 );
 ```
@@ -78,16 +77,15 @@ class Greeter extends Resource {
 }
 
 const warehouse = new Warehouse();
-declare const port: number; // Supplied and validated by your application's configuration.
 await warehouse.put("sys", new MemoryStore());
 await warehouse.put("sys/greeter", new Greeter());
 await warehouse.open();
 
-const server = await EpServer.listen({ port, warehouse });
+const server = await EpServer.listen({ warehouse }); // Listens on 51018.
 ```
 
 Any client — TypeScript, JavaScript, or a .NET Esiur client — can then attach
-to `ep://host:${ESIUR_PORT}/sys/greeter`, read/write `visits`, call `greet()`, and
+to `ep://host/sys/greeter`, read/write `visits`, call `greet()`, and
 receive property-change notifications, all without any code generation step.
 
 ### Events
@@ -107,6 +105,34 @@ class Counter extends Resource {
   }
 }
 ```
+
+### Historical properties and events
+
+Esiur 3.1 gives every resource one ordered `(generation, revision)` stream
+shared by property modifications and event occurrences. Mark only the members
+that must survive disconnects with `@Historical()`:
+
+```ts
+import { Historical } from "esiur";
+
+class Meter extends Resource {
+  @Export(t.f64) @Historical() accessor level = 0;
+  @Export(t.f64) @Historical() reading: EventSource<number> = event<number>();
+}
+
+const attachedAt = meter.cursor;
+const page = await meter.queryJournal({ after: attachedAt, limit: 1000 });
+
+await meter.onFromAsync("reading", attachedAt, (value) => {
+  console.log(value);
+});
+```
+
+Ordinary events remain live-only and do not grow the replay queue. Persist the
+last successfully processed `ResourceCursor` in the consuming application;
+reattach and historical subscriptions use it to replay exactly the missing
+range. A bounded store reports `cursorExpired` when that range has already
+been discarded.
 
 ## Federation and relay
 
@@ -181,10 +207,9 @@ import {
 
 const warehouse = new Warehouse();
 warehouse.registerAuthenticationProvider(new MyPasswordProvider());
-declare const port: number; // Supplied and validated by your application's configuration.
 
 const connection = await warehouse.get(
-  `ep://localhost:${port}`,
+  "ep://localhost",
   new EpConnectionContext({
     authenticationMode: AuthenticationMode.InitializerIdentity,
     identity: "alice",
@@ -237,12 +262,23 @@ npm run build
 ```
 
 `npm run check` runs type checking, ESLint, and the test suite. The runtime
-package supports Node.js 18+. The dev toolchain requires Node.js 18.18+.
+package supports Node.js 18+. Use Node.js 22.12+ for the development and
+release toolchain (CI runs Node.js 22).
+
+The test toolchain stays on Vite 7 to preserve the TC39 decorator transform.
+The esbuild override pins the patched build tool until upstream dependency
+ranges include it; it is not a runtime dependency of the published package.
+
+Protocol compatibility is tracked against the .NET reference implementation
+in [docs/dotnet-parity-matrix.md](docs/dotnet-parity-matrix.md). The normative
+TypeDef rules and the shared cross-runtime fixture are described in
+[docs/typedef-parity.md](docs/typedef-parity.md).
 
 ## Status
 
-The v3 TypeScript port implements the full EP wire protocol: attach/reattach
-(including reconnect resubscription), property read/write with change
+The v3.1 TypeScript port implements the full EP wire protocol: attach/reattach
+(including cursor-based reconnect replay), unified property/event journals,
+historical subscriptions and journal queries, property read/write with change
 notifications, function invocation, ref-counted event subscription (`.on()`/
 `.off()`), server-side TypeDef answering (so clients can attach without a
 predeclared type), resource lifecycle (create/delete/move/detach), static
@@ -252,10 +288,7 @@ layer. `EpResource` implements `IResource`, so a resource fetched from one
 node can be relayed through another node's warehouse to a third.
 
 Known gaps: only an in-memory store ships in this package (other backends
-are separate packages by design); no compose-side support yet for resource
-references inside arbitrary composed values (a few handlers that would
-otherwise send live resource references send `[id, link]` pairs instead —
-noted at the relevant call sites); direct raw TCP transport is client-only
+are separate packages by design); direct raw TCP transport is client-only
 (no raw-TCP server).
 
 ## License

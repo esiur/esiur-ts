@@ -1,6 +1,20 @@
 import { IndexedStructure } from "./IndexedStructure.js";
 import { getIndexedMembers } from "./IndexAttribute.js";
-import { TypedMap, t } from "./descriptors.js";
+import { TypedList, TypedMap, t } from "./descriptors.js";
+import { TruComposite, type Tru } from "./Tru.js";
+import { TruIdentifier } from "./TruIdentifier.js";
+import {
+  Char16,
+  Float32,
+  Int8,
+  Int16,
+  Int32,
+  Int64,
+  UInt8,
+  UInt16,
+  UInt32,
+  UInt64,
+} from "./widths.js";
 
 /**
  * Convert an {@link IndexedStructure} instance to a sparse `TypedMap<u8,
@@ -27,14 +41,52 @@ export function toIndexedMap(value: IndexedStructure): TypedMap {
   for (const m of members) {
     const raw = record[m.name];
     if (raw === null || raw === undefined) continue;
-    entries.push([m.index, prepareValue(raw)]);
+    entries.push([m.index, prepareValue(raw, m.wireType)]);
   }
   return new TypedMap(t.u8, t.dynamic, entries);
 }
 
-function prepareValue(v: unknown): unknown {
+function prepareValue(v: unknown, wireType?: Tru): unknown {
+  if (wireType) {
+    const n = (): number => {
+      if (typeof v !== "number" || !Number.isFinite(v))
+        throw new TypeError(`Indexed ${TruIdentifier[wireType.identifier]} value must be a finite number.`);
+      return v;
+    };
+    const b = (): bigint => {
+      if (typeof v === "bigint") return v;
+      if (typeof v === "number" && Number.isSafeInteger(v)) return BigInt(v);
+      throw new TypeError(`Indexed ${TruIdentifier[wireType.identifier]} value must be a bigint or safe integer.`);
+    };
+
+    switch (wireType.identifier) {
+      case TruIdentifier.UInt8: return new UInt8(n());
+      case TruIdentifier.Int8: return new Int8(n());
+      case TruIdentifier.Char: return new Char16(n());
+      case TruIdentifier.UInt16: return new UInt16(n());
+      case TruIdentifier.Int16: return new Int16(n());
+      case TruIdentifier.UInt32: return new UInt32(n());
+      case TruIdentifier.Int32: return new Int32(n());
+      case TruIdentifier.UInt64: return new UInt64(b());
+      case TruIdentifier.Int64: return new Int64(b());
+      case TruIdentifier.Float32: return new Float32(n());
+      case TruIdentifier.TypedList:
+        if (!Array.isArray(v)) throw new TypeError("Indexed TypedList value must be an array.");
+        return new TypedList(
+          (wireType as TruComposite).subTypes[0],
+          v.map((item) => prepareValue(item)),
+        );
+      case TruIdentifier.TypedMap:
+        if (!(v instanceof Map)) throw new TypeError("Indexed TypedMap value must be a Map.");
+        return new TypedMap(
+          (wireType as TruComposite).subTypes[0],
+          (wireType as TruComposite).subTypes[1],
+          [...v].map(([key, item]) => [prepareValue(key), prepareValue(item)]),
+        );
+    }
+  }
   if (v instanceof IndexedStructure) return toIndexedMap(v);
-  if (Array.isArray(v)) return v.map(prepareValue);
+  if (Array.isArray(v)) return v.map((item) => prepareValue(item));
   return v;
 }
 

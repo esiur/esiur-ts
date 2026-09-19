@@ -12,17 +12,21 @@ import { EpPacketRequest } from "../net/packets/EpPacketRequest.js";
 import { EpPacketReply } from "../net/packets/EpPacketReply.js";
 import { EpPacketNotification } from "../net/packets/EpPacketNotification.js";
 import type { PlainTdu } from "../data/PlainTdu.js";
-import { compose, parse, parseSync } from "../data/Codec.js";
+import { compose, parse, parseAsync, parseSyncTdu } from "../data/Codec.js";
 import { TduIdentifier } from "../data/TduIdentifier.js";
-import { TypeDefInfo } from "../data/types/TypeDefInfo.js";
+import { TduClass } from "../data/TduClass.js";
+import { ParsedTdu } from "../data/ParsedTdu.js";
+import { ParserLimitException, RemoteParserLimitException } from "../data/ParserGuard.js";
 import { TypeDefKind, type ITypeDef } from "../data/types/ITypeDef.js";
 import { StreamMode } from "../data/types/StreamMode.js";
-import { Tru, TruComposite, TruTypeDef } from "../data/Tru.js";
+import { Tru, TruComposite, TruTypeDef, type RemoteTypeDefResolver } from "../data/Tru.js";
+import { TruIdentifier } from "../data/TruIdentifier.js";
 import { getUint32, getUint64, merge, uint32ToBytes } from "../data/DC.js";
 import { Endian } from "../data/Endian.js";
 import { typedMap } from "../data/descriptors.js";
 import { t } from "../data/descriptors.js";
-import { u8 } from "../data/widths.js";
+import { u8, u64 } from "../data/widths.js";
+import { Uuid } from "../data/Uuid.js";
 import { ResourceId } from "../data/ResourceId.js";
 import { WSocket } from "../net/sockets/WSocket.js";
 import type { ISocket } from "../net/sockets/ISocket.js";
@@ -46,11 +50,23 @@ import { randomBytes } from "../security/random.js";
 import { ResourceManagerContext } from "../security/management/ResourceManagerContext.js";
 import { ActionType } from "../security/permissions/ActionType.js";
 import type { Warehouse } from "../resource/Warehouse.js";
+import {
+  EncryptionConfiguration,
+  ParserConfiguration,
+  ResourceAttachmentConfiguration,
+} from "../resource/WarehouseConfiguration.js";
 import { TypeDef, type MemberTemplate, type FunctionTemplate } from "../resource/template.js";
 import type { IResource } from "../resource/IResource.js";
+import "../resource/resources.js";
 import { isDynamicResource } from "../resource/IDynamicResource.js";
 import { LocalTypeDef } from "../resource/typedef.js";
 import { typeDefInfoFromTypeDef } from "../resource/typeDefInfoCompose.js";
+import { ResourceCursor } from "../resource/ResourceCursor.js";
+import {
+  ResourceJournalEntryKind,
+  type ResourceJournalPage,
+  type ResourceJournalQuery,
+} from "../resource/ResourceJournal.js";
 import {
   EpResource,
   type EpResourceConstructor,
@@ -59,6 +75,13 @@ import {
 } from "./EpResource.js";
 import { RemoteTypeDef } from "./RemoteTypeDef.js";
 import { ServerInvocationContext, isIterableResult } from "./ServerInvocationContext.js";
+import { normalizeEsiurEndpoint } from "./EpProtocol.js";
+import {
+  disabledEpConnectionMetrics,
+  EpConnectionMetricsCollector,
+  type EpConnectionRuntimeMetricsSnapshot,
+  type EpConnectionRuntimeState,
+} from "./EpConnectionMetrics.js";
 
 /** Handles an inbound request packet (server-side dispatch). */
 export type RequestHandler = (
@@ -73,7 +96,7 @@ export type NotificationHandler = (
   connection: EpConnection,
   action: EpPacketNotification,
   tdu: PlainTdu | null,
-) => void;
+) => void | Promise<void>;
 
 export interface EpConnectionOptions {
   /** Reconnect automatically after an unexpected client-side disconnect. */
@@ -124,6 +147,10 @@ export interface EpConnectionOptions {
   webSocketUri?: string | URL;
   /** .NET-compatible alias for {@link webSocketUri}. */
   WebSocketUri?: string | URL;
+  /** Maximum time for the authentication handshake in milliseconds. Default 30 seconds. */
+  authenticationTimeoutMs?: number;
+  /** .NET-compatible alias for {@link authenticationTimeoutMs}. */
+  AuthenticationTimeoutMs?: number;
 }
 
 /** .NET-compatible connection context accepted by `Warehouse.get` and `EpConnection.connect`. */
@@ -138,6 +165,7 @@ export class EpConnectionContext implements EpConnectionOptions {
   ResponderIdentity?: string;
   Domain?: string;
   WebSocketUri?: string | URL;
+  AuthenticationTimeoutMs?: number;
 
   constructor(options?: EpConnectionOptions) {
     if (options) Object.assign(this, options);
@@ -158,7 +186,12 @@ export type EpResourceAttachTarget<T extends EpResource = EpResource> =
 
 interface TypeDefFetchRequestInfo {
   reply: AsyncReply<RemoteTypeDef>;
-  requestSequence: number[];
+  requestSequence: bigint[];
+}
+
+interface ResourceAttachRequestInfo {
+  reply: AsyncReply;
+  requestSequence: bigint[];
 }
 
 /**
@@ -180,11 +213,37 @@ export class EpConnection extends NetworkConnection {
   onNotification?: NotificationHandler;
 
   private readonly requests = new Map<number, AsyncReply>();
+  private runtimeMetrics?: EpConnectionMetricsCollector;
   private callbackCounter = 0;
   private readonly packet = new EpPacket();
+  private readonly defaultResourceAttachmentConfiguration =
+    new ResourceAttachmentConfiguration();
+  private readonly defaultEncryptionConfiguration = new EncryptionConfiguration();
+  private readonly defaultParserConfiguration = new ParserConfiguration();
 
   /** Remote resources attached through this connection (instance id → proxy state). */
   private readonly attachedResources = new Map<number, EpResource>();
+  /** Placeholders registered before property decoding so reference cycles can close safely. */
+  private readonly neededResources = new Map<number, EpResource>();
+  /** Shared in-flight attaches prevent duplicate AttachResource requests for one id. */
+  private readonly resourceAttachRequests = new Map<number, ResourceAttachRequestInfo>();
+  /** Wait-for graph used to distinguish independent duplicate attaches from real cycles. */
+  private readonly resourcesFetchBlockedOn = new Map<number, Set<number>>();
+
+  /** Connection-aware resolver used by async value decoding. */
+  private readonly valueResolver: RemoteTypeDefResolver = Object.assign(
+    (id: bigint, sequence: readonly bigint[] | null) => this.fetchTypeDef(id, sequence),
+    {
+      resolveRemoteResource: (id: number, sequence: readonly bigint[] | null) => {
+        const attached = this.attachedResources.get(id);
+        return attached
+          ? EpResource.createProxy(attached)
+          : this.attachResource(id, undefined, sequence);
+      },
+      resolveLocalResource: (id: number) => this.warehouse?.getById(id),
+      resolveResourceLink: (link: string) => this.get(link),
+    },
+  );
 
   /**
    * The raw {@link EpResource} behind an id returned by {@link get}/{@link attach}
@@ -196,16 +255,62 @@ export class EpConnection extends NetworkConnection {
   getAttachedResource(instanceId: number): EpResource | undefined {
     return this.attachedResources.get(instanceId);
   }
+
+  /**
+   * Start per-connection diagnostics. No counters are allocated or updated
+   * before this is called. Calling it again resets the monitoring window.
+   */
+  enableRuntimeMetrics(): EpConnectionRuntimeMetricsSnapshot {
+    this.runtimeMetrics = new EpConnectionMetricsCollector();
+    return this.getRuntimeMetrics();
+  }
+
+  /** Stop diagnostics and release all counters. */
+  disableRuntimeMetrics(): void {
+    this.runtimeMetrics = undefined;
+  }
+
+  /** Read totals, current rates, attachment state, queues, and negotiated limits. */
+  getRuntimeMetrics(): EpConnectionRuntimeMetricsSnapshot {
+    const session = this.session;
+    let explicitEventSubscriptions = 0;
+    for (const events of this.eventSubscriptions.values())
+      explicitEventSubscriptions += events.size;
+    const state: EpConnectionRuntimeState = {
+      connected: this.isConnected,
+      authenticated: session.authenticated,
+      encrypted: session.encryptionActive,
+      attachedResources: this.attachedResources.size,
+      localResourceSubscriptions: this.subscriptions.size,
+      eventSubscriptions: explicitEventSubscriptions,
+      pendingRequests: this.requests.size,
+      pendingResourceAttachments: this.resourceAttachRequests.size,
+      pendingTypeDefinitions: this.typeDefRequests.size,
+      cachedTypeDefinitions: this.cachedTypeDefs.size,
+      neededResources: this.neededResources.size,
+      neededTypeDefinitions: this.neededTypeDefs.size,
+      activeInvocations: this.invocations.size,
+      queuedNotificationWork: this.pendingNotificationWork,
+      remoteMaximumPacketSize: session.remoteMaximumPacketSize ?? 0,
+      remoteMaximumAllocationSize: session.remoteMaximumAllocationSize ?? 0,
+      remoteMaximumCollectionItems: session.remoteMaximumCollectionItems ?? 0,
+      remoteMaximumTypeMetadataDepth: session.remoteMaximumTypeMetadataDepth ?? 0,
+      remoteMaximumEncryptedRecordSize: session.remoteMaximumEncryptedRecordSize ?? 0,
+    };
+    return this.runtimeMetrics?.snapshot(state) ?? disabledEpConnectionMetrics(state);
+  }
   /** Remote TypeDefs currently needed by an in-flight parse (type id to placeholder). */
-  private readonly neededTypeDefs = new Map<number, RemoteTypeDef>();
+  private readonly neededTypeDefs = new Map<bigint, RemoteTypeDef>();
   /** Fully parsed remote TypeDefs (type id to definition). */
-  private readonly cachedTypeDefs = new Map<number, RemoteTypeDef>();
+  private readonly cachedTypeDefs = new Map<bigint, RemoteTypeDef>();
   /** In-flight TypeDef fetches, used to share work and detect recursive cycles. */
-  private readonly typeDefRequests = new Map<number, TypeDefFetchRequestInfo>();
+  private readonly typeDefRequests = new Map<bigint, TypeDefFetchRequestInfo>();
   /** Wait-for graph for in-flight remote TypeDef parsing. */
-  private readonly typeDefsFetchBlockedOn = new Map<number, Set<number>>();
+  private readonly typeDefsFetchBlockedOn = new Map<bigint, Set<bigint>>();
   /** Server-side notification subscriptions (instance id → unsubscribe). */
   private readonly subscriptions = new Map<number, () => void>();
+  /** Inbound peer attachment operations that have reserved admission capacity. */
+  private readonly peerAttachmentRequests = new Set<number>();
   /**
    * Server-side explicit per-event subscriptions (instance id → subscribed
    * event indices), consulted only for events where {@link EventTemplate.subscribable}
@@ -228,6 +333,23 @@ export class EpConnection extends NetworkConnection {
    * counterpart that keys these the same way).
    */
   private readonly invocations = new Map<number, ServerInvocationContext>();
+  /** Preserves property/event delivery order while async decoding attaches referenced resources. */
+  private notificationQueue: Promise<void> = Promise.resolve();
+  private notificationGeneration = 0;
+  /**
+   * Promise continuations are microtasks. A large notification burst can keep
+   * appending continuations faster than the browser gets a chance to process
+   * input, paint, or timers. Preserve wire order, but yield to the host event
+   * loop after a bounded batch so live resources cannot starve their consumer.
+   */
+  private notificationsSinceYield = 0;
+  /** Notifications received from the wire but not yet decoded and applied. */
+  private pendingNotificationWork = 0;
+  private notificationWorkStartedAt = 0;
+  private static readonly NotificationBatchSize = 8;
+  private static readonly NotificationTimeSliceMs = 8;
+  /** Preserves streamed chunk order while async decoding resource-valued chunks. */
+  private readonly chunkDecodeQueues = new Map<number, Promise<void>>();
 
   // ---- handshake --------------------------------------------------------------
 
@@ -238,6 +360,9 @@ export class EpConnection extends NetworkConnection {
    */
   private authenticated = true;
   private authSessionEstablished = true;
+  /** Maximum authentication-handshake duration. `0` disables the deadline. */
+  authenticationTimeoutMs = 30_000;
+  private authenticationDeadline?: ReturnType<typeof setTimeout>;
   private direction: "initiator" | "responder" | null = null;
   private readonly authPacket = new EpAuthPacket();
   private readyReply?: AsyncReply;
@@ -293,6 +418,7 @@ export class EpConnection extends NetworkConnection {
   }
 
   private reconnectUrl?: string;
+  private reconnectUsesEsiurDefaultPort = true;
   private reconnectTimer?: ReturnType<typeof setTimeout>;
   private reconnectReply?: AsyncReply<boolean>;
   private manualClose = false;
@@ -309,6 +435,7 @@ export class EpConnection extends NetworkConnection {
     this.localHeaders.clear();
     if (this.domain) this.localHeaders.set(EpAuthPacketHeader.Domain, this.domain);
     this.readyReply = new AsyncReply();
+    this.restartAuthenticationDeadline();
   }
 
   /** Begin the server-side handshake (waits for the peer's Initialize). */
@@ -322,6 +449,7 @@ export class EpConnection extends NetworkConnection {
     this.localIdentity = null;
     this.remoteIdentity = null;
     this.sessionKey = null;
+    this.restartAuthenticationDeadline();
   }
 
   /** Resolves when the handshake completes (initiator side). */
@@ -346,7 +474,10 @@ export class EpConnection extends NetworkConnection {
     // `webSocketUri`, when set, is used verbatim as the socket transport —
     // never combined with `url` — matching dotnet's `WebSocketUri` override.
     const webSocketUri = config?.webSocketUri ?? config?.WebSocketUri;
-    await connection.openClientSocket(webSocketUri ? String(webSocketUri) : url);
+    await connection.openClientSocket(
+      webSocketUri ? String(webSocketUri) : url,
+      webSocketUri == null,
+    );
     return connection;
   }
 
@@ -361,6 +492,8 @@ export class EpConnection extends NetworkConnection {
     const identity = options.identity ?? options.Identity;
     const responderIdentity = options.responderIdentity ?? options.ResponderIdentity;
     const domain = options.domain ?? options.Domain;
+    const authenticationTimeoutMs =
+      options.authenticationTimeoutMs ?? options.AuthenticationTimeoutMs;
 
     if (autoReconnect != null) this.autoReconnect = autoReconnect;
     if (reconnectInterval != null) this.reconnectInterval = reconnectInterval;
@@ -371,23 +504,29 @@ export class EpConnection extends NetworkConnection {
     if (identity != null) this.localIdentity = identity;
     if (responderIdentity != null) this.responderIdentity = responderIdentity;
     if (domain != null) this.domain = domain;
+    if (authenticationTimeoutMs != null) {
+      if (!Number.isFinite(authenticationTimeoutMs) || authenticationTimeoutMs < 0)
+        throw new RangeError("authenticationTimeoutMs must be a non-negative finite number.");
+      this.authenticationTimeoutMs = authenticationTimeoutMs;
+    }
   }
 
-  private async openClientSocket(url: string): Promise<void> {
-    requireExplicitEndpointPort(url);
-    this.reconnectUrl = url;
+  private async openClientSocket(url: string, useEsiurDefaultPort = true): Promise<void> {
+    const socketUrl = useEsiurDefaultPort ? normalizeEsiurEndpoint(url) : validateEndpoint(url);
+    this.reconnectUrl = socketUrl;
+    this.reconnectUsesEsiurDefaultPort = useEsiurDefaultPort;
     this.manualClose = false;
     try {
-      this.hostName = new URL(url).hostname;
+      this.hostName = new URL(socketUrl).hostname;
       if (!this.domain) this.domain = this.hostName;
     } catch {
       /* leave domain empty */
     }
     this.startInitiatorHandshake(this.domain);
 
-    const socket = await this.createClientSocket(url);
+    const socket = await this.createClientSocket(socketUrl);
     this.assign(socket);
-    await socket.connect(url);
+    await socket.connect(socketUrl);
     await this.whenReady();
   }
 
@@ -420,6 +559,7 @@ export class EpConnection extends NetworkConnection {
   /** Send the initiator's Initialize packet. */
   private declare(): void {
     try {
+      this.populateLocalLimitHeaders();
       const headers = new Map(this.localHeaders);
       if (this.domain) headers.set(EpAuthPacketHeader.Domain, this.domain);
 
@@ -631,6 +771,7 @@ export class EpConnection extends NetworkConnection {
     this.remoteHeaders.clear();
     for (const [key, value] of remoteHeaders) this.remoteHeaders.set(key, value);
 
+    this.populateLocalLimitHeaders();
     const localHeaders = new Map(this.localHeaders);
 
     if (!this.negotiateEncryptionAsResponder(localHeaders)) return;
@@ -698,6 +839,9 @@ export class EpConnection extends NetworkConnection {
   private handleAuthAcknowledge(packet: EpAuthPacket): void {
     if (this.authenticationMode === AuthenticationMode.None) {
       if (packet.method === EpAuthPacketMethod.SessionEstablished) {
+        const { headers: remoteHeaders } = this.parseAuthHeaders(packet);
+        this.remoteHeaders.clear();
+        for (const [key, value] of remoteHeaders) this.remoteHeaders.set(key, value);
         this.completeAuthentication(nullResult());
       } else {
         this.failAuthentication(this.readAuthErrorMessage(packet), true);
@@ -929,12 +1073,14 @@ export class EpConnection extends NetworkConnection {
   }
 
   private finishAuthenticationReady(): void {
+    this.cancelAuthenticationDeadline();
     this.authenticated = true;
     this.readyReply?.trigger(true);
     this.authenticationProvider?.login?.(this.getAuthenticationSession());
   }
 
   private failAuthentication(error: unknown, suppressSend = false): void {
+    this.cancelAuthenticationDeadline();
     const exception =
       error instanceof AsyncException
         ? error
@@ -942,6 +1088,28 @@ export class EpConnection extends NetworkConnection {
     this.readyReply?.triggerError(exception);
     if (!suppressSend) this.sendAuthData(EpAuthPacketMethod.ErrorTerminate, exception.message);
     this.close();
+  }
+
+  private restartAuthenticationDeadline(): void {
+    this.cancelAuthenticationDeadline();
+    if (this.authenticationTimeoutMs <= 0) return;
+    this.authenticationDeadline = setTimeout(() => {
+      this.authenticationDeadline = undefined;
+      if (this.authenticated) return;
+      this.failAuthentication(
+        new AsyncException(
+          ErrorType.Management,
+          ExceptionCode.Timeout,
+          "Authentication did not complete before the configured deadline.",
+        ),
+        true,
+      );
+    }, this.authenticationTimeoutMs);
+  }
+
+  private cancelAuthenticationDeadline(): void {
+    if (this.authenticationDeadline) clearTimeout(this.authenticationDeadline);
+    this.authenticationDeadline = undefined;
   }
 
   private getAuthenticationSession(): AuthenticationSession {
@@ -958,7 +1126,24 @@ export class EpConnection extends NetworkConnection {
       encryptionProvider: this.encryptionProvider,
       symetricCipher: this.symetricCipher,
       encryptionActive: this.encryptionActive,
+      remoteMaximumPacketSize: this.remoteLimit(EpAuthPacketHeader.MaximumPacketSize),
+      remoteMaximumAllocationSize: this.remoteLimit(EpAuthPacketHeader.MaximumAllocationSize),
+      remoteMaximumCollectionItems: this.remoteLimit(EpAuthPacketHeader.MaximumCollectionItems),
+      remoteMaximumTypeMetadataDepth: this.remoteLimit(EpAuthPacketHeader.MaximumTypeMetadataDepth),
+      remoteMaximumEncryptedRecordSize: this.remoteLimit(
+        EpAuthPacketHeader.MaximumEncryptedRecordSize,
+      ),
     };
+  }
+
+  /** Current authenticated session, including the peer's advertised parser budgets. */
+  get session(): AuthenticationSession {
+    return this.getAuthenticationSession();
+  }
+
+  private remoteLimit(header: EpAuthPacketHeader): number {
+    const value = Number(this.remoteHeaders.get(header) ?? 0);
+    return Number.isSafeInteger(value) && value >= 0 ? value : 0;
   }
 
   // ---- outbound ---------------------------------------------------------------
@@ -966,9 +1151,41 @@ export class EpConnection extends NetworkConnection {
   /** Send a request and return a reply that settles when the peer responds. */
   sendRequest(action: EpPacketRequest, ...args: unknown[]): AsyncReply {
     const reply = new AsyncReply();
+    if (!this.isConnected) {
+      reply.triggerError(
+        new AsyncException(
+          ErrorType.Management,
+          ExceptionCode.HostNotReachable,
+          "Connection is not available while the transport reconnects.",
+        ),
+      );
+      return reply;
+    }
+
     const callbackId = ++this.callbackCounter;
     this.requests.set(callbackId, reply);
-    this.send(EpPacket.composeRequest(action, callbackId, this.composeArgs(args)));
+    this.runtimeMetrics?.sentRequest();
+    try {
+      this.send(EpPacket.composeRequest(action, callbackId, this.composeArgs(args)));
+    } catch (error) {
+      this.requests.delete(callbackId);
+      if (error instanceof RemoteParserLimitException) {
+        reply.triggerError(
+          new AsyncException(ErrorType.Management, ExceptionCode.ParserLimitExceeded, error.message),
+        );
+      } else {
+        // A browser WebSocket can become CLOSING between the isConnected check
+        // above and the actual send. Convert that transport race into the same
+        // asynchronous HostNotReachable result used for an ordinary close.
+        reply.triggerError(
+          new AsyncException(
+            ErrorType.Management,
+            ExceptionCode.HostNotReachable,
+            error instanceof Error ? error.message : "Connection closed.",
+          ),
+        );
+      }
+    }
     return reply;
   }
 
@@ -979,8 +1196,8 @@ export class EpConnection extends NetworkConnection {
   }
 
   /** Invoke a `static` exported function `index` on TypeDef `typeId` — no resource instance involved. */
-  staticCall(typeId: number, index: number, ...args: unknown[]): AsyncReply {
-    return this.sendRequest(EpPacketRequest.StaticCall, typeId, u8(index), args);
+  staticCall(typeId: bigint, index: number, ...args: unknown[]): AsyncReply {
+    return this.sendRequest(EpPacketRequest.StaticCall, u64(typeId), u8(index), args);
   }
 
   /**
@@ -1002,7 +1219,16 @@ export class EpConnection extends NetworkConnection {
       () => this.sendRequest(EpPacketRequest.ResumeExecution, callbackId),
     );
     this.requests.set(callbackId, reply);
-    this.send(EpPacket.composeRequest(action, callbackId, this.composeArgs(args)));
+    this.runtimeMetrics?.sentRequest();
+    try {
+      this.send(EpPacket.composeRequest(action, callbackId, this.composeArgs(args)));
+    } catch (error) {
+      if (!(error instanceof RemoteParserLimitException)) throw error;
+      this.requests.delete(callbackId);
+      reply.triggerError(
+        new AsyncException(ErrorType.Management, ExceptionCode.ParserLimitExceeded, error.message),
+      );
+    }
     return reply;
   }
 
@@ -1042,8 +1268,28 @@ export class EpConnection extends NetworkConnection {
    * {@link EpResource.on}, which does this per-event, ref-counted by listener
    * count, rather than sending on every call.
    */
-  subscribe(instanceId: number, index: number): AsyncReply {
-    return this.sendRequest(EpPacketRequest.Subscribe, instanceId, u8(index));
+  subscribe(
+    instanceId: number,
+    index: number,
+    after: ResourceCursor = ResourceCursor.empty(),
+  ): AsyncReply<ResourceCursor> {
+    return this.sendRequest(
+      EpPacketRequest.Subscribe,
+      instanceId,
+      u8(index),
+      after.generation.data,
+      u64(after.revision),
+    ).then(async (result) => {
+      // Historical subscriptions are replayed as EventOccurred notifications
+      // immediately before the Completed reply. Notification values may now
+      // require asynchronous resource resolution, so preserve the original
+      // await contract: once subscribe()/onFromAsync() resolves, all replayed
+      // entries that preceded its reply have already reached listeners.
+      const replayBarrier = this.notificationQueue;
+      await replayBarrier;
+      const values = result as unknown[];
+      return cursorFromWire(values[0], values[1]);
+    }) as AsyncReply<ResourceCursor>;
   }
 
   /** Unsubscribe from event `index` on the resource with `instanceId`. See {@link subscribe}. */
@@ -1051,13 +1297,61 @@ export class EpConnection extends NetworkConnection {
     return this.sendRequest(EpPacketRequest.Unsubscribe, instanceId, u8(index));
   }
 
+  /** Query retained property changes and event occurrences without changing subscriptions. */
+  queryResourceJournal(
+    instanceId: number,
+    query: ResourceJournalQuery = {},
+  ): AsyncReply<ResourceJournalPage> {
+    const after = query.after ?? ResourceCursor.empty();
+    return this.sendRequest(
+      EpPacketRequest.QueryResourceJournal,
+      instanceId,
+      after.generation.data,
+      u64(after.revision),
+      query.throughRevision == null ? null : u64(query.throughRevision),
+      query.fromTime ?? null,
+      query.toTime ?? null,
+      query.kind == null ? null : u8(query.kind),
+      query.memberIndex == null ? null : u8(query.memberIndex),
+      query.limit ?? 1_000,
+    ).then((result) => {
+      const values = result as unknown[];
+      const rawEntries = (values[8] as unknown[] | undefined) ?? [];
+      return {
+        oldestAvailable: cursorFromWire(values[0], values[1]),
+        highWatermark: cursorFromWire(values[2], values[3]),
+        next: cursorFromWire(values[4], values[5]),
+        cursorExpired: Boolean(values[6]),
+        hasMore: Boolean(values[7]),
+        entries: rawEntries.map((raw) => {
+          const entry = raw as unknown[];
+          return {
+            cursor: cursorFromWire(entry[0], entry[1]),
+            recordedAt: asDate(entry[2]) ?? new Date(0),
+            kind: asNumber(entry[3]) as ResourceJournalEntryKind,
+            memberIndex: asNumber(entry[4]),
+            value: entry[5],
+          };
+        }),
+      };
+    }) as AsyncReply<ResourceJournalPage>;
+  }
+
   /** Resolve a resource path to a {@link ResourceId} reference. */
-  getResourceIdByLink(link: string): AsyncReply {
-    return this.sendRequest(EpPacketRequest.GetResourceIdByLink, link);
+  getResourceIdByLink(link: string): AsyncReply<ResourceId> {
+    return this.sendRequest(EpPacketRequest.GetResourceIdByLink, link).then((value) =>
+      value instanceof ResourceId ? value : new ResourceId(false, asNumber(value))
+    ) as AsyncReply<ResourceId>;
   }
 
   /** Stop receiving notifications for a resource on this connection (it keeps living for other subscribers). */
   detach(instanceId: number): AsyncReply {
+    // A detached proxy is no longer part of this connection's live working
+    // set. Remove it before attempting the wire request so an explicit release
+    // made while disconnected cannot be restored by reconnect(). The old
+    // server-side subscription disappears with that closed transport anyway.
+    this.attachedResources.delete(instanceId);
+    if (!this.isConnected) return AsyncReply.fromResult(undefined);
     return this.sendRequest(EpPacketRequest.DetachResource, instanceId);
   }
 
@@ -1078,28 +1372,27 @@ export class EpConnection extends NetworkConnection {
    */
   createResource(
     path: string,
-    typeIdOrName: number | string,
+    typeIdOrName: bigint | string,
     properties?: Map<number, unknown>,
     attributes?: Map<string, unknown>,
   ): AsyncReply<number> {
     return this.sendRequest(
       EpPacketRequest.CreateResource,
       path,
-      typeIdOrName,
+      typeof typeIdOrName === "bigint" ? u64(typeIdOrName) : typeIdOrName,
       properties ?? new Map<number, unknown>(),
       attributes ?? new Map<string, unknown>(),
     ).then((reply) => Number(reply));
   }
 
   /**
-   * Resolve a resource path, replying with its children as `[id, link]`
-   * pairs (see `epRequestQueryResources`'s doc comment for why this isn't
-   * full auto-attaching resource references, unlike dotnet's `Query`).
-   * Distinct from {@link getResourceIdByLink}, which resolves a single link.
+   * Resolve a resource path and attach each visible child returned by the
+   * peer. Distinct from {@link getResourceIdByLink}, which resolves only the
+   * requested link's numeric id.
    */
-  queryResources(path: string): AsyncReply<Array<[number, string]>> {
+  queryResources(path: string): AsyncReply<EpResource[]> {
     return this.sendRequest(EpPacketRequest.Query, path).then(
-      (reply) => (reply as Array<[number, string]>) ?? [],
+      (reply) => (reply as EpResource[]) ?? [],
     );
   }
 
@@ -1128,12 +1421,12 @@ export class EpConnection extends NetworkConnection {
   }
 
   /** Fetch and parse a runtime TypeDef by its remote TypeDef id. */
-  fetchTypeDefById(typeDefId: number): AsyncReply<RemoteTypeDef> {
+  fetchTypeDefById(typeDefId: bigint): AsyncReply<RemoteTypeDef> {
     return this.fetchTypeDef(typeDefId, null);
   }
 
   /** Batch-resolve full class names to their remote TypeDef ids. */
-  getTypeDefIds(fullNames: string[]): AsyncReply<number[]> {
+  getTypeDefIds(fullNames: string[]): AsyncReply<bigint[]> {
     return this.sendRequest(EpPacketRequest.TypeDefIdsByNames, fullNames).then((reply) => {
       if (!Array.isArray(reply))
         throw new AsyncException(
@@ -1141,14 +1434,14 @@ export class EpConnection extends NetworkConnection {
           ExceptionCode.ParseError,
           "TypeDefIdsByNames did not return an id array.",
         );
-      return reply.map((v) => Number(v));
+      return reply.map(asBigInt);
     });
   }
 
   /** Fetch and parse a runtime TypeDef by id, resolving cyclic remote TypeDef references. */
   fetchTypeDef(
-    typeDefId: number,
-    requestSequence: readonly number[] | null = null,
+    typeDefId: bigint,
+    requestSequence: readonly bigint[] | null = null,
   ): AsyncReply<RemoteTypeDef> {
     const cached = this.cachedTypeDefs.get(typeDefId);
     if (cached) return AsyncReply.fromResult(cached);
@@ -1177,7 +1470,7 @@ export class EpConnection extends NetworkConnection {
 
     if (parent != null) this.addTypeDefFetchBlock(parent, typeDefId);
 
-    this.sendRequest(EpPacketRequest.TypeDefById, typeDefId)
+    this.sendRequest(EpPacketRequest.TypeDefById, u64(typeDefId))
       .onReady((result) => {
         void (async () => {
           try {
@@ -1211,7 +1504,7 @@ export class EpConnection extends NetworkConnection {
 
   private parseTypeDefPayload(
     data: Uint8Array,
-    requestSequence: readonly number[] | null,
+    requestSequence: readonly bigint[] | null,
   ): AsyncReply<RemoteTypeDef> {
     const typeDefId = readTypeDefPayloadId(data, this.warehouse);
     const cached = this.cachedTypeDefs.get(typeDefId);
@@ -1237,9 +1530,9 @@ export class EpConnection extends NetworkConnection {
   }
 
   private async finishTypeDefRequest(
-    typeDefId: number,
+    typeDefId: bigint,
     data: Uint8Array,
-    requestSequence: readonly number[],
+    requestSequence: readonly bigint[],
   ): Promise<RemoteTypeDef> {
     const placeholder = this.neededTypeDefs.get(typeDefId) ?? new RemoteTypeDef();
     this.neededTypeDefs.set(typeDefId, placeholder);
@@ -1248,7 +1541,7 @@ export class EpConnection extends NetworkConnection {
         placeholder,
         data,
         this.warehouse,
-        (id, sequence) => this.fetchTypeDef(id, sequence),
+        this.valueResolver,
         requestSequence,
       );
       this.cachedTypeDefs.set(typeDefId, typeDef);
@@ -1261,29 +1554,29 @@ export class EpConnection extends NetworkConnection {
     }
   }
 
-  private addTypeDefFetchBlock(parent: number, child: number): void {
+  private addTypeDefFetchBlock(parent: bigint, child: bigint): void {
     let children = this.typeDefsFetchBlockedOn.get(parent);
     if (!children) {
-      children = new Set<number>();
+      children = new Set<bigint>();
       this.typeDefsFetchBlockedOn.set(parent, children);
     }
     children.add(child);
   }
 
-  private clearTypeDefFetchNode(typeDefId: number): void {
+  private clearTypeDefFetchNode(typeDefId: bigint): void {
     this.typeDefsFetchBlockedOn.delete(typeDefId);
     for (const children of this.typeDefsFetchBlockedOn.values())
       children.delete(typeDefId);
   }
 
   private hasTypeDefWaitForCycle(
-    typeDefId: number,
-    requestSequence: readonly number[] | null,
+    typeDefId: bigint,
+    requestSequence: readonly bigint[] | null,
   ): boolean {
     if (!requestSequence || requestSequence.length === 0) return false;
 
     const chain = new Set(requestSequence);
-    const visited = new Set<number>();
+    const visited = new Set<bigint>();
     const stack = [typeDefId];
     while (stack.length > 0) {
       const current = stack.pop();
@@ -1348,7 +1641,10 @@ export class EpConnection extends NetworkConnection {
     (async () => {
       const started = nowMs();
       try {
-        await this.openClientSocket(this.reconnectUrl!);
+        await this.openClientSocket(
+          this.reconnectUrl!,
+          this.reconnectUsesEsiurDefaultPort,
+        );
         const connected = nowMs();
         await this.restoreAttachedResources();
         const finished = nowMs();
@@ -1388,47 +1684,180 @@ export class EpConnection extends NetworkConnection {
     instanceId: number,
     target?: EpResourceAttachTarget<T>,
   ): AsyncReply {
-    const resolved = this.resolveAttachTarget(target);
-    if (resolved.typeDef)
-      return this.attachWithTypeDef(instanceId, resolved.typeDef, resolved.ctor);
-
-    return this.fetchTypeDefByResourceId(instanceId).then((remoteTypeDef) => {
-      const ctor = resolved.ctor ?? this.findProxyType(remoteTypeDef);
-      return this.attachWithTypeDef(instanceId, remoteTypeDef.template, ctor);
-    });
+    return this.attachResource(instanceId, target, null);
   }
 
-  private attachWithTypeDef<T extends EpResource>(
+  private attachResource<T extends EpResource>(
+    instanceId: number,
+    target: EpResourceAttachTarget<T> | undefined,
+    requestSequence: readonly bigint[] | null,
+  ): AsyncReply {
+    const attached = this.attachedResources.get(instanceId);
+    if (attached) return AsyncReply.fromResult(EpResource.createProxy(attached));
+
+    const parent = requestSequence && requestSequence.length > 0
+      ? Number(requestSequence[requestSequence.length - 1])
+      : undefined;
+    const pending = this.resourceAttachRequests.get(instanceId);
+    if (pending) {
+      const placeholder = this.neededResources.get(instanceId);
+      const closesSameChain = requestSequence?.includes(BigInt(instanceId)) ?? false;
+      const closesCrossChain = this.hasResourceWaitForCycle(instanceId, requestSequence);
+      if (placeholder && (closesSameChain || closesCrossChain))
+        return AsyncReply.fromResult(EpResource.createProxy(placeholder));
+
+      if (parent != null) this.addResourceFetchBlock(parent, instanceId);
+      return pending.reply;
+    }
+
+    const attachmentConfiguration = this.warehouse?.configuration.resourceAttachments
+      ?? this.defaultResourceAttachmentConfiguration;
+    if (
+      attachmentConfiguration.maximumPendingAttachmentsPerConnection > 0
+      && this.resourceAttachRequests.size
+        >= attachmentConfiguration.maximumPendingAttachmentsPerConnection
+    )
+      return this.attachmentLimitError(
+        "The pending resource attachment limit for this connection was reached.",
+      );
+
+    if (
+      attachmentConfiguration.maximumAttachedResourcesPerConnection > 0
+      && this.attachedResources.size + this.resourceAttachRequests.size
+        >= attachmentConfiguration.maximumAttachedResourcesPerConnection
+    )
+      return this.attachmentLimitError(
+        "The resource attachment limit for this connection was reached.",
+      );
+
+    const resolved = this.resolveAttachTarget(target);
+    const sequence = requestSequence
+      ? [...requestSequence, BigInt(instanceId)]
+      : [BigInt(instanceId)];
+    const reply = new AsyncReply();
+    this.resourceAttachRequests.set(instanceId, { reply, requestSequence: sequence });
+    if (parent != null) this.addResourceFetchBlock(parent, instanceId);
+
+    void (async () => {
+      try {
+        let typeDef = resolved.typeDef;
+        let ctor = resolved.ctor;
+        if (!typeDef) {
+          const remoteTypeDef = await this.fetchTypeDefByResourceId(instanceId);
+          typeDef = remoteTypeDef.template;
+          ctor ??= this.findProxyType(remoteTypeDef) as EpResourceConstructor<T> | undefined;
+        }
+
+        const resource = await this.attachWithTypeDef(
+          instanceId,
+          typeDef,
+          ctor,
+          sequence,
+        );
+        this.finishResourceAttach(instanceId);
+        reply.trigger(resource);
+      } catch (error) {
+        this.finishResourceAttach(instanceId);
+        reply.triggerError(AsyncException.from(error));
+      }
+    })();
+
+    return reply;
+  }
+
+  private attachmentLimitError(message: string): AsyncReply {
+    const reply = new AsyncReply();
+    reply.triggerError(
+      new AsyncException(
+        ErrorType.Management,
+        ExceptionCode.AttachmentLimitExceeded,
+        message,
+      ),
+    );
+    return reply;
+  }
+
+  private async attachWithTypeDef<T extends EpResource>(
     instanceId: number,
     typeDef: TypeDef,
     ctor?: EpResourceConstructor<T>,
-  ): AsyncReply {
-    return this.sendRequest(EpPacketRequest.AttachResource, instanceId).then((reply) => {
-      // Reply: [typeDefId, age, link, hops, propertyValues] (matches C#). The
-      // 5th element is a RawData blob of (age, date, value) self-describing TDUs,
+    requestSequence: readonly bigint[] = [BigInt(instanceId)],
+  ): Promise<EpResource & Record<string, any>> {
+    const reply = await this.sendRequest(EpPacketRequest.AttachResource, instanceId);
+      // Reply: [typeDefId, generation, revision, link, hops, propertyValues]. The
+      // 6th element is a RawData blob of (age, date, value) self-describing TDUs,
       // one triple per property in index order.
       const list = reply as unknown[];
-      const typeDefId = asNumber(list[0]);
-      const age = asNumber(list[1]);
-      const link = String(list[2] ?? "");
-      const hops = asNumber(list[3]);
-      const raw = list[4] as Uint8Array | undefined;
+      const typeDefId = asBigInt(list[0]);
+      const cursor = cursorFromWire(list[1], list[2]);
+      const link = String(list[3] ?? "");
+      const hops = asNumber(list[4]);
+      const raw = list[5] as Uint8Array | undefined;
 
       const resource = this.createAttachedResource(instanceId, typeDef, ctor, {
         typeDefId,
-        age,
+        age: Number(cursor.revision),
+        cursor,
         link,
         hops,
       });
+      // Publish the identity before decoding properties. Any back-reference in
+      // the graph can now resolve to this placeholder instead of awaiting the
+      // same attachment forever.
+      this.neededResources.set(instanceId, resource);
       if (raw) {
-        const snapshots = this.parsePropertyValueArray(raw, typeDef);
+        const snapshots = await this.parsePropertyValueArray(raw, typeDef, requestSequence);
         for (const pv of snapshots)
           resource.setPropertySnapshot(pv.index, pv.age, pv.date, pv.value);
       }
 
       this.attachedResources.set(instanceId, resource);
       return EpResource.createProxy(resource);
-    });
+  }
+
+  private finishResourceAttach(instanceId: number): void {
+    this.resourceAttachRequests.delete(instanceId);
+    this.neededResources.delete(instanceId);
+    this.clearResourceFetchNode(instanceId);
+  }
+
+  private addResourceFetchBlock(parent: number, child: number): void {
+    let children = this.resourcesFetchBlockedOn.get(parent);
+    if (!children) {
+      children = new Set<number>();
+      this.resourcesFetchBlockedOn.set(parent, children);
+    }
+    children.add(child);
+  }
+
+  private clearResourceFetchNode(instanceId: number): void {
+    this.resourcesFetchBlockedOn.delete(instanceId);
+    for (const children of this.resourcesFetchBlockedOn.values())
+      children.delete(instanceId);
+  }
+
+  private hasResourceWaitForCycle(
+    instanceId: number,
+    requestSequence: readonly bigint[] | null,
+  ): boolean {
+    if (!requestSequence || requestSequence.length === 0) return false;
+
+    const chain = new Set(requestSequence.map(Number));
+    const visited = new Set<number>();
+    const stack = [instanceId];
+    while (stack.length > 0) {
+      const current = stack.pop();
+      if (current == null || visited.has(current)) continue;
+      visited.add(current);
+
+      const children = this.resourcesFetchBlockedOn.get(current);
+      if (!children) continue;
+      for (const child of children) {
+        if (chain.has(child)) return true;
+        stack.push(child);
+      }
+    }
+    return false;
   }
 
   private resolveAttachTarget<T extends EpResource>(
@@ -1472,21 +1901,35 @@ export class EpConnection extends NetworkConnection {
    * leads with the resolved id so an id change (link re-resolved to a
    * different instance) can be detected and tracking re-keyed.
    */
-  reattach(resourceLinkOrId: string | number, age: number, resource: EpResource): AsyncReply<EpResource> {
-    return this.sendRequest(EpPacketRequest.ReattachResource, resourceLinkOrId, age).then((reply) => {
+  reattach(
+    resourceLinkOrId: string | number,
+    cursor: ResourceCursor,
+    resource: EpResource,
+  ): AsyncReply<EpResource> {
+    return this.sendRequest(
+      EpPacketRequest.ReattachResource,
+      resourceLinkOrId,
+      cursor.generation.data,
+      u64(cursor.revision),
+    ).then(async (reply) => {
       const list = reply as unknown[];
       const oldId = resource.instanceId;
       const resolvedId = asNumber(list[0]);
+      const remoteCursor = cursorFromWire(list[2], list[3]);
       resource.setRemoteIdentity({
         instanceId: resolvedId,
-        typeDefId: asNumber(list[1]),
-        age: asNumber(list[2]),
-        link: String(list[3] ?? ""),
-        hops: asNumber(list[4]),
+        typeDefId: asBigInt(list[1]),
+        age: Number(remoteCursor.revision),
+        cursor: remoteCursor,
+        link: String(list[4] ?? ""),
+        hops: asNumber(list[5]),
       });
 
-      const raw = list[5] as Uint8Array | undefined;
-      if (raw) resource.applyDelta(this.parsePropertyValueMap(raw));
+      const raw = list[7] as Uint8Array | undefined;
+      if (raw)
+        resource.applyDelta(
+          await this.parsePropertyValueMap(raw, [BigInt(resolvedId)]),
+        );
 
       if (resolvedId !== oldId) {
         // Only evict oldId's entry if it still points to this resource —
@@ -1502,11 +1945,36 @@ export class EpConnection extends NetworkConnection {
 
   /** Send a reply to a peer request. */
   sendReply(action: EpPacketReply, callbackId: number, ...args: unknown[]): void {
-    this.send(EpPacket.composeReply(action, callbackId, this.composeArgs(args)));
+    this.runtimeMetrics?.sentReply(
+      action === EpPacketReply.PermissionError ||
+      action === EpPacketReply.ExecutionError ||
+      action === EpPacketReply.Warning,
+    );
+    try {
+      this.send(EpPacket.composeReply(action, callbackId, this.composeArgs(args)));
+    } catch (error) {
+      if (
+        !(error instanceof RemoteParserLimitException) ||
+        action === EpPacketReply.PermissionError ||
+        action === EpPacketReply.ExecutionError ||
+        action === EpPacketReply.Warning
+      )
+        throw error;
+      this.sendError(
+        ErrorType.Exception,
+        callbackId,
+        ExceptionCode.ParserLimitExceeded,
+        error.message,
+      );
+    }
   }
 
   /** Send a notification (no reply expected). */
   sendNotification(action: EpPacketNotification, ...args: unknown[]): void {
+    this.runtimeMetrics?.sentNotification(
+      action === EpPacketNotification.PropertyModified,
+      action === EpPacketNotification.EventOccurred,
+    );
     this.send(EpPacket.composeNotification(action, this.composeArgs(args)));
   }
 
@@ -1530,15 +1998,37 @@ export class EpConnection extends NetworkConnection {
     return compose(args, this.warehouse, this);
   }
 
-  private parsePropertyValueArray(raw: Uint8Array, typeDef: TypeDef): RemotePropertyValue[] {
+  private async parsePropertyValueArray(
+    raw: Uint8Array,
+    typeDef: TypeDef,
+    requestSequence: readonly bigint[],
+  ): Promise<RemotePropertyValue[]> {
     const values: RemotePropertyValue[] = [];
     let offset = 0;
     for (const p of typeDef.properties) {
-      const age = parseSync(raw, offset, this.warehouse);
+      const age = await parseAsync(
+        raw,
+        offset,
+        this.warehouse,
+        this.valueResolver,
+        requestSequence,
+      );
       offset += age.length;
-      const date = parseSync(raw, offset, this.warehouse);
+      const date = await parseAsync(
+        raw,
+        offset,
+        this.warehouse,
+        this.valueResolver,
+        requestSequence,
+      );
       offset += date.length;
-      const value = parseSync(raw, offset, this.warehouse);
+      const value = await parseAsync(
+        raw,
+        offset,
+        this.warehouse,
+        this.valueResolver,
+        requestSequence,
+      );
       offset += value.length;
       values.push({
         index: p.index,
@@ -1550,17 +2040,44 @@ export class EpConnection extends NetworkConnection {
     return values;
   }
 
-  private parsePropertyValueMap(raw: Uint8Array): RemotePropertyValue[] {
+  private async parsePropertyValueMap(
+    raw: Uint8Array,
+    requestSequence: readonly bigint[],
+  ): Promise<RemotePropertyValue[]> {
     const values: RemotePropertyValue[] = [];
     let offset = 0;
     while (offset < raw.length) {
-      const index = parseSync(raw, offset, this.warehouse);
+      const index = await parseAsync(
+        raw,
+        offset,
+        this.warehouse,
+        this.valueResolver,
+        requestSequence,
+      );
       offset += index.length;
-      const age = parseSync(raw, offset, this.warehouse);
+      const age = await parseAsync(
+        raw,
+        offset,
+        this.warehouse,
+        this.valueResolver,
+        requestSequence,
+      );
       offset += age.length;
-      const date = parseSync(raw, offset, this.warehouse);
+      const date = await parseAsync(
+        raw,
+        offset,
+        this.warehouse,
+        this.valueResolver,
+        requestSequence,
+      );
       offset += date.length;
-      const value = parseSync(raw, offset, this.warehouse);
+      const value = await parseAsync(
+        raw,
+        offset,
+        this.warehouse,
+        this.valueResolver,
+        requestSequence,
+      );
       offset += value.length;
       values.push({
         index: asNumber(index.value),
@@ -1588,7 +2105,7 @@ export class EpConnection extends NetworkConnection {
     return merge(...parts);
   }
 
-  private composePropertyValueMap(instanceId: number, sinceAge: number): Uint8Array {
+  private composePropertyValueMap(instanceId: number, sinceRevision?: bigint): Uint8Array {
     const resource = this.warehouse?.getById(instanceId);
     if (!resource?.instance) return new Uint8Array(0);
 
@@ -1598,7 +2115,7 @@ export class EpConnection extends NetworkConnection {
     const parts: Uint8Array[] = [];
     for (const p of instance.definition.properties) {
       const propertyAge = instance.getAge(p.index) ?? 0;
-      if (propertyAge <= sinceAge) continue;
+      if (sinceRevision != null && BigInt(Math.trunc(propertyAge)) <= sinceRevision) continue;
       parts.push(compose(u8(p.index), this.warehouse, this));
       parts.push(compose(propertyAge, this.warehouse, this));
       parts.push(compose(instance.getModificationDate(p.index) ?? new Date(0), this.warehouse, this));
@@ -1612,7 +2129,7 @@ export class EpConnection extends NetworkConnection {
     const stats = { restored: 0, failed: 0 };
     for (const resource of resources) {
       try {
-        await this.reattach(resource.link || resource.instanceId, resource.age, resource);
+        await this.reattach(resource.link || resource.instanceId, resource.cursor, resource);
         resource.resubscribeAfterReconnect();
         stats.restored++;
       } catch (e) {
@@ -1637,12 +2154,37 @@ export class EpConnection extends NetworkConnection {
    * pass-through otherwise.
    */
   override send(message: Uint8Array): void {
+    this.runtimeMetrics?.sent(message.length);
     if (!this.encryptionActive || !this.symetricCipher) {
       super.send(message);
       return;
     }
+    const remoteMaximumRecordSize = this.remoteLimit(
+      EpAuthPacketHeader.MaximumEncryptedRecordSize,
+    );
+    const maximumRecordOverhead = this.encryptionProvider?.maximumRecordOverhead ?? 0;
+    if (
+      remoteMaximumRecordSize > 0 &&
+      message.length + maximumRecordOverhead > remoteMaximumRecordSize
+    )
+      throw new RemoteParserLimitException(
+        `Encrypted record would exceed the peer's advertised ${remoteMaximumRecordSize}-byte limit.`,
+      );
     const protectedPayload = this.symetricCipher.encrypt(message);
+    if (remoteMaximumRecordSize > 0 && protectedPayload.length > remoteMaximumRecordSize)
+      throw new RemoteParserLimitException(
+        `Encrypted record of ${protectedPayload.length} bytes exceeds the peer's advertised ${remoteMaximumRecordSize}-byte limit.`,
+      );
     super.send(merge(uint32ToBytes(protectedPayload.length, Endian.Big), protectedPayload));
+  }
+
+  override networkReceive(sender: ISocket, buffer: NetworkBuffer): void {
+    try {
+      super.networkReceive(sender, buffer);
+    } catch (error) {
+      if (!(error instanceof ParserLimitException)) throw error;
+      this.close();
+    }
   }
 
   // ---- inbound ----------------------------------------------------------------
@@ -1650,6 +2192,7 @@ export class EpConnection extends NetworkConnection {
   protected override dataReceived(buffer: NetworkBuffer): void {
     const msg = buffer.read();
     if (!msg) return;
+    this.runtimeMetrics?.received(msg.length);
 
     let offset = 0;
     const ends = msg.length;
@@ -1663,6 +2206,12 @@ export class EpConnection extends NetworkConnection {
         }
 
         const protectedLength = getUint32(msg, offset, Endian.Big);
+        const maximumRecordSize = this.warehouse?.configuration.encryption.maximumRecordSize
+          ?? this.defaultEncryptionConfiguration.maximumRecordSize;
+        if (maximumRecordSize > 0 && protectedLength > maximumRecordSize) {
+          this.close();
+          return;
+        }
         const totalLength = headerSize + protectedLength;
         if (remaining < totalLength) {
           buffer.holdFor(msg, offset, remaining, totalLength);
@@ -1737,13 +2286,26 @@ export class EpConnection extends NetworkConnection {
   private dispatch(packet: EpPacket): void {
     switch (packet.method) {
       case EpPacketMethod.Reply:
+        this.runtimeMetrics?.receivedPacket(
+          "reply",
+          packet.reply === EpPacketReply.PermissionError ||
+          packet.reply === EpPacketReply.ExecutionError ||
+          packet.reply === EpPacketReply.Warning ? "error" : undefined,
+        );
         this.dispatchReply(packet);
         break;
       case EpPacketMethod.Request:
+        this.runtimeMetrics?.receivedPacket("request");
         this.processRequest(packet.request, packet.callbackId, packet.tdu);
         break;
       case EpPacketMethod.Notification:
-        this.processNotification(packet.notification, packet.tdu);
+        this.runtimeMetrics?.receivedPacket(
+          "notification",
+          packet.notification === EpPacketNotification.PropertyModified
+            ? "property"
+            : packet.notification === EpPacketNotification.EventOccurred ? "event" : undefined,
+        );
+        this.enqueueNotification(packet.notification, packet.tdu);
         break;
       case EpPacketMethod.Extension:
         break;
@@ -1768,6 +2330,9 @@ export class EpConnection extends NetworkConnection {
           return;
         case EpPacketRequest.Unsubscribe:
           void this.epRequestUnsubscribe(callbackId, tdu);
+          return;
+        case EpPacketRequest.QueryResourceJournal:
+          void this.epRequestQueryResourceJournal(callbackId, tdu);
           return;
         case EpPacketRequest.AttachResource:
           void this.epRequestAttachResource(callbackId, tdu);
@@ -1860,7 +2425,14 @@ export class EpConnection extends NetworkConnection {
     try {
       const evaluation = this.warehouse.evaluateManagers(context);
       if (!evaluation.isAllowed) {
-        this.sendError(denialErrorType, callbackId, denialCode);
+        this.sendError(
+          denialErrorType,
+          callbackId,
+          denialCode,
+          evaluation.permissionsDenialReason ??
+            evaluation.rateControlDenialReason ??
+            evaluation.auditingDenialReason,
+        );
         return false;
       }
       if (evaluation.delay > 0) {
@@ -1871,10 +2443,54 @@ export class EpConnection extends NetworkConnection {
         await new Promise<void>((resolve) => setTimeout(resolve, evaluation.delay));
       }
       return true;
-    } catch {
-      this.sendError(denialErrorType, callbackId, denialCode);
+    } catch (error) {
+      this.sendError(
+        denialErrorType,
+        callbackId,
+        denialCode,
+        error instanceof Error ? error.message : String(error),
+      );
       return false;
     }
+  }
+
+  private beginPeerAttachment(
+    resourceId: number,
+  ): { code: ExceptionCode; message: string } | null {
+    const configuration = this.warehouse?.configuration.resourceAttachments
+      ?? this.defaultResourceAttachmentConfiguration;
+
+    if (
+      configuration.rejectDuplicateAttachments
+      && (this.subscriptions.has(resourceId) || this.peerAttachmentRequests.has(resourceId))
+    )
+      return {
+        code: ExceptionCode.AlreadyAttached,
+        message: `Resource ${resourceId} is already attached or being attached by this connection.`,
+      };
+
+    if (
+      configuration.maximumPendingAttachmentsPerConnection > 0
+      && this.peerAttachmentRequests.size
+        >= configuration.maximumPendingAttachmentsPerConnection
+    )
+      return {
+        code: ExceptionCode.AttachmentLimitExceeded,
+        message: "The pending resource attachment limit for this connection was reached.",
+      };
+
+    if (
+      configuration.maximumAttachedResourcesPerConnection > 0
+      && this.subscriptions.size + this.peerAttachmentRequests.size
+        >= configuration.maximumAttachedResourcesPerConnection
+    )
+      return {
+        code: ExceptionCode.AttachmentLimitExceeded,
+        message: "The resource attachment limit for this connection was reached.",
+      };
+
+    this.peerAttachmentRequests.add(resourceId);
+    return null;
   }
 
   /** Server handler: send current property values and subscribe the peer to changes. */
@@ -1884,41 +2500,81 @@ export class EpConnection extends NetworkConnection {
       return;
     }
 
-    const instanceId = Number(this.decode(tdu));
-    const resource = this.warehouse.getById(instanceId);
-    if (!resource?.instance) {
-      this.sendError(ErrorType.Management, callbackId, ExceptionCode.ResourceNotFound);
+    let instanceId: number;
+    try {
+      instanceId = Number(this.decode(tdu));
+    } catch {
+      this.sendError(ErrorType.Management, callbackId, ExceptionCode.ParseError);
       return;
     }
 
-    if (
-      !(await this.tryApplyManagers(
-        null,
-        resource,
-        ActionType.Attach,
-        callbackId,
-        ErrorType.Management,
-        ExceptionCode.AccessDenied,
-      ))
-    )
+    const rejection = this.beginPeerAttachment(instanceId);
+    if (rejection) {
+      this.sendError(ErrorType.Management, callbackId, rejection.code, rejection.message);
       return;
+    }
 
-    const instance = resource.instance;
-    if (!instance) return;
-    const propertyValues = this.composePropertyValueArray(instanceId);
+    try {
+      const resource = this.warehouse.getById(instanceId);
+      if (!resource?.instance) {
+        this.sendError(ErrorType.Management, callbackId, ExceptionCode.ResourceNotFound);
+        return;
+      }
 
-    const typeDef = this.warehouse.getLocalTypeDefByType(resource.constructor);
+      if (
+        !(await this.tryApplyManagers(
+          null,
+          resource,
+          ActionType.Attach,
+          callbackId,
+          ErrorType.Management,
+          ExceptionCode.AttachDenied,
+        ))
+      )
+        return;
 
-    this.subscribeToInstance(instanceId);
+      const instance = resource.instance;
+      if (!instance) return;
+      const head = instance.cursor;
+      const propertyValues = this.composePropertyValueArray(instanceId);
+      const typeDef = this.warehouse.getLocalTypeDefByType(resource.constructor);
 
-    this.sendReply(
-      EpPacketReply.Completed,
-      callbackId,
-      typeDef.id,
-      instance.age,
-      instance.link ?? "",
-      0, // hops
-      propertyValues,
+      this.subscribeToInstance(instanceId);
+      this.sendReply(
+        EpPacketReply.Completed,
+        callbackId,
+        u64(typeDef.id),
+        head.generation.data,
+        u64(head.revision),
+        instance.link ?? "",
+        u8(0), // hops is a protocol byte, not a signed inferred JS integer
+        propertyValues,
+      );
+    } catch (error) {
+      this.sendError(
+        ErrorType.Management,
+        callbackId,
+        ExceptionCode.GeneralFailure,
+        String(error),
+      );
+    } finally {
+      this.peerAttachmentRequests.delete(instanceId);
+    }
+  }
+
+  private populateLocalLimitHeaders(): void {
+    const parser = this.warehouse?.configuration.parser ?? this.defaultParserConfiguration;
+    const encryption = this.warehouse?.configuration.encryption ?? this.defaultEncryptionConfiguration;
+    this.localHeaders.set(EpAuthPacketHeader.MaximumPacketSize, parser.maximumPacketSize);
+    this.localHeaders.set(EpAuthPacketHeader.MaximumAllocationSize, parser.maximumAllocationSize);
+    this.localHeaders.set(EpAuthPacketHeader.MaximumCollectionItems, parser.maximumCollectionItems);
+    this.localHeaders.set(
+      EpAuthPacketHeader.MaximumTypeMetadataDepth,
+      parser.maximumTypeMetadataDepth,
+    );
+    this.localHeaders.set(
+      EpAuthPacketHeader.MaximumEncryptedRecordSize,
+      encryption.maximumRecordSize,
     );
   }
 
@@ -1945,7 +2601,7 @@ export class EpConnection extends NetworkConnection {
     }
 
     const linkOrId = parsed[0];
-    const sinceAge = asNumber(parsed[1]);
+    const requestedCursor = cursorFromWire(parsed[1], parsed[2]);
 
     let resource: IResource | undefined;
     if (typeof linkOrId === "string") {
@@ -1963,35 +2619,61 @@ export class EpConnection extends NetworkConnection {
       return;
     }
 
-    if (
-      !(await this.tryApplyManagers(
-        null,
-        resource,
-        ActionType.Attach,
-        callbackId,
-        ErrorType.Management,
-        ExceptionCode.AccessDenied,
-      ))
-    )
-      return;
-
     const instance = resource.instance;
     if (!instance) return;
     const resolvedId = instance.id;
-    const typeDef = this.warehouse.getLocalTypeDefByType(resource.constructor);
-    const propertyValues = this.composePropertyValueMap(resolvedId, sinceAge);
-    this.subscribeToInstance(resolvedId);
+    const rejection = this.beginPeerAttachment(resolvedId);
+    if (rejection) {
+      this.sendError(ErrorType.Management, callbackId, rejection.code, rejection.message);
+      return;
+    }
 
-    this.sendReply(
-      EpPacketReply.Completed,
-      callbackId,
-      resolvedId,
-      typeDef.id,
-      instance.age,
-      instance.link ?? "",
-      0,
-      propertyValues,
-    );
+    try {
+      if (
+        !(await this.tryApplyManagers(
+          null,
+          resource,
+          ActionType.Attach,
+          callbackId,
+          ErrorType.Management,
+          ExceptionCode.AttachDenied,
+        ))
+      )
+        return;
+
+      const typeDef = this.warehouse.getLocalTypeDefByType(resource.constructor);
+      const head = instance.cursor;
+      const reset = !requestedCursor.generation.equals(head.generation);
+      const propertyValues = this.composePropertyValueMap(
+        resolvedId,
+        reset ? undefined : requestedCursor.revision,
+      );
+      this.subscriptions.get(resolvedId)?.();
+      this.subscriptions.delete(resolvedId);
+      this.subscribeToInstance(resolvedId);
+
+      this.sendReply(
+        EpPacketReply.Completed,
+        callbackId,
+        resolvedId,
+        u64(typeDef.id),
+        head.generation.data,
+        u64(head.revision),
+        instance.link ?? "",
+        u8(0),
+        reset,
+        propertyValues,
+      );
+    } catch (error) {
+      this.sendError(
+        ErrorType.Management,
+        callbackId,
+        ExceptionCode.GeneralFailure,
+        String(error),
+      );
+    } finally {
+      this.peerAttachmentRequests.delete(resolvedId);
+    }
   }
 
   /** Server handler: resolve a resource path to an instance id. */
@@ -2021,7 +2703,7 @@ export class EpConnection extends NetworkConnection {
       return;
     }
 
-    const id = Number(this.decode(tdu));
+    const id = asBigInt(this.decode(tdu));
     let local: ITypeDef;
     try {
       local = this.warehouse.getLocalTypeDefById(id);
@@ -2080,10 +2762,10 @@ export class EpConnection extends NetworkConnection {
     // this warehouse — forward the id the upstream connection originally
     // assigned this type (mirrors dotnet's RemoteTypeDef, which inherits
     // TypeDef.Id and is composed unchanged when relayed onward).
-    let id: number;
+    let id: bigint;
     let kind: TypeDefKind;
     if (resource instanceof EpResource) {
-      id = resource.typeDefId ?? 0;
+      id = resource.typeDefId ?? 0n;
       kind = TypeDefKind.Resource;
     } else {
       const local = this.warehouse.getLocalTypeDefByType(resource.constructor);
@@ -2134,24 +2816,14 @@ export class EpConnection extends NetworkConnection {
     this.sendReply(
       EpPacketReply.Completed,
       callbackId,
-      resolved.map((td) => td.id),
+      resolved.map((td) => u64(td.id)),
     );
   }
 
   /**
-   * Server handler (Query, 0xB): resolve a link, reply with the resource's
-   * children as `{id, link}` descriptors, filtered to what the caller is
-   * allowed to Attach. Distinct from {@link epRequestGetResourceIdByLink},
-   * which resolves a single link rather than listing children.
-   *
-   * Dotnet replies with full resource references that auto-attach on
-   * decode; esiur-ts has no compose-side counterpart for that at all yet
-   * (`LocalResource8/16/32` TDUs are decode-only — see `ResourceId.ts` /
-   * `DataDeserializer.ts` — and nothing turns a decoded `ResourceId` into an
-   * attached `EpResource` either). Building that bidirectional
-   * resource-reference wire support is its own substantial feature; this
-   * intentionally replies with plain, already-composable descriptors
-   * instead — the caller can `attach()`/`get()` any id it wants from there.
+   * Server handler (Query, 0xB): resolve a link and reply with full resource
+   * references for children the caller may Attach. The receiver's async
+   * decoder attaches those references before completing the request.
    */
   private async epRequestQueryResources(callbackId: number, tdu: PlainTdu | null): Promise<void> {
     if (!tdu || !this.warehouse) {
@@ -2173,11 +2845,7 @@ export class EpConnection extends NetworkConnection {
 
     const children = await resource.instance.store.children<IResource>(resource);
     const allowed = children.filter((child) => this.isActionAllowed(child, ActionType.Attach));
-    // [id, link] pairs — Codec.compose has no generic plain-object composer,
-    // only Map/Array/etc.; a nested array composes fine through the same
-    // dynamic-List path every other multi-field reply in this file uses.
-    const descriptors = allowed.map((child) => [child.instance!.id, child.instance!.link ?? ""]);
-    this.sendReply(EpPacketReply.Completed, callbackId, descriptors);
+    this.sendReply(EpPacketReply.Completed, callbackId, allowed);
   }
 
   /**
@@ -2223,7 +2891,7 @@ export class EpConnection extends NetworkConnection {
     )
       return;
 
-    const closure = new Map<number, LocalTypeDef>();
+    const closure = new Map<bigint, LocalTypeDef>();
     collectTypeDefDependencies(local, closure);
     const payloads = [...closure.values()].map((td) =>
       compose(typeDefInfoFromTypeDef(td.id, td.kind, td.template), this.warehouse, this),
@@ -2235,14 +2903,18 @@ export class EpConnection extends NetworkConnection {
    * Silent (no error reply) permission check, for filtering a list of
    * candidates (e.g. Query's children) rather than gating a single request.
    */
-  private isActionAllowed(resource: IResource | null, action: ActionType): boolean {
+  private isActionAllowed(
+    resource: IResource | null,
+    action: ActionType,
+    member: MemberTemplate | null = null,
+  ): boolean {
     if (!this.warehouse) return true;
     const context = new ResourceManagerContext(
       this.warehouse,
       this,
       this.getAuthenticationSession(),
       resource,
-      null,
+      member,
       action,
       this,
     );
@@ -2404,7 +3076,7 @@ export class EpConnection extends NetworkConnection {
       local =
         typeof typeIdOrName === "string"
           ? this.warehouse.getLocalTypeDefByName(typeIdOrName)
-          : this.warehouse.getLocalTypeDefById(Number(typeIdOrName));
+          : this.warehouse.getLocalTypeDefById(asBigInt(typeIdOrName));
     } catch {
       local = undefined;
     }
@@ -2456,18 +3128,34 @@ export class EpConnection extends NetworkConnection {
     if (!resource?.instance || this.subscriptions.has(instanceId)) return;
 
     const instance = resource.instance;
-    const onProp = (info: { property: { index: number }; value: unknown }): void =>
+    const onProp = (info: {
+      property: { index: number };
+      value: unknown;
+      cursor: ResourceCursor;
+      recordedAt: Date;
+    }): void =>
       this.sendNotification(
         EpPacketNotification.PropertyModified,
         instanceId,
+        info.cursor.generation.data,
+        u64(info.cursor.revision),
+        info.recordedAt,
         info.property.index,
         info.value,
       );
-    const onEvent = (info: { event: { index: number; subscribable?: boolean }; value: unknown }): void => {
+    const onEvent = (info: {
+      event: { index: number; subscribable?: boolean };
+      value: unknown;
+      cursor: ResourceCursor;
+      recordedAt: Date;
+    }): void => {
       if (info.event.subscribable && !this.eventSubscriptions.get(instanceId)?.has(info.event.index)) return;
       this.sendNotification(
         EpPacketNotification.EventOccurred,
         instanceId,
+        info.cursor.generation.data,
+        u64(info.cursor.revision),
+        info.recordedAt,
         info.event.index,
         info.value,
       );
@@ -2757,7 +3445,7 @@ export class EpConnection extends NetworkConnection {
       return;
     }
 
-    const typeId = Number(parsed[0]);
+    const typeId = asBigInt(parsed[0]);
     const index = Number(parsed[1]);
     const args = (parsed[2] as unknown[]) ?? [];
 
@@ -2860,6 +3548,9 @@ export class EpConnection extends NetworkConnection {
     const parsed = this.decode(tdu) as unknown[];
     const resourceId = Number(parsed[0]);
     const index = Number(parsed[1]);
+    const requestedCursor = parsed.length >= 4
+      ? cursorFromWire(parsed[2], parsed[3])
+      : ResourceCursor.empty();
 
     const resource = this.warehouse.getById(resourceId);
     if (!resource?.instance) {
@@ -2875,7 +3566,7 @@ export class EpConnection extends NetworkConnection {
       this.sendError(ErrorType.Management, callbackId, ExceptionCode.GeneralFailure);
       return;
     }
-    if (!et.subscribable) {
+    if (!et.subscribable && !et.historical) {
       this.sendError(ErrorType.Management, callbackId, ExceptionCode.NotSubscribable);
       return;
     }
@@ -2891,6 +3582,11 @@ export class EpConnection extends NetworkConnection {
       ))
     )
       return;
+
+    if (!this.isActionAllowed(resource, ActionType.ReceiveEvent, et)) {
+      this.sendError(ErrorType.Management, callbackId, ExceptionCode.NotAllowed);
+      return;
+    }
 
     const subscribed = this.eventSubscriptions.get(resourceId) ?? new Set<number>();
     if (subscribed.has(index)) {
@@ -2908,10 +3604,84 @@ export class EpConnection extends NetworkConnection {
       const key = `${resourceId}:${index}`;
       const listener = (): void => {};
       this.relayListeners.set(key, listener);
-      resource.on(et.name, listener);
+      try {
+        if (et.historical) await resource.onFromAsync(et.name, requestedCursor, listener);
+        else await resource.onAsync(et.name, listener);
+      } catch (error) {
+        subscribed.delete(index);
+        this.relayListeners.delete(key);
+        this.sendError(
+          ErrorType.Exception,
+          callbackId,
+          ExceptionCode.GeneralFailure,
+          String(error),
+        );
+        return;
+      }
+      const head = resource.instance?.cursor ?? resource.cursor;
+      this.sendReply(
+        EpPacketReply.Completed,
+        callbackId,
+        head.generation.data,
+        u64(head.revision),
+      );
+      return;
     }
 
-    this.sendReply(EpPacketReply.Completed, callbackId);
+    const head = resource.instance.cursor;
+    const after = requestedCursor.isEmpty ? head : requestedCursor;
+    if (et.historical) {
+      let replayAfter = after;
+      for (;;) {
+        const page = resource.instance.queryJournal({
+          after: replayAfter,
+          throughRevision: head.revision,
+          kind: ResourceJournalEntryKind.EventOccurred,
+          memberIndex: index,
+          limit: 10_000,
+        });
+        if (page.cursorExpired) {
+          subscribed.delete(index);
+          this.sendError(
+            ErrorType.Management,
+            callbackId,
+            ExceptionCode.CursorExpired,
+            `The requested cursor is older than ${page.oldestAvailable}.`,
+          );
+          return;
+        }
+        for (const entry of page.entries) {
+          this.sendNotification(
+            EpPacketNotification.EventOccurred,
+            resourceId,
+            entry.cursor.generation.data,
+            u64(entry.cursor.revision),
+            entry.recordedAt,
+            entry.memberIndex,
+            entry.value,
+          );
+        }
+        if (!page.hasMore) break;
+        if (page.next.equals(replayAfter)) {
+          subscribed.delete(index);
+          this.sendError(
+            ErrorType.Exception,
+            callbackId,
+            ExceptionCode.GeneralFailure,
+            "The resource journal did not advance while replaying a page.",
+          );
+          return;
+        }
+        replayAfter = page.next;
+      }
+    }
+
+    this.sendReply(
+      EpPacketReply.Completed,
+      callbackId,
+      head.generation.data,
+      u64(head.revision),
+    );
   }
 
   /** Server handler: the mirror of {@link epRequestSubscribe}. */
@@ -2972,52 +3742,201 @@ export class EpConnection extends NetworkConnection {
     this.sendReply(EpPacketReply.Completed, callbackId);
   }
 
+  /** Server handler: query retained changes without changing live subscriptions. */
+  private async epRequestQueryResourceJournal(
+    callbackId: number,
+    tdu: PlainTdu | null,
+  ): Promise<void> {
+    if (!tdu || !this.warehouse) {
+      this.sendError(ErrorType.Management, callbackId, ExceptionCode.ParseError);
+      return;
+    }
+
+    let args: unknown[];
+    try {
+      args = this.decode(tdu) as unknown[];
+    } catch {
+      this.sendError(ErrorType.Management, callbackId, ExceptionCode.ParseError);
+      return;
+    }
+    if (!Array.isArray(args) || args.length < 9) {
+      this.sendError(ErrorType.Management, callbackId, ExceptionCode.ParseError);
+      return;
+    }
+
+    const resourceId = asNumber(args[0]);
+    const resource = this.warehouse.getById(resourceId);
+    if (!resource?.instance) {
+      this.sendError(ErrorType.Management, callbackId, ExceptionCode.ResourceNotFound);
+      return;
+    }
+    if (!this.subscriptions.has(resourceId)) {
+      this.sendError(ErrorType.Management, callbackId, ExceptionCode.NotAttached);
+      return;
+    }
+
+    try {
+      const query: ResourceJournalQuery = {
+        after: cursorFromWire(args[1], args[2]),
+        throughRevision: args[3] == null ? undefined : asBigInt(args[3]),
+        fromTime: args[4] == null ? undefined : asDate(args[4]),
+        toTime: args[5] == null ? undefined : asDate(args[5]),
+        kind: args[6] == null
+          ? undefined
+          : asNumber(args[6]) as ResourceJournalEntryKind,
+        memberIndex: args[7] == null ? undefined : asNumber(args[7]),
+        limit: asNumber(args[8]),
+      };
+      // A relayed proxy must ask its authoritative upstream journal. Its
+      // process-local journal only contains changes observed since the relay
+      // was attached and may omit older retained entries.
+      const page = resource instanceof EpResource
+        ? await resource.queryJournal(query)
+        : resource.instance.queryJournal(query);
+      const permitted = page.entries.flatMap((entry) => {
+        const member = entry.kind === ResourceJournalEntryKind.PropertyModified
+          ? resource.instance!.definition.getPropertyByIndex(entry.memberIndex)
+          : resource.instance!.definition.getEventByIndex(entry.memberIndex);
+        const action = entry.kind === ResourceJournalEntryKind.PropertyModified
+          ? ActionType.GetProperty
+          : ActionType.ReceiveEvent;
+        if (!member || !this.isActionAllowed(resource, action, member)) return [];
+        return [[
+          entry.cursor.generation.data,
+          u64(entry.cursor.revision),
+          entry.recordedAt,
+          u8(entry.kind),
+          u8(entry.memberIndex),
+          entry.value,
+        ]];
+      });
+
+      this.sendReply(
+        EpPacketReply.Completed,
+        callbackId,
+        page.oldestAvailable.generation.data,
+        u64(page.oldestAvailable.revision),
+        page.highWatermark.generation.data,
+        u64(page.highWatermark.revision),
+        page.next.generation.data,
+        u64(page.next.revision),
+        page.cursorExpired,
+        page.hasMore,
+        permitted,
+      );
+    } catch (error) {
+      this.sendError(
+        ErrorType.Exception,
+        callbackId,
+        ExceptionCode.GeneralFailure,
+        String(error),
+      );
+    }
+  }
+
+  private enqueueNotification(action: EpPacketNotification, tdu: PlainTdu | null): void {
+    const generation = this.notificationGeneration;
+    this.pendingNotificationWork++;
+    this.notificationQueue = this.notificationQueue
+      .then(async () => {
+        if (generation !== this.notificationGeneration) return;
+        const now = Date.now();
+        if (this.notificationWorkStartedAt === 0)
+          this.notificationWorkStartedAt = now;
+        this.notificationsSinceYield++;
+        if (
+          this.notificationsSinceYield >= EpConnection.NotificationBatchSize ||
+          now - this.notificationWorkStartedAt >= EpConnection.NotificationTimeSliceMs
+        ) {
+          this.notificationsSinceYield = 0;
+          await new Promise<void>((resolve) => setTimeout(resolve, 0));
+          if (generation !== this.notificationGeneration) return;
+          this.notificationWorkStartedAt = Date.now();
+        }
+        await this.processNotification(action, tdu, generation);
+      })
+      .catch(() => {
+        if (generation === this.notificationGeneration) this.close();
+      })
+      .finally(() => {
+        if (generation === this.notificationGeneration)
+          this.pendingNotificationWork = Math.max(0, this.pendingNotificationWork - 1);
+      });
+  }
+
   /** Route an inbound notification to a built-in handler, or fall back to {@link onNotification}. */
-  private processNotification(action: EpPacketNotification, tdu: PlainTdu | null): void {
+  private async processNotification(
+    action: EpPacketNotification,
+    tdu: PlainTdu | null,
+    generation: number,
+  ): Promise<void> {
     switch (action) {
       case EpPacketNotification.PropertyModified: {
-        const a = (this.decode(tdu) as unknown[]) ?? [];
+        const a = (await this.decodeAsync(tdu) as unknown[]) ?? [];
+        if (generation !== this.notificationGeneration) return;
         this.attachedResources
           .get(Number(a[0]))
-          ?.updateProperty(Number(a[1]), a[2]);
+          ?.updateProperty(
+            Number(a[4]),
+            a[5],
+            cursorFromWire(a[1], a[2]),
+            asDate(a[3]),
+          );
         return;
       }
       case EpPacketNotification.EventOccurred: {
-        const a = (this.decode(tdu) as unknown[]) ?? [];
-        this.attachedResources.get(Number(a[0]))?.applyEvent(Number(a[1]), a[2]);
+        const a = (await this.decodeAsync(tdu) as unknown[]) ?? [];
+        if (generation !== this.notificationGeneration) return;
+        this.attachedResources.get(Number(a[0]))?.applyEvent(
+          Number(a[4]),
+          a[5],
+          cursorFromWire(a[1], a[2]),
+          asDate(a[3]),
+        );
         return;
       }
     }
-    this.onNotification?.(this, action, tdu);
+    if (generation !== this.notificationGeneration) return;
+    await this.onNotification?.(this, action, tdu);
   }
 
   private dispatchReply(packet: EpPacket): void {
     const { callbackId, tdu } = packet;
-    switch (packet.reply) {
-      case EpPacketReply.Completed:
-        this.replyCompleted(callbackId, tdu);
-        break;
-      case EpPacketReply.Stream:
-        this.replyStream(callbackId);
-        break;
-      case EpPacketReply.Propagated:
-        this.replyPropagated(callbackId, tdu);
-        break;
-      case EpPacketReply.PermissionError:
-        this.replyError(callbackId, tdu, ErrorType.Management);
-        break;
-      case EpPacketReply.ExecutionError:
-        this.replyError(callbackId, tdu, ErrorType.Exception);
-        break;
-      case EpPacketReply.Progress:
-        this.replyProgress(callbackId, tdu);
-        break;
-      case EpPacketReply.Chunk:
-        this.replyChunk(callbackId, tdu);
-        break;
-      case EpPacketReply.Warning:
-        this.replyWarning(callbackId, tdu);
-        break;
+    try {
+      switch (packet.reply) {
+        case EpPacketReply.Completed:
+          this.replyCompleted(callbackId, tdu);
+          break;
+        case EpPacketReply.Stream:
+          this.replyStream(callbackId);
+          break;
+        case EpPacketReply.Propagated:
+          this.replyPropagated(callbackId, tdu);
+          break;
+        case EpPacketReply.PermissionError:
+          this.replyError(callbackId, tdu, ErrorType.Management);
+          break;
+        case EpPacketReply.ExecutionError:
+          this.replyError(callbackId, tdu, ErrorType.Exception);
+          break;
+        case EpPacketReply.Progress:
+          this.replyProgress(callbackId, tdu);
+          break;
+        case EpPacketReply.Chunk:
+          this.replyChunk(callbackId, tdu);
+          break;
+        case EpPacketReply.Warning:
+          this.replyWarning(callbackId, tdu);
+          break;
+      }
+    } catch (error) {
+      if (!(error instanceof ParserLimitException)) throw error;
+      const req = this.requests.get(callbackId);
+      this.requests.delete(callbackId);
+      this.chunkDecodeQueues.delete(callbackId);
+      req?.triggerError(
+        new AsyncException(ErrorType.Management, ExceptionCode.ParserLimitExceeded, error.message),
+      );
     }
   }
 
@@ -3036,16 +3955,43 @@ export class EpConnection extends NetworkConnection {
     return parse(tdu.data, tdu.tduOffset, this.warehouse);
   }
 
+  /** Resolver-aware reply decoder used whenever decoding may attach resources. */
+  private async decodeAsync(tdu: PlainTdu | null): Promise<unknown> {
+    if (!tdu) return undefined;
+    // TypeDefs are intentionally returned as raw bytes and parsed by the
+    // dedicated dependency-aware TypeDef pipeline (see decode()).
+    if (tdu.identifier === TduIdentifier.TypeDef)
+      return tdu.data.subarray(tdu.tduOffset, tdu.tduOffset + tdu.totalLength);
+    return (
+      await parseAsync(
+        tdu.data,
+        tdu.tduOffset,
+        this.warehouse,
+        this.valueResolver,
+        null,
+      )
+    ).value;
+  }
+
   private replyCompleted(callbackId: number, tdu: PlainTdu | null): void {
     const req = this.requests.get(callbackId);
     if (!req) return;
     this.requests.delete(callbackId);
-    // A `Completed` reply for a streamed invocation signals both "the call
-    // is done" (the normal `trigger`, inherited unchanged) and "no more
-    // chunks are coming" — without the latter, `for await` consumers of an
-    // `AsyncStreamReply` would hang waiting on a chunk that will never arrive.
-    if (req instanceof AsyncStreamReply) req.triggerStreamCompleted();
-    req.trigger(this.decode(tdu));
+    const pendingChunks = this.chunkDecodeQueues.get(callbackId) ?? Promise.resolve();
+    void pendingChunks.then(async () => {
+      try {
+        const value = await this.decodeAsync(tdu);
+        // A `Completed` reply for a streamed invocation signals both "the call
+        // is done" and "no more chunks are coming". Do this after queued chunk
+        // decodes so resource-valued final chunks are not discarded.
+        if (req instanceof AsyncStreamReply) req.triggerStreamCompleted();
+        req.trigger(value);
+      } catch (error) {
+        req.triggerError(AsyncException.from(error));
+      } finally {
+        this.chunkDecodeQueues.delete(callbackId);
+      }
+    });
   }
 
   private replyStream(callbackId: number): void {
@@ -3054,7 +4000,17 @@ export class EpConnection extends NetworkConnection {
   }
 
   private replyChunk(callbackId: number, tdu: PlainTdu | null): void {
-    this.requests.get(callbackId)?.triggerChunk(this.decode(tdu));
+    const req = this.requests.get(callbackId);
+    if (!req) return;
+    const previous = this.chunkDecodeQueues.get(callbackId) ?? Promise.resolve();
+    const next = previous
+      .then(async () => {
+        req.triggerChunk(await this.decodeAsync(tdu));
+      })
+      .catch((error) => {
+        req.triggerError(AsyncException.from(error));
+      });
+    this.chunkDecodeQueues.set(callbackId, next);
   }
 
   private replyWarning(callbackId: number, tdu: PlainTdu | null): void {
@@ -3072,6 +4028,7 @@ export class EpConnection extends NetworkConnection {
     const req = this.requests.get(callbackId);
     if (!req) return;
     this.requests.delete(callbackId);
+    this.chunkDecodeQueues.delete(callbackId);
     const args = (this.decode(tdu) as unknown[]) ?? [];
     req.triggerError(new AsyncException(type, Number(args[0] ?? 0), String(args[1] ?? "")));
   }
@@ -3090,6 +4047,7 @@ export class EpConnection extends NetworkConnection {
   override close(): void {
     this.manualClose = true;
     this.clearReconnectTimer();
+    this.cancelAuthenticationDeadline();
     if (this.authSessionEstablished)
       this.authenticationProvider?.logout?.(this.getAuthenticationSession());
     super.close();
@@ -3098,10 +4056,17 @@ export class EpConnection extends NetworkConnection {
   override destroy(): void {
     this.manualClose = true;
     this.clearReconnectTimer();
+    this.cancelAuthenticationDeadline();
     super.destroy();
   }
 
   protected override disconnected(): void {
+    this.cancelAuthenticationDeadline();
+    const connectionClosed = new AsyncException(
+      ErrorType.Management,
+      ExceptionCode.HostNotReachable,
+      "Connection closed.",
+    );
     // Fail a pending handshake.
     this.readyReply?.triggerError(
       new AsyncException(ErrorType.Management, 1, "Connection closed during handshake."),
@@ -3109,14 +4074,33 @@ export class EpConnection extends NetworkConnection {
     // Drop notification subscriptions and fail any in-flight requests.
     for (const unsubscribe of this.subscriptions.values()) unsubscribe();
     this.subscriptions.clear();
+    this.peerAttachmentRequests.clear();
     this.eventSubscriptions.clear();
+    this.notificationGeneration++;
+    this.notificationQueue = Promise.resolve();
+    this.notificationsSinceYield = 0;
+    this.pendingNotificationWork = 0;
+    this.notificationWorkStartedAt = 0;
+    this.chunkDecodeQueues.clear();
 
     const pending = [...this.requests.values()];
     this.requests.clear();
-    for (const req of pending)
-      req.triggerError(
-        new AsyncException(ErrorType.Management, 1, "Connection closed."),
-      );
+    for (const req of pending) req.triggerError(connectionClosed);
+
+    for (const request of this.resourceAttachRequests.values())
+      request.reply.triggerError(connectionClosed);
+    this.resourceAttachRequests.clear();
+    this.neededResources.clear();
+    this.resourcesFetchBlockedOn.clear();
+
+    for (const request of this.typeDefRequests.values())
+      request.reply.triggerError(connectionClosed);
+    this.typeDefRequests.clear();
+    this.neededTypeDefs.clear();
+    this.typeDefsFetchBlockedOn.clear();
+
+    for (const invocation of this.invocations.values()) void invocation.terminate();
+    this.invocations.clear();
 
     if (this.shouldAutoReconnect()) this.scheduleReconnect();
   }
@@ -3148,8 +4132,8 @@ export class EpConnection extends NetworkConnection {
   }
 }
 
-/** Reject URL handling that would otherwise inherit a transport's default port. */
-function requireExplicitEndpointPort(value: string): URL {
+/** Validate an explicit transport override without changing its scheme-defined port. */
+function validateEndpoint(value: string): string {
   let url: URL;
   try {
     url = new URL(value);
@@ -3157,31 +4141,9 @@ function requireExplicitEndpointPort(value: string): URL {
     throw new Error(`Invalid EP endpoint: ${value}`);
   }
 
-  const schemeEnd = value.indexOf("://");
-  const authorityStart = schemeEnd < 0 ? -1 : schemeEnd + 3;
-  const authorityEnd =
-    authorityStart < 0
-      ? -1
-      : ["/", "?", "#"]
-          .map((separator) => value.indexOf(separator, authorityStart))
-          .filter((index) => index >= 0)
-          .reduce((first, index) => Math.min(first, index), value.length);
-  const authority =
-    authorityStart < 0 ? "" : value.slice(authorityStart, authorityEnd).split("@").at(-1) ?? "";
-  const portText = authority.startsWith("[")
-    ? authority.slice(authority.indexOf("]") + 1).replace(/^:/, "")
-    : authority.slice(authority.lastIndexOf(":") + 1);
-  const hasPortSeparator = authority.startsWith("[")
-    ? authority.indexOf("]") >= 0 && authority[authority.indexOf("]") + 1] === ":"
-    : authority.lastIndexOf(":") > 0;
-  const port = Number(portText);
+  if (!url.hostname) throw new Error(`Invalid EP endpoint: ${value}`);
 
-  if (!url.hostname || !hasPortSeparator || !/^\d+$/.test(portText) || port <= 0 || port > 65535)
-    throw new Error(
-      `EP endpoints must include an explicit port (for example, ep://host:port): ${value}`,
-    );
-
-  return url;
+  return value;
 }
 
 function isThenable(value: unknown): value is PromiseLike<unknown> {
@@ -3253,7 +4215,7 @@ function nullResult(): AuthenticationResult {
  * typed lists/maps/tuples), collecting the full transitive closure. Used by
  * `LinkTypeDefs` to bulk-fetch a type's dependency graph in one round trip.
  */
-function collectTypeDefDependencies(local: LocalTypeDef, closure: Map<number, LocalTypeDef>): void {
+function collectTypeDefDependencies(local: LocalTypeDef, closure: Map<bigint, LocalTypeDef>): void {
   if (closure.has(local.id)) return;
   closure.set(local.id, local);
 
@@ -3279,6 +4241,23 @@ function asNumber(value: unknown): number {
   if (typeof value === "bigint") return Number(value);
   if (value instanceof Number) return Number(value.valueOf());
   return Number(value ?? 0);
+}
+
+function asBigInt(value: unknown): bigint {
+  if (typeof value === "bigint") return value;
+  if (typeof value === "number") return BigInt(Math.trunc(value));
+  if (value != null && typeof value === "object" && "value" in value)
+    return asBigInt((value as { value: unknown }).value);
+  return BigInt(value == null ? 0 : String(value));
+}
+
+function cursorFromWire(generation: unknown, revision: unknown): ResourceCursor {
+  const uuid = generation instanceof Uuid
+    ? generation
+    : generation instanceof Uint8Array
+      ? new Uuid(generation)
+      : (() => { throw new Error("Resource cursor generation must be a 16-byte value."); })();
+  return new ResourceCursor(uuid, asBigInt(revision));
 }
 
 function asDate(value: unknown): Date | undefined {
@@ -3313,7 +4292,7 @@ function asStringArray(value: unknown): string[] {
   return value.filter((v): v is string => typeof v === "string");
 }
 
-function readTypeDefPayloadId(data: Uint8Array, warehouse: unknown): number {
+function readTypeDefPayloadId(data: Uint8Array, warehouse: unknown): bigint {
   if (data.length < 1)
     throw new AsyncException(
       ErrorType.Management,
@@ -3322,17 +4301,35 @@ function readTypeDefPayloadId(data: Uint8Array, warehouse: unknown): number {
     );
 
   if ((data[0] & 0xc7) === TduIdentifier.TypeDef) {
-    // No fixed-offset shortcut exists in the new format (matching dotnet) —
-    // the id is `TypeDefField.Id` inside the indexed structure, so extracting
-    // it requires a full (small) decode.
-    const parsed = parseSync(data, 0, warehouse);
-    if (!(parsed.value instanceof TypeDefInfo))
-      throw new AsyncException(
-        ErrorType.Management,
-        ExceptionCode.ParseError,
-        "Invalid TypeDefInfo payload.",
-      );
-    return parsed.value.id;
+    // The TypeDef id is field 1 in its indexed TypedMap. Decode only through
+    // that field: a full synchronous decode can encounter member signatures
+    // that reference other remote TypeDefs, which necessarily require this
+    // connection's asynchronous resolver.
+    const outer = requireParsedTypeDefTdu(data, 0, data.length, warehouse);
+    const map = requireParsedTypeDefTdu(
+      data,
+      outer.payloadOffset,
+      outer.payloadOffset + outer.payloadLength,
+      warehouse,
+    );
+    if (!(map.metadata instanceof TruComposite) || map.metadata.identifier !== TruIdentifier.TypedMap)
+      throw typeDefPayloadError("TypeDef payload is not an indexed map.");
+
+    const keys = requireParsedTypeDefTdu(
+      data,
+      map.payloadOffset,
+      map.payloadOffset + map.payloadLength,
+      warehouse,
+    );
+    const valuesOffset = keys.payloadOffset + keys.payloadLength;
+    const values = requireParsedTypeDefTdu(
+      data,
+      valuesOffset,
+      map.payloadOffset + map.payloadLength,
+      warehouse,
+    );
+    const fieldIndexes = decodeTypeDefFieldIndexes(keys, map.metadata.subTypes[0], warehouse);
+    return decodeTypeDefIdValue(values, fieldIndexes, map.metadata.subTypes[1], warehouse);
   }
 
   if (data.length < 9)
@@ -3341,7 +4338,92 @@ function readTypeDefPayloadId(data: Uint8Array, warehouse: unknown): number {
       ExceptionCode.ParseError,
       "TypeDef payload is too short.",
     );
-  return Number(getUint64(data, 1));
+  return getUint64(data, 1);
+}
+
+function typeDefPayloadError(message: string): AsyncException {
+  return new AsyncException(ErrorType.Management, ExceptionCode.ParseError, message);
+}
+
+function requireParsedTypeDefTdu(
+  data: Uint8Array,
+  offset: number,
+  ends: number,
+  warehouse: unknown,
+): ParsedTdu {
+  const parsed = ParsedTdu.parseSync(data, offset, ends, warehouse);
+  if (parsed.tduClass === TduClass.Invalid || parsed.totalLength <= 0)
+    throw typeDefPayloadError("TypeDef payload contains an incomplete value.");
+  return parsed;
+}
+
+function applyTypeDefArrayElement(
+  current: ParsedTdu,
+  previous: ParsedTdu | null,
+  declaredType: Tru,
+): void {
+  if (current.identifier === TduIdentifier.TypeContinuation && previous) {
+    current.tduClass = previous.tduClass;
+    current.identifier = previous.identifier;
+    current.metadata = previous.metadata;
+    current.exponent = previous.exponent;
+    current.index = previous.index;
+  } else if (current.identifier === TduIdentifier.TypeOfTarget) {
+    current.tduClass = TduClass.Typed;
+    current.identifier = TduIdentifier.Typed;
+    current.metadata = declaredType;
+    current.index = TduIdentifier.Typed & 0x7;
+  }
+}
+
+function decodeTypeDefFieldIndexes(
+  array: ParsedTdu,
+  declaredType: Tru,
+  warehouse: unknown,
+): number[] {
+  const indexes: number[] = [];
+  const ends = array.payloadOffset + array.payloadLength;
+  let offset = array.payloadOffset;
+  let previous: ParsedTdu | null = null;
+  while (offset < ends) {
+    const current = requireParsedTypeDefTdu(array.data, offset, ends, warehouse);
+    applyTypeDefArrayElement(current, previous, declaredType);
+    const value = parseSyncTdu(current, warehouse);
+    if (typeof value !== "number" || !Number.isInteger(value))
+      throw typeDefPayloadError("TypeDef field index is invalid.");
+    indexes.push(value);
+    offset += current.totalLength;
+    previous = current;
+  }
+  return indexes;
+}
+
+function decodeTypeDefIdValue(
+  array: ParsedTdu,
+  fieldIndexes: readonly number[],
+  declaredType: Tru,
+  warehouse: unknown,
+): bigint {
+  const ends = array.payloadOffset + array.payloadLength;
+  let offset = array.payloadOffset;
+  let previous: ParsedTdu | null = null;
+  for (let i = 0; i < fieldIndexes.length && offset < ends; i++) {
+    const current = requireParsedTypeDefTdu(array.data, offset, ends, warehouse);
+    applyTypeDefArrayElement(current, previous, declaredType);
+    const value = parseSyncTdu(current, warehouse);
+    if (fieldIndexes[i] === 1) {
+      if (
+        (typeof value !== "bigint" &&
+          (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0)) ||
+        (typeof value === "bigint" && value < 0n)
+      )
+        throw typeDefPayloadError("TypeDef id is invalid.");
+      return typeof value === "bigint" ? value : BigInt(value);
+    }
+    offset += current.totalLength;
+    previous = current;
+  }
+  throw typeDefPayloadError("TypeDef id field is missing.");
 }
 
 function toInstanceId(value: unknown): number | undefined {

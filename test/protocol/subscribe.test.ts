@@ -6,14 +6,25 @@ import { WSocket } from "../../src/net/sockets/WSocket.js";
 import { Warehouse } from "../../src/resource/Warehouse.js";
 import { MemoryStore } from "../../src/stores/MemoryStore.js";
 import { Resource } from "../../src/resource/Resource.js";
-import { Export, AutoDelivered, event, type EventSource } from "../../src/resource/decorators.js";
+import {
+  Export,
+  AutoDelivered,
+  Historical,
+  event,
+  type EventSource,
+} from "../../src/resource/decorators.js";
 import { t } from "../../src/data/descriptors.js";
+import type { ResourceCursor } from "../../src/resource/ResourceCursor.js";
+import type {
+  ResourceJournalPage,
+  ResourceJournalQuery,
+} from "../../src/resource/ResourceJournal.js";
 
 class Beacon extends Resource {
-  @Export(t.i32) accessor pings = 0;
+  @Export(t.i32) @Historical() accessor pings = 0;
 
   // Default: subscribable, requires an explicit Subscribe before occurrences flow.
-  @Export(t.string) ping: EventSource<string> = event<string>();
+  @Export(t.string) @Historical() ping: EventSource<string> = event<string>();
 
   // Opts out via @AutoDelivered(): flows to every attached connection unconditionally.
   @Export(t.string) @AutoDelivered() tick: EventSource<string> = event<string>();
@@ -28,6 +39,13 @@ interface ListenableProxy {
   on(name: string, cb: (value: unknown) => void): void;
   off(name: string, cb: (value: unknown) => void): void;
   eventOccurred: { add(cb: (value: unknown) => void): void };
+  cursor: ResourceCursor;
+  onFromAsync(
+    name: string,
+    after: ResourceCursor,
+    cb: (value: unknown) => void,
+  ): PromiseLike<ListenableProxy>;
+  queryJournal(query?: ResourceJournalQuery): PromiseLike<ResourceJournalPage>;
 }
 
 async function makeServerAndClient(): Promise<{
@@ -159,6 +177,73 @@ describe("EpResource.on/.off — event subscription", () => {
     await new Promise<void>((r) => server.close(() => r()));
   });
 
+  it("reports completed notifications as no longer pending", async () => {
+    const { beacon, server, client, res } = await makeServerAndClient();
+    const properties: unknown[] = [];
+    const events: string[] = [];
+    res.on(":pings", (value) => properties.push(value));
+    res.on("tick", (value) => events.push(String(value)));
+    client.enableRuntimeMetrics();
+
+    beacon.fire("tick", "done");
+    await waitFor(() => properties.length === 1 && events.length === 1);
+
+    const metrics = client.getRuntimeMetrics();
+    expect(metrics.receivedNotifications).toBeGreaterThanOrEqual(2);
+    expect(metrics.queuedNotificationWork).toBe(0);
+
+    client.close();
+    await new Promise<void>((r) => server.close(() => r()));
+  });
+
+  it("yields to the host event loop while preserving a large property-notification burst", async () => {
+    const { beacon, server, client, res } = await makeServerAndClient();
+    let received = 0;
+    let receivedWhenTimerRan = Number.POSITIVE_INFINITY;
+    res.on(":pings", () => {
+      received++;
+      if (received === 1) {
+        setTimeout(() => {
+          receivedWhenTimerRan = received;
+        }, 0);
+      }
+    });
+
+    for (let index = 1; index <= 512; index++) beacon.pings = index;
+
+    await waitFor(() => received === 512);
+    await waitFor(() => Number.isFinite(receivedWhenTimerRan));
+    expect(receivedWhenTimerRan).toBeLessThan(512);
+    expect(res.cursor.revision).toBeGreaterThanOrEqual(512n);
+
+    client.close();
+    await new Promise<void>((r) => server.close(() => r()));
+  });
+
+  it("queries the unified journal and replays a historical event from a cursor", async () => {
+    const { beacon, server, client, res } = await makeServerAndClient();
+    const attachedAt = res.cursor;
+
+    beacon.fire("ping", "missed");
+
+    const page = await res.queryJournal({ after: attachedAt });
+    expect(page.entries.map((entry) => [entry.kind, entry.value])).toEqual([
+      [0, 1],
+      [1, "missed"],
+    ]);
+
+    const received: string[] = [];
+    await res.onFromAsync("ping", attachedAt, (value) => received.push(String(value)));
+    expect(received).toEqual(["missed"]);
+
+    beacon.fire("ping", "live");
+    await waitFor(() => received.length === 2);
+    expect(received).toEqual(["missed", "live"]);
+
+    client.close();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  });
+
   it("resubscribes active event listeners after an automatic reconnect", async () => {
     const warehouse = new Warehouse();
     await warehouse.put("sys", new MemoryStore());
@@ -170,7 +255,7 @@ describe("EpResource.on/.off — event subscription", () => {
     const server = await EpServer.listen({ port: 0, warehouse });
     const client = await EpConnection.connect(`ws://127.0.0.1:${server.port}`, {
       autoReconnect: true,
-      reconnectInterval: 20,
+      reconnectInterval: 200,
     });
     const res = (await client.attach(beaconId, typeDef)) as unknown as ListenableProxy;
 
@@ -189,12 +274,16 @@ describe("EpResource.on/.off — event subscription", () => {
     await waitFor(() => !client.isConnected);
     await waitFor(() => server.connections.size === 0);
 
+    // Historical events raised while disconnected are replayed exactly once
+    // before live delivery resumes.
+    beacon.fire("ping", "offline");
+
     await waitFor(() => client.isConnected);
     await new Promise((r) => setTimeout(r, 150)); // let post-reattach resubscribe land
 
     beacon.fire("ping", "after");
-    await waitFor(() => received.length === 2);
-    expect(received).toEqual(["before", "after"]);
+    await waitFor(() => received.length === 3);
+    expect(received).toEqual(["before", "offline", "after"]);
 
     client.close();
     await server.close();

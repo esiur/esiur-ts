@@ -28,6 +28,17 @@ import {
   GroupUInt32Codec,
   GroupUInt64Codec,
 } from "./gvwie/index.js";
+import { ensureAllocation, ensureCollectionCount, saturatedMultiply } from "./ParserGuard.js";
+
+const pointerSize = 8;
+
+function ensureTypedArrayBudget(tdu: ParsedTdu, warehouse: unknown, elementSize: number): void {
+  ensureAllocation(warehouse, saturatedMultiply(tdu.payloadLength, elementSize), "typed array");
+}
+
+function decodedArrayGuard(warehouse: unknown, elementSize: number): (count: number) => void {
+  return (count) => ensureCollectionCount(warehouse, count, elementSize);
+}
 
 /**
  * Sync value parsers (port of the sync parsers in C# `DataDeserializer`). Each
@@ -46,7 +57,7 @@ export type AsyncParser = (
   tdu: ParsedTdu,
   warehouse: unknown,
   remoteResolver: RemoteTypeDefResolver | undefined,
-  requestSequence: readonly number[] | null,
+  requestSequence: readonly bigint[] | null,
 ) => Promise<unknown>;
 
 export const nullParser: Parser = () => null;
@@ -84,13 +95,19 @@ export const uint128Parser: Parser = (t) =>
     DC.getUint64(t.data, t.payloadOffset + 8),
   );
 
-export const resourceLinkParser: Parser = (t) =>
-  new ResourceLink(DC.getString(t.data, t.payloadOffset, t.payloadLength));
+export const resourceLinkParser: Parser = (t, w) => {
+  ensureAllocation(w, saturatedMultiply(t.payloadLength, 2), "resource link");
+  return new ResourceLink(DC.getString(t.data, t.payloadOffset, t.payloadLength));
+};
 
-export const rawDataParser: Parser = (t) =>
-  t.data.slice(t.payloadOffset, t.payloadOffset + t.payloadLength);
-export const stringParser: Parser = (t) =>
-  DC.getString(t.data, t.payloadOffset, t.payloadLength);
+export const rawDataParser: Parser = (t, w) => {
+  ensureAllocation(w, t.payloadLength, "raw data");
+  return t.data.slice(t.payloadOffset, t.payloadOffset + t.payloadLength);
+};
+export const stringParser: Parser = (t, w) => {
+  ensureAllocation(w, saturatedMultiply(t.payloadLength, 2), "string");
+  return DC.getString(t.data, t.payloadOffset, t.payloadLength);
+};
 
 // Resource references (sync path returns placeholders).
 export const resource8Parser: Parser = (t) => new ResourceId(false, DC.getUint8(t.data, t.payloadOffset));
@@ -99,6 +116,47 @@ export const resource32Parser: Parser = (t) => new ResourceId(false, DC.getUint3
 export const localResource8Parser: Parser = (t) => new ResourceId(true, DC.getUint8(t.data, t.payloadOffset));
 export const localResource16Parser: Parser = (t) => new ResourceId(true, DC.getUint16(t.data, t.payloadOffset));
 export const localResource32Parser: Parser = (t) => new ResourceId(true, DC.getUint32(t.data, t.payloadOffset));
+
+function resourceReferenceId(tdu: ParsedTdu): number {
+  switch (tdu.identifier) {
+    case TduIdentifier.LocalResource8:
+    case TduIdentifier.RemoteResource8:
+      return DC.getUint8(tdu.data, tdu.payloadOffset);
+    case TduIdentifier.LocalResource16:
+    case TduIdentifier.RemoteResource16:
+      return DC.getUint16(tdu.data, tdu.payloadOffset);
+    case TduIdentifier.LocalResource32:
+    case TduIdentifier.RemoteResource32:
+      return DC.getUint32(tdu.data, tdu.payloadOffset);
+    default:
+      throw new Error(`TDU ${tdu.identifier} is not a resource reference.`);
+  }
+}
+
+/** Resolve resource references on the async/connection-aware decode path. */
+export async function resourceReferenceParserAsync(
+  tdu: ParsedTdu,
+  warehouse: unknown,
+  remoteResolver: RemoteTypeDefResolver | undefined,
+  requestSequence: readonly bigint[] | null,
+): Promise<unknown> {
+  const id = resourceReferenceId(tdu);
+  const local =
+    tdu.identifier === TduIdentifier.LocalResource8 ||
+    tdu.identifier === TduIdentifier.LocalResource16 ||
+    tdu.identifier === TduIdentifier.LocalResource32;
+
+  if (local) {
+    if (remoteResolver?.resolveLocalResource)
+      return await remoteResolver.resolveLocalResource(id);
+    const candidate = warehouse as { getById?: (resourceId: number) => unknown } | null;
+    return candidate?.getById?.(id) ?? new ResourceId(true, id);
+  }
+
+  if (remoteResolver?.resolveRemoteResource)
+    return await remoteResolver.resolveRemoteResource(id, requestSequence);
+  return new ResourceId(false, id);
+}
 
 /** Parse a self-describing array payload, honouring TypeContinuation runs. */
 function parseDynamicArray(tdu: ParsedTdu, warehouse: unknown): unknown[] {
@@ -119,6 +177,7 @@ function parseDynamicArray(tdu: ParsedTdu, warehouse: unknown): unknown[] {
     }
 
     list.push(parseSyncTdu(current, warehouse));
+    ensureCollectionCount(warehouse, list.length, pointerSize);
 
     if (current.totalLength <= 0)
       throw new Error("Error while parsing structured data.");
@@ -174,6 +233,7 @@ function typedObjectParser(tdu: ParsedTdu, typeDef: ITypeDef, warehouse: unknown
 
 /** Decode a record TDU: parse each property in TypeDef order, then build the instance. */
 function recordParser(tdu: ParsedTdu, typeDef: ITypeDef, warehouse: unknown): object {
+  ensureCollectionCount(warehouse, typeDef.properties.length, pointerSize);
   const values: unknown[] = [];
   let offset = tdu.payloadOffset;
   let length = tdu.payloadLength;
@@ -223,17 +283,23 @@ function typedArrayParser(tdu: ParsedTdu, element: Tru, warehouse: unknown): unk
 
   switch (element.identifier) {
     case TruIdentifier.Int16:
-      return GroupInt16Codec.decode(tdu.data, start, end);
+      ensureTypedArrayBudget(tdu, warehouse, 2);
+      return GroupInt16Codec.decode(tdu.data, start, end, decodedArrayGuard(warehouse, 2));
     case TruIdentifier.Int32:
-      return GroupInt32Codec.decode(tdu.data, start, end);
+      ensureTypedArrayBudget(tdu, warehouse, 4);
+      return GroupInt32Codec.decode(tdu.data, start, end, decodedArrayGuard(warehouse, 4));
     case TruIdentifier.Int64:
-      return GroupInt64Codec.decode(tdu.data, start, end);
+      ensureTypedArrayBudget(tdu, warehouse, 8);
+      return GroupInt64Codec.decode(tdu.data, start, end, decodedArrayGuard(warehouse, 8));
     case TruIdentifier.UInt16:
-      return GroupUInt16Codec.decode(tdu.data, start, end);
+      ensureTypedArrayBudget(tdu, warehouse, 2);
+      return GroupUInt16Codec.decode(tdu.data, start, end, decodedArrayGuard(warehouse, 2));
     case TruIdentifier.UInt32:
-      return GroupUInt32Codec.decode(tdu.data, start, end);
+      ensureTypedArrayBudget(tdu, warehouse, 4);
+      return GroupUInt32Codec.decode(tdu.data, start, end, decodedArrayGuard(warehouse, 4));
     case TruIdentifier.UInt64:
-      return GroupUInt64Codec.decode(tdu.data, start, end);
+      ensureTypedArrayBudget(tdu, warehouse, 8);
+      return GroupUInt64Codec.decode(tdu.data, start, end, decodedArrayGuard(warehouse, 8));
     default: {
       const list: unknown[] = [];
       let offset = start;
@@ -256,6 +322,7 @@ function typedArrayParser(tdu: ParsedTdu, element: Tru, warehouse: unknown): unk
         }
 
         list.push(parseSyncTdu(current, warehouse));
+        ensureCollectionCount(warehouse, list.length, pointerSize);
 
         if (current.totalLength <= 0)
           throw new Error("Error while parsing structured data.");
@@ -290,6 +357,7 @@ function typedMapParser(
 
   const keys = typedArrayParser(keysTdu, keyTru, warehouse);
   const values = typedArrayParser(valuesTdu, valueTru, warehouse);
+  ensureCollectionCount(warehouse, keys.length, pointerSize * 2);
 
   const map = new Map<unknown, unknown>();
   for (let i = 0; i < keys.length; i++) map.set(keys[i], values[i]);
@@ -298,6 +366,7 @@ function typedMapParser(
 
 /** Decode a `TupleN<...>` TDU to a JS array (in element order). */
 function tupleParser(tdu: ParsedTdu, subTrus: Tru[], warehouse: unknown): unknown[] {
+  ensureCollectionCount(warehouse, subTrus.length, pointerSize);
   const results: unknown[] = [];
   let offset = tdu.payloadOffset;
   let length = tdu.payloadLength;
@@ -349,6 +418,12 @@ export const truParser: Parser = (tdu, warehouse) => {
  * their concrete `*DefInfo` classes by hand at this known call site.
  */
 function hydrateTypeDefInfo(info: TypeDefInfo): TypeDefInfo {
+  // Dynamic numeric TDUs use the narrowest lossless width, so small UInt64
+  // values decode as numbers. Normalize protocol identifiers back to bigint
+  // at the typed structure boundary; callers must never observe a lossy or
+  // width-dependent TypeDef id representation.
+  info.id = BigInt(info.id);
+  if (info.parent != null) info.parent = BigInt(info.parent);
   if (Array.isArray(info.properties))
     info.properties = info.properties.map((m) => fromIndexedMap(PropertyDefInfo, m));
   if (Array.isArray(info.functions))
@@ -380,7 +455,7 @@ async function parseDynamicArrayAsync(
   tdu: ParsedTdu,
   warehouse: unknown,
   remoteResolver: RemoteTypeDefResolver | undefined,
-  requestSequence: readonly number[] | null,
+  requestSequence: readonly bigint[] | null,
 ): Promise<unknown[]> {
   const list: unknown[] = [];
   let offset = tdu.payloadOffset;
@@ -406,6 +481,7 @@ async function parseDynamicArrayAsync(
     }
 
     list.push(await parseAsyncTdu(current, warehouse, remoteResolver, requestSequence));
+    ensureCollectionCount(warehouse, list.length, pointerSize);
 
     if (current.totalLength <= 0)
       throw new Error("Error while parsing structured data.");
@@ -429,7 +505,10 @@ export const mapParserAsync: AsyncParser = async (t, w, r, s) => {
 export const mapListParserAsync: AsyncParser = (t, w, r, s) => parseDynamicArrayAsync(t, w, r, s);
 export const rawDataParserAsync: AsyncParser = async (t, w) => rawDataParser(t, w);
 export const stringParserAsync: AsyncParser = async (t, w) => stringParser(t, w);
-export const resourceLinkParserAsync: AsyncParser = async (t, w) => resourceLinkParser(t, w);
+export const resourceLinkParserAsync: AsyncParser = async (t, w, r) => {
+  const link = resourceLinkParser(t, w) as ResourceLink;
+  return r?.resolveResourceLink ? await r.resolveResourceLink(link.link) : link;
+};
 
 export const typedParserAsync: AsyncParser = async (tdu, warehouse, remoteResolver, requestSequence) => {
   const tru = tdu.metadata;
@@ -467,7 +546,7 @@ async function typedObjectParserAsync(
   typeDef: ITypeDef,
   warehouse: unknown,
   remoteResolver: RemoteTypeDefResolver | undefined,
-  requestSequence: readonly number[] | null,
+  requestSequence: readonly bigint[] | null,
 ): Promise<unknown> {
   if (typeDef.kind === TypeDefKind.Record)
     return recordParserAsync(tdu, typeDef, warehouse, remoteResolver, requestSequence);
@@ -480,8 +559,9 @@ async function recordParserAsync(
   typeDef: ITypeDef,
   warehouse: unknown,
   remoteResolver: RemoteTypeDefResolver | undefined,
-  requestSequence: readonly number[] | null,
+  requestSequence: readonly bigint[] | null,
 ): Promise<object> {
+  ensureCollectionCount(warehouse, typeDef.properties.length, pointerSize);
   const values: unknown[] = [];
   let offset = tdu.payloadOffset;
   let length = tdu.payloadLength;
@@ -530,24 +610,30 @@ async function typedArrayParserAsync(
   element: Tru,
   warehouse: unknown,
   remoteResolver: RemoteTypeDefResolver | undefined,
-  requestSequence: readonly number[] | null,
+  requestSequence: readonly bigint[] | null,
 ): Promise<unknown[]> {
   const start = tdu.payloadOffset;
   const end = start + tdu.payloadLength;
 
   switch (element.identifier) {
     case TruIdentifier.Int16:
-      return GroupInt16Codec.decode(tdu.data, start, end);
+      ensureTypedArrayBudget(tdu, warehouse, 2);
+      return GroupInt16Codec.decode(tdu.data, start, end, decodedArrayGuard(warehouse, 2));
     case TruIdentifier.Int32:
-      return GroupInt32Codec.decode(tdu.data, start, end);
+      ensureTypedArrayBudget(tdu, warehouse, 4);
+      return GroupInt32Codec.decode(tdu.data, start, end, decodedArrayGuard(warehouse, 4));
     case TruIdentifier.Int64:
-      return GroupInt64Codec.decode(tdu.data, start, end);
+      ensureTypedArrayBudget(tdu, warehouse, 8);
+      return GroupInt64Codec.decode(tdu.data, start, end, decodedArrayGuard(warehouse, 8));
     case TruIdentifier.UInt16:
-      return GroupUInt16Codec.decode(tdu.data, start, end);
+      ensureTypedArrayBudget(tdu, warehouse, 2);
+      return GroupUInt16Codec.decode(tdu.data, start, end, decodedArrayGuard(warehouse, 2));
     case TruIdentifier.UInt32:
-      return GroupUInt32Codec.decode(tdu.data, start, end);
+      ensureTypedArrayBudget(tdu, warehouse, 4);
+      return GroupUInt32Codec.decode(tdu.data, start, end, decodedArrayGuard(warehouse, 4));
     case TruIdentifier.UInt64:
-      return GroupUInt64Codec.decode(tdu.data, start, end);
+      ensureTypedArrayBudget(tdu, warehouse, 8);
+      return GroupUInt64Codec.decode(tdu.data, start, end, decodedArrayGuard(warehouse, 8));
     default: {
       const list: unknown[] = [];
       let offset = start;
@@ -577,6 +663,7 @@ async function typedArrayParserAsync(
         }
 
         list.push(await parseAsyncTdu(current, warehouse, remoteResolver, requestSequence));
+        ensureCollectionCount(warehouse, list.length, pointerSize);
 
         if (current.totalLength <= 0)
           throw new Error("Error while parsing structured data.");
@@ -595,7 +682,7 @@ async function typedMapParserAsync(
   valueTru: Tru,
   warehouse: unknown,
   remoteResolver: RemoteTypeDefResolver | undefined,
-  requestSequence: readonly number[] | null,
+  requestSequence: readonly bigint[] | null,
 ): Promise<Map<unknown, unknown>> {
   const keysTdu = await ParsedTdu.parseAsync(
     tdu.data,
@@ -622,6 +709,7 @@ async function typedMapParserAsync(
     remoteResolver,
     requestSequence,
   );
+  ensureCollectionCount(warehouse, keys.length, pointerSize * 2);
 
   const map = new Map<unknown, unknown>();
   for (let i = 0; i < keys.length; i++) map.set(keys[i], values[i]);
@@ -633,8 +721,9 @@ async function tupleParserAsync(
   subTrus: Tru[],
   warehouse: unknown,
   remoteResolver: RemoteTypeDefResolver | undefined,
-  requestSequence: readonly number[] | null,
+  requestSequence: readonly bigint[] | null,
 ): Promise<unknown[]> {
+  ensureCollectionCount(warehouse, subTrus.length, pointerSize);
   const results: unknown[] = [];
   let offset = tdu.payloadOffset;
   let length = tdu.payloadLength;

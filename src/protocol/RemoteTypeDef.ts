@@ -22,8 +22,10 @@ import { EventDefFlags } from "../data/types/EventDefFlags.js";
 import { ArgumentDefFlags } from "../data/types/ArgumentDefFlags.js";
 import {
   ArgumentTemplate,
+  ConstantTemplate,
   EventTemplate,
   FunctionTemplate,
+  type MemberMetadata,
   PropertyTemplate,
   TypeDef,
 } from "../resource/template.js";
@@ -105,6 +107,7 @@ export interface RemoteEventDef extends RemoteMemberMetadata {
   inherited: boolean;
   subscribable: boolean;
   autoDelivered?: boolean;
+  historical: boolean;
   orderingControl?: number;
   historyControl?: number;
   annotations?: Map<string, string>;
@@ -120,11 +123,17 @@ export interface RemoteConstantDef extends RemoteMemberMetadata {
 }
 
 export interface RemoteTypeDefSnapshot {
-  id: number;
+  id: number | string;
   name: string;
   kind: string;
   version: number;
-  parentTypeId?: number;
+  parentTypeId?: number | string;
+  namespace?: string;
+  usage?: string;
+  description?: string;
+  example?: unknown;
+  category?: string;
+  since?: string;
   annotations?: Record<string, string>;
   properties: Array<Record<string, unknown>>;
   functions: Array<Record<string, unknown>>;
@@ -132,22 +141,37 @@ export interface RemoteTypeDefSnapshot {
   constants: Array<Record<string, unknown>>;
 }
 
+export interface RemoteTypeDefMetadata {
+  namespace?: string;
+  usage?: string;
+  description?: string;
+  example?: unknown;
+  category?: string;
+  since?: string;
+}
+
 export class RemoteTypeDef implements ITypeDef {
   template = new TypeDef("", []);
 
   private cachedProperties: TypeDefProperty[] = [];
-  private _id = 0;
+  private _id = 0n;
   private _kind = TypeDefKind.Resource;
   private _name = "";
   private _version = 0;
-  private _parentTypeId: number | undefined;
+  private _parentTypeId: bigint | undefined;
   private _annotations: Map<string, string> | undefined;
+  private _namespace: string | undefined;
+  private _usage: string | undefined;
+  private _description: string | undefined;
+  private _example: unknown;
+  private _category: string | undefined;
+  private _since: string | undefined;
   private _remoteProperties: RemotePropertyDef[] = [];
   private _remoteFunctions: RemoteFunctionDef[] = [];
   private _remoteEvents: RemoteEventDef[] = [];
   private _remoteConstants: RemoteConstantDef[] = [];
 
-  get id(): number {
+  get id(): bigint {
     return this._id;
   }
 
@@ -163,12 +187,36 @@ export class RemoteTypeDef implements ITypeDef {
     return this._version;
   }
 
-  get parentTypeId(): number | undefined {
+  get parentTypeId(): bigint | undefined {
     return this._parentTypeId;
   }
 
   get annotations(): Map<string, string> | undefined {
     return this._annotations;
+  }
+
+  get namespace(): string | undefined {
+    return this._namespace;
+  }
+
+  get usage(): string | undefined {
+    return this._usage;
+  }
+
+  get description(): string | undefined {
+    return this._description;
+  }
+
+  get example(): unknown {
+    return this._example;
+  }
+
+  get category(): string | undefined {
+    return this._category;
+  }
+
+  get since(): string | undefined {
+    return this._since;
   }
 
   get remoteProperties(): ReadonlyArray<RemotePropertyDef> {
@@ -188,16 +236,17 @@ export class RemoteTypeDef implements ITypeDef {
   }
 
   hydrate(
-    id: number,
+    id: bigint,
     kind: TypeDefKind,
     name: string,
     version: number,
-    parentTypeId: number | undefined,
+    parentTypeId: bigint | undefined,
     annotations: Map<string, string> | undefined,
     remoteProperties: RemotePropertyDef[],
     remoteFunctions: RemoteFunctionDef[],
     remoteEvents: RemoteEventDef[],
     remoteConstants: RemoteConstantDef[],
+    metadata: RemoteTypeDefMetadata = {},
   ): void {
     this._id = id;
     this._kind = kind;
@@ -205,6 +254,12 @@ export class RemoteTypeDef implements ITypeDef {
     this._version = version;
     this._parentTypeId = parentTypeId;
     this._annotations = annotations;
+    this._namespace = metadata.namespace;
+    this._usage = metadata.usage;
+    this._description = metadata.description;
+    this._example = metadata.example;
+    this._category = metadata.category;
+    this._since = metadata.since;
     this._remoteProperties = remoteProperties;
     this._remoteFunctions = remoteFunctions;
     this._remoteEvents = remoteEvents;
@@ -212,7 +267,22 @@ export class RemoteTypeDef implements ITypeDef {
 
     const members = [
       ...remoteProperties.map(
-        (p) => new PropertyTemplate(p.name, p.index, p.valueType, false, p.annotations),
+        (p) => new PropertyTemplate(
+          p.name,
+          p.index,
+          p.valueType,
+          p.readOnly ?? false,
+          p.annotations,
+          p.hasHistory,
+          {
+            ...templateMemberMetadata(p),
+            constant: p.constant,
+            volatile: p.volatile,
+            orderingControl: p.orderingControl,
+            historyControl: p.historyControl,
+            defaultValue: p.defaultValue,
+          },
+        ),
       ),
       ...remoteFunctions.map(
         (f) =>
@@ -221,10 +291,21 @@ export class RemoteTypeDef implements ITypeDef {
             f.index,
             f.returnType,
             f.arguments.map(
-              (a) => new ArgumentTemplate(a.name, a.type, a.optional, a.annotations),
+              (a) => new ArgumentTemplate(a.name, a.type, a.optional, a.annotations, {
+                variadic: a.variadic,
+                defaultValue: a.defaultValue,
+              }),
             ),
             f.isStatic,
             f.annotations,
+            f.streamMode,
+            f.pausable,
+            {
+              ...templateMemberMetadata(f),
+              readOnly: f.readOnly,
+              idempotent: f.idempotent,
+              cancellable: f.cancellable,
+            },
           ),
       ),
       ...remoteEvents.map(
@@ -235,10 +316,36 @@ export class RemoteTypeDef implements ITypeDef {
             e.argumentType,
             e.annotations,
             e.subscribable,
+            e.historical,
+            {
+              ...templateMemberMetadata(e),
+              argumentName: e.argumentName,
+              orderingControl: e.orderingControl,
+              historyControl: e.historyControl,
+            },
           ),
       ),
+      ...remoteConstants.map(
+        (c) => new ConstantTemplate(
+          c.name,
+          c.index,
+          c.valueType,
+          c.value,
+          c.annotations,
+          templateMemberMetadata(c),
+        ),
+      ),
     ];
-    this.template = new TypeDef(name, members, annotations);
+    this.template = new TypeDef(name, members, annotations, {
+      version,
+      parentTypeId,
+      namespace: metadata.namespace,
+      usage: metadata.usage,
+      description: metadata.description,
+      example: metadata.example,
+      category: metadata.category,
+      since: metadata.since,
+    });
     this.cachedProperties = remoteProperties.map((p) => ({
       name: p.name,
       valueType: p.valueType,
@@ -267,13 +374,20 @@ export class RemoteTypeDef implements ITypeDef {
 
   toJSON(): RemoteTypeDefSnapshot {
     return {
-      id: this.id,
+      id: jsonId(this.id),
       name: this.name,
       kind: TypeDefKind[this.kind] ?? String(this.kind),
       version: this.version,
-      parentTypeId: this.parentTypeId,
+      parentTypeId: this.parentTypeId == null ? undefined : jsonId(this.parentTypeId),
+      namespace: this.namespace,
+      usage: this.usage,
+      description: this.description,
+      example: this.example,
+      category: this.category,
+      since: this.since,
       annotations: mapToObject(this.annotations),
       properties: this.remoteProperties.map((p) => ({
+        ...memberSnapshot(p),
         index: p.index,
         name: p.name,
         type: p.valueType?.toString(),
@@ -283,11 +397,10 @@ export class RemoteTypeDef implements ITypeDef {
         readOnly: p.readOnly,
         constant: p.constant,
         volatile: p.volatile,
-        deprecated: p.deprecated,
-        description: p.description,
         annotations: mapToObject(p.annotations),
       })),
       functions: this.remoteFunctions.map((f) => ({
+        ...memberSnapshot(f),
         index: f.index,
         name: f.name,
         returnType: f.returnType?.toString(),
@@ -297,37 +410,39 @@ export class RemoteTypeDef implements ITypeDef {
         idempotent: f.idempotent,
         cancellable: f.cancellable,
         pausable: f.pausable,
-        deprecated: f.deprecated,
-        description: f.description,
         arguments: f.arguments.map((a) => ({
+          ...memberSnapshot(a),
           index: a.index,
           name: a.name,
           type: a.type?.toString(),
           optional: a.optional,
           variadic: a.variadic,
+          defaultValue: a.defaultValue,
           annotations: mapToObject(a.annotations),
         })),
         annotations: mapToObject(f.annotations),
       })),
       events: this.remoteEvents.map((e) => ({
+        ...memberSnapshot(e),
         index: e.index,
         name: e.name,
         argumentType: e.argumentType?.toString(),
         inherited: e.inherited,
         subscribable: e.subscribable,
         autoDelivered: e.autoDelivered,
-        deprecated: e.deprecated,
-        description: e.description,
+        historical: e.historical,
+        argumentName: e.argumentName,
+        orderingControl: e.orderingControl,
+        historyControl: e.historyControl,
         annotations: mapToObject(e.annotations),
       })),
       constants: this.remoteConstants.map((c) => ({
+        ...memberSnapshot(c),
         index: c.index,
         name: c.name,
         type: c.valueType?.toString(),
         value: c.value,
         inherited: c.inherited,
-        deprecated: c.deprecated,
-        description: c.description,
         annotations: mapToObject(c.annotations),
       })),
     };
@@ -349,15 +464,15 @@ export class RemoteTypeDef implements ITypeDef {
     const hasClassAnnotation = (flags & 0x40) > 0;
     const kind = (flags & 0x0f) as TypeDefKind;
 
-    const id = Number(DC.getUint64(data, offset));
+    const id = DC.getUint64(data, offset);
     offset += 8;
 
     const name = readName(data, offset);
     offset = name.offset;
 
-    let parentTypeId: number | undefined;
+    let parentTypeId: bigint | undefined;
     if (hasParent) {
-      parentTypeId = Number(DC.getUint64(data, offset));
+      parentTypeId = DC.getUint64(data, offset);
       offset += 8;
     }
 
@@ -425,7 +540,7 @@ export class RemoteTypeDef implements ITypeDef {
     data: Uint8Array,
     warehouse: unknown = null,
     remoteResolver?: RemoteTypeDefResolver,
-    requestSequence: readonly number[] | null = null,
+    requestSequence: readonly bigint[] | null = null,
   ): Promise<RemoteTypeDef> {
     return RemoteTypeDef.parseAsyncInto(
       new RemoteTypeDef(),
@@ -441,7 +556,7 @@ export class RemoteTypeDef implements ITypeDef {
     data: Uint8Array,
     warehouse: unknown = null,
     remoteResolver?: RemoteTypeDefResolver,
-    requestSequence: readonly number[] | null = null,
+    requestSequence: readonly bigint[] | null = null,
   ): Promise<RemoteTypeDef> {
     if ((data[0] & 0xc7) === TduIdentifier.TypeDef) {
       const parsed = await parseAsync(data, 0, warehouse, remoteResolver, requestSequence);
@@ -457,15 +572,15 @@ export class RemoteTypeDef implements ITypeDef {
     const hasClassAnnotation = (flags & 0x40) > 0;
     const kind = (flags & 0x0f) as TypeDefKind;
 
-    const id = Number(DC.getUint64(data, offset));
+    const id = DC.getUint64(data, offset);
     offset += 8;
 
     const name = readName(data, offset);
     offset = name.offset;
 
-    let parentTypeId: number | undefined;
+    let parentTypeId: bigint | undefined;
     if (hasParent) {
-      parentTypeId = Number(DC.getUint64(data, offset));
+      parentTypeId = DC.getUint64(data, offset);
       offset += 8;
     }
 
@@ -590,10 +705,17 @@ function applyInfo(target: RemoteTypeDef, info: TypeDefInfo): void {
   const events = (info.events ?? []).map((e) => toRemoteEvent(e));
   const constants = (info.constants ?? []).map((c) => toRemoteConstant(c));
 
+  const qualifiedName =
+    !info.namespace ||
+    info.name.startsWith(`${info.namespace}.`) ||
+    info.name.startsWith(`${info.namespace}+`)
+      ? info.name
+      : `${info.namespace}.${info.name}`;
+
   target.hydrate(
     info.id,
     info.kind,
-    info.name,
+    qualifiedName,
     info.version,
     info.parent,
     info.annotations,
@@ -601,6 +723,14 @@ function applyInfo(target: RemoteTypeDef, info: TypeDefInfo): void {
     functions,
     events,
     constants,
+    {
+      namespace: info.namespace,
+      usage: info.usage,
+      description: info.description,
+      example: info.example,
+      category: info.category,
+      since: info.since,
+    },
   );
 }
 
@@ -658,6 +788,7 @@ function toRemoteEvent(e: EventDefInfo): RemoteEventDef {
     // events as subscribable (matches typical Subscribe/Unsubscribe usage).
     subscribable: (flags & EventDefFlags.AutoDelivered) === 0,
     autoDelivered: (flags & EventDefFlags.AutoDelivered) !== 0,
+    historical: (flags & EventDefFlags.Historical) !== 0 || e.historyControl !== 0,
     orderingControl: e.orderingControl,
     historyControl: e.historyControl,
     annotations: e.annotations,
@@ -688,6 +819,7 @@ function toRemoteArgument(a: ArgumentDefInfo): RemoteArgumentDef {
     variadic: (flags & ArgumentDefFlags.Variadic) !== 0,
     defaultValue: a.defaultValue,
     annotations: a.annotations,
+    ...memberMetadata(a),
   };
 }
 
@@ -710,7 +842,7 @@ function memberMetadata(m: MemberDefInfo): RemoteMemberMetadata {
   if (m.postconditions !== undefined) meta.postconditions = m.postconditions;
   if (m.effects !== undefined) meta.effects = m.effects;
   if (m.warnings !== undefined) meta.warnings = m.warnings;
-  if (m.relatedMembers !== undefined) meta.relatedMembers = m.relatedMembers;
+  if (m.relatedMembers !== undefined) meta.relatedMembers = Array.from(m.relatedMembers);
   return meta;
 }
 
@@ -769,7 +901,7 @@ async function parseFunctionAsync(
   inherited: boolean,
   warehouse: unknown,
   remoteResolver: RemoteTypeDefResolver | undefined,
-  requestSequence: readonly number[] | null,
+  requestSequence: readonly bigint[] | null,
 ): Promise<{ value: RemoteFunctionDef; offset: number }> {
   const header = data[offset++];
   const isStatic = (header & 0x04) > 0;
@@ -869,7 +1001,7 @@ async function parsePropertyAsync(
   inherited: boolean,
   warehouse: unknown,
   remoteResolver: RemoteTypeDefResolver | undefined,
-  requestSequence: readonly number[] | null,
+  requestSequence: readonly bigint[] | null,
 ): Promise<{ value: RemotePropertyDef; offset: number }> {
   const header = data[offset++];
   const hasAnnotations = (header & 0x08) > 0;
@@ -940,6 +1072,7 @@ function parseEvent(
       argumentType: argType.value,
       inherited,
       subscribable,
+      historical: false,
       annotations,
     },
     offset,
@@ -953,7 +1086,7 @@ async function parseEventAsync(
   inherited: boolean,
   warehouse: unknown,
   remoteResolver: RemoteTypeDefResolver | undefined,
-  requestSequence: readonly number[] | null,
+  requestSequence: readonly bigint[] | null,
 ): Promise<{ value: RemoteEventDef; offset: number }> {
   const header = data[offset++];
   const hasAnnotations = (header & 0x10) > 0;
@@ -985,6 +1118,7 @@ async function parseEventAsync(
       argumentType: argType.value,
       inherited,
       subscribable,
+      historical: false,
       annotations,
     },
     offset,
@@ -1032,7 +1166,7 @@ async function parseArgumentAsync(
   index: number,
   warehouse: unknown,
   remoteResolver: RemoteTypeDefResolver | undefined,
-  requestSequence: readonly number[] | null,
+  requestSequence: readonly bigint[] | null,
 ): Promise<{ value: RemoteArgumentDef; offset: number }> {
   const header = data[offset++];
   const optional = (header & 0x01) > 0;
@@ -1115,7 +1249,7 @@ async function parseConstantAsync(
   inherited: boolean,
   warehouse: unknown,
   remoteResolver: RemoteTypeDefResolver | undefined,
-  requestSequence: readonly number[] | null,
+  requestSequence: readonly bigint[] | null,
 ): Promise<{ value: RemoteConstantDef; offset: number }> {
   const header = data[offset++];
   const hasAnnotations = (header & 0x10) > 0;
@@ -1197,4 +1331,54 @@ function asStringMap(value: unknown): Map<string, string> | undefined {
 function mapToObject(map: Map<string, string> | undefined): Record<string, string> | undefined {
   if (!map) return undefined;
   return Object.fromEntries(map.entries());
+}
+
+function jsonId(value: bigint): number | string {
+  return value <= BigInt(Number.MAX_SAFE_INTEGER) ? Number(value) : value.toString();
+}
+
+function templateMemberMetadata(source: RemoteMemberMetadata): MemberMetadata {
+  return {
+    inherited: "inherited" in source ? Boolean(source.inherited) : false,
+    deprecated: source.deprecated,
+    deprecationMessage: source.deprecationMessage,
+    description: source.description,
+    usage: source.usage,
+    examples: source.examples,
+    tags: source.tags,
+    unit: source.unit,
+    minimum: source.minimum,
+    maximum: source.maximum,
+    allowedValues: source.allowedValues,
+    pattern: source.pattern,
+    format: source.format,
+    preconditions: source.preconditions,
+    postconditions: source.postconditions,
+    effects: source.effects,
+    warnings: source.warnings,
+    relatedMembers: source.relatedMembers,
+  };
+}
+
+function memberSnapshot(source: RemoteMemberMetadata): Record<string, unknown> {
+  return {
+    inherited: "inherited" in source ? Boolean(source.inherited) : undefined,
+    deprecated: source.deprecated,
+    deprecationMessage: source.deprecationMessage,
+    description: source.description,
+    usage: source.usage,
+    examples: source.examples,
+    tags: source.tags,
+    unit: source.unit,
+    minimum: source.minimum,
+    maximum: source.maximum,
+    allowedValues: source.allowedValues,
+    pattern: source.pattern,
+    format: source.format,
+    preconditions: source.preconditions,
+    postconditions: source.postconditions,
+    effects: source.effects,
+    warnings: source.warnings,
+    relatedMembers: source.relatedMembers,
+  };
 }

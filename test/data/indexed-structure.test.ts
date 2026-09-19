@@ -121,7 +121,7 @@ describe("TduIdentifier.TypeDef (0x81) / TRU (0x82) wire framing", () => {
   it("composes and decodes a TypeDefInfo through the dedicated 0x81 slot", () => {
     const info = new TypeDefInfo();
     info.version = 1;
-    info.id = 42;
+    info.id = 42n;
     info.name = "MyResource";
     info.kind = TypeDefKind.Resource;
 
@@ -153,7 +153,7 @@ describe("TduIdentifier.TypeDef (0x81) / TRU (0x82) wire framing", () => {
     const decoded = parse(bytes);
     expect(decoded).toBeInstanceOf(TypeDefInfo);
     const d = decoded as TypeDefInfo;
-    expect(d.id).toBe(42);
+    expect(d.id).toBe(42n);
     expect(d.name).toBe("MyResource");
     expect(d.kind).toBe(TypeDefKind.Resource);
 

@@ -1,5 +1,6 @@
 import { Tdu } from "./Tdu.js";
 import { TduIdentifier } from "./TduIdentifier.js";
+import { ensureRemoteAllocation, saturatedMultiply } from "./ParserGuard.js";
 import { Decimal128 } from "./Decimal128.js";
 import { Uuid } from "./Uuid.js";
 import * as DC from "./DC.js";
@@ -130,8 +131,9 @@ export function dateTimeComposer(value: Date): Tdu {
   return fixed(TduIdentifier.DateTime, DC.dateTimeToBytes(value));
 }
 
-export function stringComposer(value: string): Tdu {
+export function stringComposer(value: string, connection: unknown = null): Tdu {
   const b = DC.stringToBytes(value);
+  ensureRemoteAllocation(connection, saturatedMultiply(b.length, 2), "string");
   return new Tdu(TduIdentifier.String, b, b.length);
 }
 
@@ -139,7 +141,8 @@ export function uuidComposer(value: Uuid): Tdu {
   return fixed(TduIdentifier.UUID, value.data);
 }
 
-export function rawDataComposer(value: Uint8Array): Tdu {
+export function rawDataComposer(value: Uint8Array, connection: unknown = null): Tdu {
+  ensureRemoteAllocation(connection, value.length, "raw data");
   return new Tdu(TduIdentifier.RawData, value, value.length);
 }
 

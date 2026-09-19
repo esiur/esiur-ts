@@ -4,11 +4,26 @@ import * as DC from "./DC.js";
 import { registerTruParser, registerTruParserAsync } from "./ParsedTdu.js";
 import type { ComposableTru } from "./Tdu.js";
 import type { ITypeDef } from "./types/ITypeDef.js";
+import { ensureTypeMetadataDepth } from "./ParserGuard.js";
 
-export type RemoteTypeDefResolver = (
-  id: number,
-  requestSequence: readonly number[] | null,
-) => ITypeDef | PromiseLike<ITypeDef>;
+export interface RemoteTypeDefResolver {
+  (
+  id: bigint,
+  requestSequence: readonly bigint[] | null,
+  ): ITypeDef | PromiseLike<ITypeDef>;
+
+  /** Resolve a peer-owned resource reference while decoding an async value. */
+  resolveRemoteResource?: (
+    id: number,
+    requestSequence: readonly bigint[] | null,
+  ) => unknown | PromiseLike<unknown>;
+
+  /** Resolve a resource owned by the local Warehouse. */
+  resolveLocalResource?: (id: number) => unknown | PromiseLike<unknown>;
+
+  /** Resolve a resource link through the active connection/Warehouse. */
+  resolveResourceLink?: (link: string) => unknown | PromiseLike<unknown>;
+}
 
 /**
  * Type-Representation Unit (port of C# `Tru`). Describes how a value's type maps
@@ -42,7 +57,9 @@ export abstract class Tru implements ComposableTru {
     data: Uint8Array,
     offset: number,
     warehouse: unknown = null,
+    depth = 1,
   ): { value: Tru; size: number } {
+    ensureTypeMetadataDepth(warehouse, depth);
     const start = offset;
     const header = data[offset++];
     const nullable = (header & 0x80) > 0;
@@ -61,7 +78,7 @@ export abstract class Tru implements ComposableTru {
 
       const subTypes: Tru[] = [];
       for (let i = 0; i < subsCount; i++) {
-        const pr = Tru.parseSync(data, offset, warehouse);
+        const pr = Tru.parseSync(data, offset, warehouse, depth + 1);
         subTypes.push(pr.value);
         offset += pr.size;
       }
@@ -77,8 +94,10 @@ export abstract class Tru implements ComposableTru {
     offset: number,
     warehouse: unknown = null,
     remoteResolver?: RemoteTypeDefResolver,
-    requestSequence: readonly number[] | null = null,
+    requestSequence: readonly bigint[] | null = null,
+    depth = 1,
   ): Promise<{ value: Tru; size: number }> {
+    ensureTypeMetadataDepth(warehouse, depth);
     const start = offset;
     const header = data[offset++];
     const nullable = (header & 0x80) > 0;
@@ -102,6 +121,7 @@ export abstract class Tru implements ComposableTru {
           warehouse,
           remoteResolver,
           requestSequence,
+          depth + 1,
         );
         subTypes.push(pr.value);
         offset += pr.size;
@@ -171,10 +191,10 @@ export class TruComposite extends Tru {
 }
 
 /** Smallest local-typedef identifier that can carry `id`. */
-function localTypeIdentifier(id: number): TruIdentifier {
-  if (id <= 0xff) return TruIdentifier.LocalType8;
-  if (id <= 0xffff) return TruIdentifier.LocalType16;
-  if (id <= 0xffffffff) return TruIdentifier.LocalType32;
+function localTypeIdentifier(id: bigint): TruIdentifier {
+  if (id <= 0xffn) return TruIdentifier.LocalType8;
+  if (id <= 0xffffn) return TruIdentifier.LocalType16;
+  if (id <= 0xffff_ffffn) return TruIdentifier.LocalType32;
   return TruIdentifier.LocalType64;
 }
 
@@ -183,24 +203,24 @@ function readTypeDefId(
   data: Uint8Array,
   offset: number,
   identifier: TruIdentifier,
-): { id: number; remote: boolean; size: number } {
+): { id: bigint; remote: boolean; size: number } {
   switch (identifier) {
     case TruIdentifier.LocalType8:
-      return { id: DC.getUint8(data, offset), remote: false, size: 1 };
+      return { id: BigInt(DC.getUint8(data, offset)), remote: false, size: 1 };
     case TruIdentifier.RemoteType8:
-      return { id: DC.getUint8(data, offset), remote: true, size: 1 };
+      return { id: BigInt(DC.getUint8(data, offset)), remote: true, size: 1 };
     case TruIdentifier.LocalType16:
-      return { id: DC.getUint16(data, offset), remote: false, size: 2 };
+      return { id: BigInt(DC.getUint16(data, offset)), remote: false, size: 2 };
     case TruIdentifier.RemoteType16:
-      return { id: DC.getUint16(data, offset), remote: true, size: 2 };
+      return { id: BigInt(DC.getUint16(data, offset)), remote: true, size: 2 };
     case TruIdentifier.LocalType32:
-      return { id: DC.getUint32(data, offset), remote: false, size: 4 };
+      return { id: BigInt(DC.getUint32(data, offset)), remote: false, size: 4 };
     case TruIdentifier.RemoteType32:
-      return { id: DC.getUint32(data, offset), remote: true, size: 4 };
+      return { id: BigInt(DC.getUint32(data, offset)), remote: true, size: 4 };
     case TruIdentifier.LocalType64:
-      return { id: Number(DC.getUint64(data, offset)), remote: false, size: 8 };
+      return { id: DC.getUint64(data, offset), remote: false, size: 8 };
     case TruIdentifier.RemoteType64:
-      return { id: Number(DC.getUint64(data, offset)), remote: true, size: 8 };
+      return { id: DC.getUint64(data, offset), remote: true, size: 8 };
     default:
       throw new Error("Invalid Tru typedef identifier.");
   }
@@ -208,8 +228,8 @@ function readTypeDefId(
 
 async function resolveRemoteTypeDef(
   resolver: RemoteTypeDefResolver | undefined,
-  id: number,
-  requestSequence: readonly number[] | null,
+  id: bigint,
+  requestSequence: readonly bigint[] | null,
 ): Promise<ITypeDef> {
   if (!resolver)
     throw new Error("Remote type definitions require a connection.");
@@ -230,16 +250,16 @@ export class TruTypeDef extends Tru {
     let idBytes: Uint8Array;
     switch (this.identifier) {
       case TruIdentifier.LocalType8:
-        idBytes = Uint8Array.of(id & 0xff);
+        idBytes = Uint8Array.of(Number(id & 0xffn));
         break;
       case TruIdentifier.LocalType16:
-        idBytes = DC.uint16ToBytes(id);
+        idBytes = DC.uint16ToBytes(Number(id));
         break;
       case TruIdentifier.LocalType32:
-        idBytes = DC.uint32ToBytes(id);
+        idBytes = DC.uint32ToBytes(Number(id));
         break;
       default:
-        idBytes = DC.uint64ToBytes(BigInt(id));
+        idBytes = DC.uint64ToBytes(id);
         break;
     }
     return merge(Uint8Array.of(this.headerByte), idBytes);
@@ -259,13 +279,13 @@ export class TruTypeDef extends Tru {
 }
 
 /** Resolves a typedef id to its definition (registered by the resource layer). */
-let typeDefResolver: (warehouse: unknown, id: number) => ITypeDef = () => {
+let typeDefResolver: (warehouse: unknown, id: bigint) => ITypeDef = () => {
   throw new Error("No TypeDef resolver registered (import the resource layer).");
 };
 
 /** Register the typedef resolver used when decoding TypeDef-referencing Trus. */
 export function registerTypeDefResolver(
-  fn: (warehouse: unknown, id: number) => ITypeDef,
+  fn: (warehouse: unknown, id: bigint) => ITypeDef,
 ): void {
   typeDefResolver = fn;
 }

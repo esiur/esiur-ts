@@ -28,7 +28,7 @@ export interface TypeDefConstant {
  * independent of the resource model.
  */
 export interface ITypeDef {
-  readonly id: number;
+  readonly id: bigint;
   readonly kind: TypeDefKind;
   readonly name: string;
   readonly properties: ReadonlyArray<TypeDefProperty>;

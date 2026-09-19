@@ -1,4 +1,6 @@
 export * from "./ResourceOperation.js";
+export * from "./ResourceCursor.js";
+export * from "./ResourceJournal.js";
 export * from "./template.js";
 export * from "./decorators.js";
 export * from "./IResource.js";
@@ -7,5 +9,7 @@ export * from "./Resource.js";
 export * from "./typedef.js";
 export * from "./records.js";
 export * from "./enums.js";
+export * from "./resources.js";
 export * from "./Warehouse.js";
+export * from "./WarehouseConfiguration.js";
 export * from "./reactive.js";

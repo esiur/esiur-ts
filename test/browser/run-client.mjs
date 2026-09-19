@@ -15,8 +15,10 @@ const profileDir = join(profileRoot, `browser-client-${process.pid}`);
 
 let serverProcess;
 let browserProcess;
+let dotnetProcess;
 let cdp;
 let browserErrors = "";
+const dotnetFlowGraph = process.argv.includes("--dotnet-flow-graph");
 
 try {
   const browserPath = findBrowser();
@@ -28,8 +30,29 @@ try {
 
   await mkdir(profileDir, { recursive: true });
 
+  let serverEnvironment = process.env;
+  if (dotnetFlowGraph) {
+    const interopPort = await getFreePort();
+    const interopDll = join(projectRoot, "interop", "bin", "Release", "net10.0", "InteropServer.dll");
+    if (!existsSync(interopDll)) {
+      throw new Error(`The .NET interop fixture is not built: ${interopDll}`);
+    }
+    dotnetProcess = spawn("dotnet", [interopDll], {
+      cwd: projectRoot,
+      env: { ...process.env, ESIUR_INTEROP_PORT: String(interopPort) },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    await waitForOutput(dotnetProcess, `ESIUR-INTEROP-READY ${interopPort}`, 15000);
+    serverEnvironment = {
+      ...process.env,
+      ESIUR_BROWSER_EP_URL: `ws://127.0.0.1:${interopPort}`,
+      ESIUR_BROWSER_FIXTURE: "dotnet-flow-graph",
+    };
+  }
+
   serverProcess = spawn(process.execPath, [serverScript], {
     cwd: projectRoot,
+    env: serverEnvironment,
     stdio: ["ignore", "pipe", "pipe"],
   });
 
@@ -72,7 +95,35 @@ try {
   await closeCdp();
   await stopProcess(browserProcess);
   await stopProcess(serverProcess);
+  await stopProcess(dotnetProcess);
   await removeProfileDir();
+}
+
+function waitForOutput(child, expected, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    let output = "";
+    let settled = false;
+    const timeout = setTimeout(() => fail(new Error(`Timed out waiting for '${expected}'.\n${output}`)), timeoutMs);
+    const done = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      resolve();
+    };
+    const fail = (error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      reject(error);
+    };
+    const read = (chunk) => {
+      output += chunk.toString();
+      if (output.includes(expected)) done();
+    };
+    child.stdout?.on("data", read);
+    child.stderr?.on("data", read);
+    child.once("exit", (code, signal) => fail(new Error(`Process exited before '${expected}' (${code ?? signal}).\n${output}`)));
+  });
 }
 
 function findBrowser() {
@@ -218,7 +269,7 @@ function connectCdp(url) {
 }
 
 async function waitForBrowserResult(client) {
-  const deadline = Date.now() + 15000;
+  const deadline = Date.now() + (dotnetFlowGraph ? 45000 : 15000);
   let lastState = null;
 
   while (Date.now() < deadline) {

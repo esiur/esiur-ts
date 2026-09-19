@@ -22,4 +22,10 @@ export interface AuthenticationSession {
   symetricCipher: ISymetricCipher | null;
   /** True once outbound/inbound records are actually being protected. */
   encryptionActive: boolean;
+  /** Parser and record budgets advertised by the remote peer; zero means unknown/unbounded. */
+  remoteMaximumPacketSize?: number;
+  remoteMaximumAllocationSize?: number;
+  remoteMaximumCollectionItems?: number;
+  remoteMaximumTypeMetadataDepth?: number;
+  remoteMaximumEncryptedRecordSize?: number;
 }

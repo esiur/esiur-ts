@@ -1,6 +1,6 @@
 {
   "name": "esiur",
-  "version": "3.0.1",
+  "version": "3.1.0",
   "description": "Distributed Object Framework for TypeScript - real-time properties, async invocation and events over the Esiur EP protocol.",
   "type": "module",
   "exports": {
@@ -23,19 +23,23 @@
   },
   "files": [
     "dist",
-    "bin"
+    "bin",
+    "CHANGELOG.md"
   ],
   "scripts": {
     "build": "tsup",
     "check": "npm run typecheck && npm run lint && npm test",
+    "check:release": "npm run check && npm run test:interop && npm run build",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
+    "test:interop": "node interop/run.mjs",
     "test:watch": "vitest",
     "test:browser-client": "npm run build && node test/browser/run-client.mjs",
+    "test:browser-dotnet": "npm run build && dotnet build interop/InteropServer.csproj -c Release --nologo && node test/browser/run-client.mjs --dotnet-flow-graph",
     "serve:browser-client": "npm run build && node test/browser/server.mjs",
     "lint": "eslint .",
     "prepack": "npm run build",
-    "prepublishOnly": "npm run check"
+    "prepublishOnly": "npm run check:release"
   },
   "keywords": [
     "esiur",
@@ -74,6 +78,9 @@
       "optional": true
     }
   },
+  "overrides": {
+    "esbuild": "0.28.2"
+  },
   "devDependencies": {
     "@eslint/js": "^9.39.4",
     "@types/node": "^22.10.0",
@@ -86,7 +93,8 @@
     "tsup": "^8.3.5",
     "typescript": "^5.7.2",
     "typescript-eslint": "^8.60.1",
-    "vitest": "^3.2.6",
+    "vite": "^7.3.6",
+    "vitest": "^4.1.11",
     "ws": "^8.21.0"
   }
 }

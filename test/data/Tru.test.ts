@@ -6,7 +6,7 @@ import * as DC from "../../src/data/DC.js";
 
 function fakeTypeDef(id: number): ITypeDef {
   return {
-    id,
+    id: BigInt(id),
     kind: TypeDefKind.Record,
     name: `Type${id}`,
     properties: [],

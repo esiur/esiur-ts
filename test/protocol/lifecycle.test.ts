@@ -15,6 +15,13 @@ class Counter extends Resource {
   @Export(t.i32) accessor count = 0;
 }
 
+class HangingResource extends Resource {
+  @Export(t.string)
+  waitForever(): Promise<string> {
+    return new Promise(() => {});
+  }
+}
+
 class AllowManager implements IPermissionsManager {
   readonly managerCategory = "permissions" as const;
   readonly settings = undefined;
@@ -119,6 +126,7 @@ describe("Resource lifecycle: Create / Delete / Move / Detach", () => {
     await waitFor(() => resA.count === 1 && resB.count === 1);
 
     await clientA.detach(id);
+    expect(clientA.getAttachedResource(id)).toBeUndefined();
 
     counter.count = 2;
     await waitFor(() => resB.count === 2);
@@ -128,5 +136,67 @@ describe("Resource lifecycle: Create / Delete / Move / Detach", () => {
     clientA.close();
     clientB.close();
     await server.close();
+  });
+
+  it("detach releases reconnect state even after the transport closes", async () => {
+    const wh = new Warehouse();
+    wh.registerManager(new AllowManager(), true);
+    await wh.put("sys", new MemoryStore());
+    const counter = await wh.put("sys/counter", new Counter());
+    await wh.open();
+    const id = counter.instance!.id;
+    const typeDef = wh.getTypeDef(Counter);
+
+    const server = await EpServer.listen({ port: 0, warehouse: wh });
+    const client = await EpConnection.connect(`ws://127.0.0.1:${server.port}`);
+    await client.attach(id, typeDef);
+    expect(client.getAttachedResource(id)).toBeDefined();
+
+    client.close();
+    await waitFor(() => !client.isConnected);
+    await client.detach(id);
+    expect(client.getAttachedResource(id)).toBeUndefined();
+
+    await server.close();
+  });
+
+  it("fails in-flight requests when the transport disconnects", async () => {
+    const wh = new Warehouse();
+    wh.registerManager(new AllowManager(), true);
+    await wh.put("sys", new MemoryStore());
+    const hanging = await wh.put("sys/hanging", new HangingResource());
+    await wh.open();
+    const server = await EpServer.listen({ port: 0, warehouse: wh });
+    const client = await EpConnection.connect(`ws://127.0.0.1:${server.port}`);
+    const index = wh.getTypeDef(HangingResource).getFunctionByName("waitForever")!.index;
+
+    const pending = client.invoke(hanging.instance!.id, index);
+    client.close();
+
+    await expect(pending).rejects.toMatchObject({
+      code: ExceptionCode.HostNotReachable,
+    } as Partial<AsyncException>);
+    await server.close();
+    await wh.close();
+  });
+
+  it("rejects requests made while disconnected instead of leaving them pending", async () => {
+    const wh = new Warehouse();
+    wh.registerManager(new AllowManager(), true);
+    await wh.put("sys", new MemoryStore());
+    const counter = await wh.put("sys/counter", new Counter());
+    await wh.open();
+    const server = await EpServer.listen({ port: 0, warehouse: wh });
+    const client = await EpConnection.connect(`ws://127.0.0.1:${server.port}`);
+
+    client.close();
+    await waitFor(() => !client.isConnected);
+
+    await expect(client.invoke(counter.instance!.id, 0)).rejects.toMatchObject({
+      code: ExceptionCode.HostNotReachable,
+    } as Partial<AsyncException>);
+
+    await server.close();
+    await wh.close();
   });
 });

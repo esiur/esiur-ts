@@ -9,6 +9,8 @@ import { Export } from "../../src/resource/decorators.js";
 import { t } from "../../src/data/descriptors.js";
 import type { IPermissionsManager } from "../../src/security/permissions/IPermissionsManager.js";
 import { Ruling } from "../../src/security/permissions/Ruling.js";
+import { AsyncReply } from "../../src/core/AsyncReply.js";
+import { EpPacketRequest } from "../../src/net/packets/EpPacketRequest.js";
 
 /**
  * Matches esiur-dotnet's current default: any action not explicitly allowed
@@ -43,6 +45,26 @@ class HelloResource extends Resource {
 }
 
 describe("EpConnection remote invoke (TS ↔ TS)", () => {
+  it("does not block request replies behind an unrelated notification decode", async () => {
+    const connection = new EpConnection();
+    const unresolvedNotification = new Promise<void>(() => undefined);
+    (connection as unknown as { notificationQueue: Promise<void> }).notificationQueue =
+      unresolvedNotification;
+    connection.sendRequest = ((action: EpPacketRequest) => {
+      expect([
+        EpPacketRequest.InvokeFunction,
+        EpPacketRequest.StaticCall,
+        EpPacketRequest.SetProperty,
+      ]).toContain(action);
+      return AsyncReply.fromResult("completed");
+    }) as EpConnection["sendRequest"];
+
+    await expect(Promise.resolve(connection.invoke(1, 0))).resolves.toBe("completed");
+    await expect(Promise.resolve(connection.invokeWithArguments(1, 0, []))).resolves.toBe("completed");
+    await expect(Promise.resolve(connection.staticCall(1n, 0))).resolves.toBe("completed");
+    await expect(Promise.resolve(connection.set(1, 0, true))).resolves.toBe("completed");
+  });
+
   it("invokes remote functions (sync + async) and sets a remote property", async () => {
     const wh = new Warehouse();
     wh.registerManager(new AllowAllPermissionsManager(), true);

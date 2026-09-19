@@ -39,7 +39,7 @@ describe("TypeDef server-answering (TypeDefIdsByNames / Query / LinkTypeDefs)", 
     await server.close();
   });
 
-  it("Query replies with a resource's children, distinct from GetResourceIdByLink's bare id", async () => {
+  it("Query replies with attached child resources, distinct from GetResourceIdByLink's bare id", async () => {
     const wh = new Warehouse();
     await wh.put("sys", new MemoryStore());
     await wh.put("sys/parent", new Parent());
@@ -51,9 +51,9 @@ describe("TypeDef server-answering (TypeDefIdsByNames / Query / LinkTypeDefs)", 
 
     const children = await client.queryResources("sys/parent");
     expect(children).toHaveLength(1);
-    const [id, link] = children[0];
-    expect(typeof id).toBe("number");
-    expect(link).toBe("sys/parent/kid");
+    expect(children[0].instanceId).toBe(3);
+    expect(children[0].link).toBe("sys/parent/kid");
+    expect((children[0] as unknown as { value: number }).value).toBe(0);
 
     client.close();
     await server.close();

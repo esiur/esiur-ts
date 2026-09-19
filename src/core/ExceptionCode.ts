@@ -44,4 +44,10 @@ export enum ExceptionCode {
   NotSupported,
   NotImplemented,
   NotAllowed,
+  RateLimitExceeded,
+  ParserLimitExceeded,
+  AttachmentLimitExceeded,
+  AlreadyAttached,
+  ConnectionLimitExceeded,
+  CursorExpired,
 }

@@ -7,6 +7,7 @@ import { MemoryStore } from "../../src/stores/MemoryStore.js";
 import { Resource } from "../../src/resource/Resource.js";
 import { Export } from "../../src/resource/decorators.js";
 import { t } from "../../src/data/descriptors.js";
+import { ESIUR_DEFAULT_PORT, normalizeEsiurEndpoint } from "../../src/protocol/EpProtocol.js";
 
 class Greeter extends Resource {
   @Export(t.i32) accessor visits = 0;
@@ -19,15 +20,26 @@ class Greeter extends Resource {
 }
 
 describe("EpServer + EpConnection.connect (end-to-end API)", () => {
-  it("requires callers to supply a server port", async () => {
-    const wh = new Warehouse();
-    await expect(
-      EpServer.listen({ warehouse: wh } as unknown as Parameters<typeof EpServer.listen>[0]),
-    ).rejects.toThrow(/explicit port/i);
+  it("uses port 51018 when an endpoint omits its port", () => {
+    expect(ESIUR_DEFAULT_PORT).toBe(51018);
+    expect(normalizeEsiurEndpoint("ws://127.0.0.1/esiur")).toBe(
+      "ws://127.0.0.1:51018/esiur",
+    );
+    expect(normalizeEsiurEndpoint("ep://[::1]/sys/resource")).toBe(
+      "ep://[::1]:51018/sys/resource",
+    );
   });
 
-  it("rejects client endpoints without an explicit port", async () => {
-    await expect(EpConnection.connect("ws://127.0.0.1")).rejects.toThrow(/explicit port/i);
+  it("preserves an explicitly selected port", () => {
+    expect(normalizeEsiurEndpoint("ws://127.0.0.1:8080/esiur")).toBe(
+      "ws://127.0.0.1:8080/esiur",
+    );
+  });
+
+  it("rejects an invalid explicit client port", () => {
+    expect(() => normalizeEsiurEndpoint("ep://127.0.0.1:0/sys/resource")).toThrow(
+      /1 through 65535/i,
+    );
   });
 
   it("hosts a warehouse and serves a remote client", async () => {
@@ -48,6 +60,7 @@ describe("EpServer + EpConnection.connect (end-to-end API)", () => {
 
     expect(res.visits).toBe(0);
     expect(await res.greet("Sam")).toBe("Hi Sam");
+    await waitFor(() => res.visits === 1);
     expect(res.visits).toBe(1);
     expect(greeter.visits).toBe(1);
     expect(server.connections.size).toBe(1);
@@ -56,6 +69,15 @@ describe("EpServer + EpConnection.connect (end-to-end API)", () => {
     await server.close();
   });
 });
+
+async function waitFor(predicate: () => boolean, timeoutMs = 1_500): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (predicate()) return;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  expect(predicate()).toBe(true);
+}
 
 describe("EpServer WebSocket subprotocol enforcement", () => {
   it("accepts an upgrade that requests the EP subprotocol and negotiates it back", async () => {

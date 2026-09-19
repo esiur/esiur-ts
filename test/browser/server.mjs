@@ -11,6 +11,7 @@ import {
   PasswordAuthenticationProvider,
   PasswordHash,
   Resource,
+  Ruling,
   Warehouse,
   event,
   t,
@@ -21,6 +22,18 @@ const projectRoot = resolve(__dirname, "../..");
 const clientPassword = Uint8Array.of(1, 2, 3, 4, 5);
 const serverSalt = Uint8Array.of(6, 7, 8, 9, 10);
 const memberSymbol = Symbol.for("esiur.members");
+
+class AllowAllPermissionsManager {
+  managerCategory = "permissions";
+
+  applicable() {
+    return Ruling.Allowed;
+  }
+
+  initialize() {
+    return true;
+  }
+}
 
 class BrowserService extends Resource {
   #level = 1;
@@ -97,6 +110,7 @@ class BrowserServerAuthenticationProvider extends PasswordAuthenticationProvider
 
 const warehouse = new Warehouse();
 warehouse.RegisterAuthenticationProvider(new BrowserServerAuthenticationProvider());
+warehouse.registerPermissionsManager(new AllowAllPermissionsManager(), true);
 await warehouse.put("sys", new MemoryStore());
 const service = await warehouse.put("sys/service", new BrowserService());
 await warehouse.open();
@@ -119,11 +133,16 @@ const httpServer = http.createServer(async (req, res) => {
     }
 
     if (url.pathname === "/config.js") {
+      const configuredEpUrl = process.env.ESIUR_BROWSER_EP_URL;
+      const fixture = process.env.ESIUR_BROWSER_FIXTURE ?? "service";
       send(
         res,
         200,
         "application/javascript",
-        `window.__esiurBrowserClientTest = { epUrl: "ws://localhost:${epServer.port}" };\n`,
+        `window.__esiurBrowserClientTest = ${JSON.stringify({
+          epUrl: configuredEpUrl || `ws://localhost:${epServer.port}`,
+          fixture,
+        })};\n`,
       );
       return;
     }

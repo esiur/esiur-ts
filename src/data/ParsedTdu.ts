@@ -1,6 +1,6 @@
 import { TduClass } from "./TduClass.js";
 import { TduIdentifier } from "./TduIdentifier.js";
-import { DEFAULT_MAXIMUM_PAYLOAD_LENGTH, ensurePacketSize } from "./ParserGuard.js";
+import { ensurePacketSize, maximumPacketSize } from "./ParserGuard.js";
 
 /**
  * A decoded TDU header pointing back into the source buffer (port of C#
@@ -33,7 +33,7 @@ export class ParsedTdu {
     offset: number,
     ends: number,
     warehouse: unknown = null,
-    maximumPayloadLength: number = DEFAULT_MAXIMUM_PAYLOAD_LENGTH,
+    maximumPayloadLength?: number,
   ): ParsedTdu {
     let pos = offset;
     const h = data[pos++];
@@ -74,7 +74,7 @@ export class ParsedTdu {
     // Reject an oversized declaration before it can be used to size a buffer
     // or justify waiting for more bytes — checked ahead of the completeness
     // test below, which would otherwise treat it as merely "incomplete".
-    ensurePacketSize(cl, maximumPayloadLength);
+    ensurePacketSize(cl, maximumPacketSize(warehouse, maximumPayloadLength));
     if (ends - pos < cl) return ParsedTdu.invalid(cl - (ends - pos));
 
     // Only the plain `Typed` identifier (0x80, index 0) carries embedded Tru
@@ -123,8 +123,8 @@ export class ParsedTdu {
     ends: number,
     warehouse: unknown,
     remoteResolver: unknown,
-    requestSequence: readonly number[] | null,
-    maximumPayloadLength: number = DEFAULT_MAXIMUM_PAYLOAD_LENGTH,
+    requestSequence: readonly bigint[] | null,
+    maximumPayloadLength?: number,
   ): Promise<ParsedTdu> {
     let pos = offset;
     const h = data[pos++];
@@ -164,7 +164,7 @@ export class ParsedTdu {
     // Reject an oversized declaration before it can be used to size a buffer
     // or justify waiting for more bytes — checked ahead of the completeness
     // test below, which would otherwise treat it as merely "incomplete".
-    ensurePacketSize(cl, maximumPayloadLength);
+    ensurePacketSize(cl, maximumPacketSize(warehouse, maximumPayloadLength));
     if (ends - pos < cl) return ParsedTdu.invalid(cl - (ends - pos));
 
     if (cls === TduClass.Typed && (h & 0xc7) === 0x80) {
@@ -228,7 +228,7 @@ let parseTruAsync: (
   offset: number,
   warehouse: unknown,
   remoteResolver: unknown,
-  requestSequence: readonly number[] | null,
+  requestSequence: readonly bigint[] | null,
 ) => Promise<{ value: unknown; size: number }> = () => {
   throw new Error("Typed TDU parsing requires the Tru family (Phase 2 continuation).");
 };
@@ -240,7 +240,7 @@ export function registerTruParserAsync(
     offset: number,
     warehouse: unknown,
     remoteResolver: unknown,
-    requestSequence: readonly number[] | null,
+    requestSequence: readonly bigint[] | null,
   ) => Promise<{ value: unknown; size: number }>,
 ): void {
   parseTruAsync = fn;

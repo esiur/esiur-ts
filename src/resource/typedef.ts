@@ -15,7 +15,7 @@ export class LocalTypeDef implements ITypeDef {
   private cachedProperties?: TypeDefProperty[];
 
   constructor(
-    readonly id: number,
+    readonly id: bigint,
     readonly kind: TypeDefKind,
     readonly name: string,
     readonly template: TypeDef,

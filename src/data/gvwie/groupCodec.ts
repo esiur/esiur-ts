@@ -100,13 +100,19 @@ function build(cfg: GroupConfig) {
     return Uint8Array.from(dst);
   }
 
-  function decode(src: Uint8Array, start = 0, end = src.length): bigint[] {
+  function decode(
+    src: Uint8Array,
+    start = 0,
+    end = src.length,
+    validateCount?: (count: number) => void,
+  ): bigint[] {
     const result: bigint[] = [];
     const pos = { i: start };
 
     while (pos.i < end) {
       const h = src[pos.i++];
       if ((h & 0x80) === 0) {
+        validateCount?.(result.length + 1);
         result.push(fromZ(BigInt(h & 0x7f)));
         continue;
       }
@@ -123,6 +129,7 @@ function build(cfg: GroupConfig) {
         count = shortMaxCount + 1 + extra;
       }
 
+      validateCount?.(result.length + count);
       for (let j = 0; j < count; j++) result.push(fromZ(readLE(src, pos, width)));
     }
 
@@ -138,8 +145,12 @@ export function makeNumberCodec(cfg: GroupConfig) {
   return {
     encode: (values: ArrayLike<number>): Uint8Array =>
       core.encode(Array.from(values, (v) => BigInt(v))),
-    decode: (src: Uint8Array, start?: number, end?: number): number[] =>
-      core.decode(src, start, end).map((v) => Number(v)),
+    decode: (
+      src: Uint8Array,
+      start?: number,
+      end?: number,
+      validateCount?: (count: number) => void,
+    ): number[] => core.decode(src, start, end, validateCount).map((v) => Number(v)),
   };
 }
 
@@ -148,7 +159,11 @@ export function makeBigIntCodec(cfg: GroupConfig) {
   const core = build(cfg);
   return {
     encode: (values: ArrayLike<bigint>): Uint8Array => core.encode(Array.from(values)),
-    decode: (src: Uint8Array, start?: number, end?: number): bigint[] =>
-      core.decode(src, start, end),
+    decode: (
+      src: Uint8Array,
+      start?: number,
+      end?: number,
+      validateCount?: (count: number) => void,
+    ): bigint[] => core.decode(src, start, end, validateCount),
   };
 }

@@ -55,7 +55,8 @@ describe("warehouse put/get and notifications", () => {
 
     expect(store.instance!.link).toBe("sys");
     expect(hello.instance!.link).toBe("sys/hello");
-    expect(hello.instance!.age).toBe(1);
+    // Properties and events share one ordered revision stream.
+    expect(hello.instance!.age).toBe(2);
   });
 
   it("moves and removes resources by store path", async () => {

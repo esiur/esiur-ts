@@ -5,6 +5,7 @@ export enum EpPacketRequest {
   SetProperty = 0x1,
   Subscribe = 0x2,
   Unsubscribe = 0x3,
+  QueryResourceJournal = 0x4,
   // Inquire
   /** Batch name → id lookup (request: `string[]`, reply: `ulong[]`). */
   TypeDefIdsByNames = 0x8,

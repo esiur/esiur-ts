@@ -87,8 +87,9 @@ runBrowserClientTest().then(
   (error) => {
     statusEl.textContent = "FAIL";
     statusEl.className = "fail";
-    log(`FAIL ${error?.stack ?? error}`);
-    window.__esiurBrowserClientTestResult = { ok: false, error: String(error?.stack ?? error) };
+    const detail = describeError(error);
+    log(`FAIL ${detail}`);
+    window.__esiurBrowserClientTestResult = { ok: false, error: detail };
   },
 );
 
@@ -96,6 +97,11 @@ async function runBrowserClientTest() {
   const config = window.__esiurBrowserClientTest;
   assert(config?.epUrl, "Browser test config is missing epUrl.");
   log(`EP server: ${config.epUrl}`);
+
+  if (config.fixture === "dotnet-flow-graph") {
+    await runDotnetFlowGraphTest(config.epUrl);
+    return;
+  }
 
   const clientWarehouse = new Warehouse();
   clientWarehouse.RegisterAuthenticationProvider(new BrowserClientAuthenticationProvider());
@@ -122,7 +128,7 @@ async function runBrowserClientTest() {
   const propertyChanges = [];
   const events = [];
   remote.propertyModified.add((change) => propertyChanges.push(change));
-  remote.eventOccurred.add((occurrence) => events.push(occurrence));
+  await remote.onAsync("message", (value) => events.push(value));
 
   assert(remote.level === 1, "Initial level snapshot mismatch.");
   assert(remote.status === "idle", "Initial status snapshot mismatch.");
@@ -140,6 +146,7 @@ async function runBrowserClientTest() {
   );
   log("Invoked function and received property notifications.");
 
+  log("Invoking async add function.");
   assert((await remote.add(20, 22)) === 42, "add returned unexpected value.");
 
   await connection.set(remote.instanceId, typeDef.getPropertyByName("status").index, "browser-set");
@@ -147,9 +154,7 @@ async function runBrowserClientTest() {
   log("Set server property from browser client.");
 
   assert((await remote.raise("browser-ping")) === "BROWSER-PING", "raise returned unexpected value.");
-  await waitFor(() =>
-    events.some((e) => e.name === "message" && e.value === "browser-ping"),
-  );
+  await waitFor(() => events.includes("browser-ping"));
   log("Received exported event.");
 
   assert((await remote.setLevel(7)) === 7, "setLevel returned unexpected value.");
@@ -168,12 +173,79 @@ async function runBrowserClientTest() {
   connection.close();
 }
 
+async function runDotnetFlowGraphTest(epUrl) {
+  const connection = await EpConnection.connect(epUrl);
+  assert(connection.isConnected, "Browser did not connect to the .NET fixture.");
+  const workspace = await within(connection.Get("sys/workspace"), 5000, "attach workspace");
+  const revisionFunction = workspace.resourceDefinition.getFunctionByName("GetFlowRevision");
+  const snapshotFunction = workspace.resourceDefinition.getFunctionByName("GetFlowSnapshot");
+  const pulseFunction = workspace.resourceDefinition.getFunctionByName("Pulse");
+  assert(revisionFunction && snapshotFunction && pulseFunction, "Flow workspace functions are missing.");
+
+  const switchFlow = async (flowId) => {
+    const revision = connection.invoke(workspace.instanceId, revisionFunction.index, flowId);
+    const root = connection.Get(`sys/workspace/flows/${flowId}/blocks/${flowId * 1000}`);
+    const snapshot = connection.invoke(workspace.instanceId, snapshotFunction.index, flowId);
+    const [revisionJson, attachedRoot, typedSnapshot] = await within(
+      Promise.all([revision, root, snapshot]),
+      8000,
+      `switch flow ${flowId}`,
+    );
+    assert(JSON.parse(String(revisionJson)).flowId === flowId, `Revision ${flowId} mismatch.`);
+    assert(attachedRoot.link.includes(`/flows/${flowId}/`), `Root ${flowId} mismatch.`);
+    assert(Number(typedSnapshot.FlowId) === flowId, `Snapshot ${flowId} mismatch.`);
+  };
+
+  const switches = Array.from({ length: 6 }, () => [1, 2, 3].map((flowId) => switchFlow(flowId))).flat();
+  const pulses = Array.from({ length: 6 }, (_, seed) =>
+    within(connection.invoke(workspace.instanceId, pulseFunction.index, seed), 5000, `pulse ${seed}`),
+  );
+  await within(Promise.all([...switches, ...pulses]), 20000, "browser flow graph workload");
+
+  let missingRejected = false;
+  try {
+    await within(connection.Get("sys/workspace/flows/99/blocks/99000"), 2000, "missing block");
+  } catch {
+    missingRejected = true;
+  }
+  assert(missingRejected, "Missing browser resource did not reject.");
+  await switchFlow(2);
+  assert(connection.isConnected, "Connection closed after rapid browser flow switching.");
+  log("Chromium sustained dense .NET resource attach, TypeDefs, updates, and flow switching.");
+  connection.close();
+}
+
+async function within(promise, timeoutMs, operation) {
+  let timer;
+  try {
+    return await Promise.race([
+      Promise.resolve(promise),
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`${operation} did not finish within ${timeoutMs} ms`)), timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 function log(message) {
   logEl.textContent += `${message}\n`;
 }
 
 function assert(condition, message) {
   if (!condition) throw new Error(message);
+}
+
+function describeError(error) {
+  if (error == null) return String(error);
+  const parts = [
+    error.name,
+    error.message,
+    error.type == null ? "" : `type=${error.type}`,
+    error.code == null ? "" : `code=${error.code}`,
+  ].filter(Boolean);
+  return `${parts.join(" · ")}\n${error.stack ?? ""}`.trim();
 }
 
 async function waitFor(predicate, timeoutMs = 1500) {

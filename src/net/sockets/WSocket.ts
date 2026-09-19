@@ -30,6 +30,7 @@ export class WSocket implements ISocket {
   private ws?: WebSocket;
   private readonly buffer = new NetworkBuffer();
   private readonly destroyHandlers: DestroyedEvent[] = [];
+  private closeNotified = false;
 
   constructor(ws?: WebSocket) {
     if (ws) this.attach(ws);
@@ -38,6 +39,7 @@ export class WSocket implements ISocket {
   connect(url: string): AsyncReply<boolean> {
     const reply = new AsyncReply<boolean>();
     this.state = SocketState.Connecting;
+    this.closeNotified = false;
 
     (async () => {
       try {
@@ -90,21 +92,45 @@ export class WSocket implements ISocket {
       this.buffer.write(bytes);
       this.receiver?.networkReceive(this, this.buffer);
     });
-    ws.addEventListener("close", () => {
-      this.state = SocketState.Closed;
-      this.receiver?.networkClose(this);
-    });
+    // Node's `ws` emits an EventEmitter `error` (for example when maxPayload
+    // rejects a frame). Registering a listener prevents an otherwise
+    // process-level uncaught exception; the transport's following close event
+    // remains the single source of disconnect notification.
+    ws.addEventListener("error", () => {});
+    ws.addEventListener("close", () => this.transitionClosed());
 
     if (ws.readyState === 1) this.state = SocketState.Established;
   }
 
   send(message: Uint8Array): void {
-    this.ws?.send(message);
+    const ws = this.ws;
+    if (
+      !ws ||
+      this.state !== SocketState.Established ||
+      ws.readyState !== 1
+    ) {
+      // Browsers can leave a suspended tab with our logical state marked as
+      // Established even though the native WebSocket has already entered
+      // CLOSING/CLOSED. Notify the protocol immediately so it can fail pending
+      // requests and schedule recovery, instead of calling WebSocket.send()
+      // repeatedly and leaving replies that can never settle.
+      this.transitionClosed();
+      return;
+    }
+
+    ws.send(message);
   }
 
   close(): void {
     this.state = SocketState.Closed;
     this.ws?.close();
+  }
+
+  private transitionClosed(): void {
+    this.state = SocketState.Closed;
+    if (this.closeNotified) return;
+    this.closeNotified = true;
+    this.receiver?.networkClose(this);
   }
 
   addDestroyHandler(handler: DestroyedEvent): void {

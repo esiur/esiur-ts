@@ -19,13 +19,6 @@ class RemoteGreeter extends Resource {
 }
 
 describe("Warehouse remote EP get", () => {
-  it("rejects an EP URL without an explicit port", async () => {
-    const warehouse = new Warehouse();
-    await expect(warehouse.get("ep://127.0.0.1/sys/resource")).rejects.toThrow(
-      /explicit port/i,
-    );
-  });
-
   it("returns an EpConnection for a bare ep:// URL", async () => {
     const serverWh = new Warehouse();
     await serverWh.put("sys", new MemoryStore());
@@ -60,6 +53,7 @@ describe("Warehouse remote EP get", () => {
 
     expect(res.visits).toBe(0);
     expect(await res.greet("Mira")).toBe("Hello Mira");
+    await waitFor(() => res.visits === 1);
     expect(res.visits).toBe(1);
     expect(greeter.visits).toBe(1);
 
@@ -88,6 +82,7 @@ describe("Warehouse remote EP get", () => {
 
     expect(res.visits).toBe(0);
     expect(await res.greet("Zaid")).toBe("Hello Zaid");
+    await waitFor(() => res.visits === 1);
     expect(res.visits).toBe(1);
     expect(greeter.visits).toBe(1);
 
@@ -153,3 +148,12 @@ describe("Warehouse remote EP get", () => {
     await server.close();
   });
 });
+
+async function waitFor(predicate: () => boolean, timeoutMs = 1_500): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (predicate()) return;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  expect(predicate()).toBe(true);
+}

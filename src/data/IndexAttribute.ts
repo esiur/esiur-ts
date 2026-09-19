@@ -1,9 +1,11 @@
 import "../internal/metadata.js";
+import type { Tru } from "./Tru.js";
 
 /** A discovered `@Index`ed member: its wire index and property name. */
 export interface IndexedMember {
   index: number;
   name: string;
+  wireType?: Tru;
 }
 
 const INDEXED_MEMBERS = Symbol.for("esiur.indexedMembers");
@@ -21,7 +23,7 @@ type MetaBag = Record<symbol, unknown>;
  * prototype, so e.g. `PropertyDefInfo extends MemberDefInfo` sees
  * `MemberDefInfo`'s indexed fields with no extra work.
  */
-export function Index(index: number) {
+export function Index(index: number, wireType?: Tru) {
   if (index < 0 || index > 255)
     throw new RangeError("A structure index must be between 0 and 255.");
   return function (_value: unknown, context: ClassMemberDecoratorContext): void {
@@ -32,7 +34,7 @@ export function Index(index: number) {
     const name = String(context.name);
     if (members.some((m) => m.index === index))
       throw new Error(`Structure index ${index} is already used on this type.`);
-    members.push({ index, name });
+    members.push({ index, name, wireType });
   };
 }
 

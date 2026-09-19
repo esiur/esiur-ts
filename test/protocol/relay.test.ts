@@ -4,14 +4,19 @@ import { EpServer } from "../../src/protocol/EpServer.js";
 import { Warehouse } from "../../src/resource/Warehouse.js";
 import { MemoryStore } from "../../src/stores/MemoryStore.js";
 import { Resource } from "../../src/resource/Resource.js";
-import { Export, event, type EventSource } from "../../src/resource/decorators.js";
+import {
+  Export,
+  Historical,
+  event,
+  type EventSource,
+} from "../../src/resource/decorators.js";
 import { t } from "../../src/data/descriptors.js";
 import { Ruling } from "../../src/security/permissions/Ruling.js";
 import type { IPermissionsManager } from "../../src/security/permissions/IPermissionsManager.js";
 
 class RelayCounter extends Resource {
-  @Export(t.i32) accessor counts = 0;
-  @Export(t.string) ping: EventSource<string> = event<string>();
+  @Export(t.i32) @Historical() accessor counts = 0;
+  @Export(t.string) @Historical() ping: EventSource<string> = event<string>();
 
   @Export(t.i32, [t.i32])
   bump(by: number): number {
@@ -36,6 +41,8 @@ interface RelayProxy {
   bump(by: number): Promise<number>;
   on(name: string, cb: (value: unknown) => void): void;
   off(name: string, cb: (value: unknown) => void): void;
+  cursor: import("../../src/resource/ResourceCursor.js").ResourceCursor;
+  queryJournal(query: unknown): PromiseLike<import("../../src/resource/ResourceJournal.js").ResourceJournalPage>;
 }
 
 function waitFor(predicate: () => boolean, timeoutMs = 3000): Promise<void> {
@@ -85,6 +92,7 @@ describe("EpResource as IResource — relay through a third node", () => {
     // path in epRequestTypeDefByResourceId).
     const connectionToB = await EpConnection.connect(`ws://127.0.0.1:${serverB.port}`);
     const viaC = (await connectionToB.get("sys/relay")) as unknown as RelayProxy;
+    const attachedAt = viaC.cursor;
 
     // Initial read relays through B to A's real state.
     expect(viaC.counts).toBe(0);
@@ -112,6 +120,13 @@ describe("EpResource as IResource — relay through a third node", () => {
     counter.ping.emit("hello");
     await waitFor(() => received.length === 1);
     expect(received).toEqual(["hello"]);
+
+    // Journal queries through B are delegated to A's authoritative journal,
+    // not limited to entries B happened to observe locally.
+    const page = await viaC.queryJournal({ after: attachedAt });
+    expect(page.entries.some((entry) => entry.value === 7)).toBe(true);
+    expect(page.entries.some((entry) => entry.value === 99)).toBe(true);
+    expect(page.entries.some((entry) => entry.value === "hello")).toBe(true);
 
     connectionToB.close();
     connectionToA.close();

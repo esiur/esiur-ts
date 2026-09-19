@@ -4,12 +4,14 @@ import type { IResource, IResourceContext, IStore } from "./IResource.js";
 import { Instance } from "./Instance.js";
 import { ResourceOperation } from "./ResourceOperation.js";
 import { getRemoteInfo, getTypeDef } from "./decorators.js";
-import { TypeDef } from "./template.js";
+import { ConstantTemplate, TypeDef } from "./template.js";
 import { TypeDefKind, type ITypeDef } from "../data/types/ITypeDef.js";
+import { t } from "../data/descriptors.js";
 import { LocalTypeDef } from "./typedef.js";
 import { Record } from "./records.js";
 import type { EnumType } from "./enums.js";
 import { EpConnection, type EpConnectionOptions } from "../protocol/EpConnection.js";
+import { normalizeEsiurEndpoint } from "../protocol/EpProtocol.js";
 import type { EpResourceConstructor } from "../protocol/EpResource.js";
 import type { IAuthenticationProvider } from "../security/IAuthenticationProvider.js";
 import type { IEncryptionProvider } from "../security/cryptography/IEncryptionProvider.js";
@@ -24,6 +26,7 @@ import { ActionType } from "../security/permissions/ActionType.js";
 import { Ruling } from "../security/permissions/Ruling.js";
 import type { RatePolicy } from "../security/ratelimiting/RatePolicy.js";
 import { NamedRateControlManager } from "../security/ratelimiting/NamedRateControlManager.js";
+import { WarehouseConfiguration } from "./WarehouseConfiguration.js";
 
 export interface WarehouseRemoteGetOptions extends EpConnectionOptions {
   /** TypeDef for the remote resource proxy. Required when the URL includes a resource path. */
@@ -69,10 +72,10 @@ export class Warehouse {
   private resourceCounter = 0;
   private opened = false;
 
-  private readonly typeDefs = new Map<number, ITypeDef>();
+  private readonly typeDefs = new Map<bigint, ITypeDef>();
   private readonly typeDefsByCtor = new Map<Function, ITypeDef>();
   private readonly typeDefsByEnum = new Map<EnumType, ITypeDef>();
-  private typeDefCounter = 0;
+  private typeDefCounter = 0n;
   private readonly authenticationProviders = new Map<string, IAuthenticationProvider>();
   private readonly encryptionProviders = new Map<string, IEncryptionProvider>();
   private readonly resourceManagers = new Map<Function, IResourceManager>();
@@ -80,7 +83,7 @@ export class Warehouse {
   private readonly ratePolicies = new Map<string, RatePolicy>();
   private readonly proxyTypes = new Map<string, Function>();
 
-  constructor() {
+  constructor(public readonly configuration = new WarehouseConfiguration()) {
     // Built in and always-on, matching dotnet's own Warehouse construction —
     // bridges `@RateControl(name)`-tagged members into the named rate-policy
     // registry (see `addRatePolicy`/`tryGetRatePolicy`).
@@ -509,7 +512,15 @@ export class Warehouse {
       id,
       TypeDefKind.Enum,
       enumType.name,
-      new TypeDef(enumType.name, []),
+      new TypeDef(
+        enumType.name,
+        enumType.constants.map((constant) => new ConstantTemplate(
+          constant.name,
+          constant.index,
+          t.i32,
+          constant.value,
+        )),
+      ),
       undefined,
       enumType.constants,
     );
@@ -519,7 +530,7 @@ export class Warehouse {
   }
 
   /** Resolve a type definition by its numeric id. */
-  getLocalTypeDefById(id: number): ITypeDef {
+  getLocalTypeDefById(id: bigint): ITypeDef {
     const td = this.typeDefs.get(id);
     if (!td) throw new Error(`TypeDef ${id} not found.`);
     return td;
@@ -569,7 +580,15 @@ export class Warehouse {
     }
 
     const id = ++this.resourceCounter;
-    resource.instance = new Instance(this, id, instanceName, resource, store, context?.age ?? 0);
+    resource.instance = new Instance(
+      this,
+      id,
+      instanceName,
+      resource,
+      store,
+      context?.age ?? 0,
+      location.join("/"),
+    );
 
     if (isStore(resource)) {
       this.stores.add(resource);
@@ -792,11 +811,11 @@ function parseRemoteEpUrl(path: string): RemoteEpUrl | undefined {
   else if (scheme === "tcp") socketScheme = "tcp";
   else return undefined;
 
-  const port = getExplicitPort(path);
-  if (port == null)
-    throw new Error(
-      `EP endpoints must include an explicit port (for example, ep://host:port): ${path}`,
-    );
+  const normalizedPath = normalizeEsiurEndpoint(path);
+  url = new URL(normalizedPath);
+
+  const port = getExplicitPort(normalizedPath);
+  if (port == null) throw new Error(`Invalid EP endpoint: ${path}`);
 
   const resourcePath = decodeURIComponent(url.pathname.replace(/^\/+/, ""));
   const hostname = url.hostname.includes(":") && !url.hostname.startsWith("[")

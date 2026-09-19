@@ -4,17 +4,43 @@ import type { DestroyedEvent } from "../core/IDestructible.js";
 import type { IResource, IStore } from "../resource/IResource.js";
 import type { Instance } from "../resource/Instance.js";
 import { ResourceOperation } from "../resource/ResourceOperation.js";
+import {
+  ResourceJournalBuffer,
+  type IResourceJournalStore,
+  type ResourceJournalEntry,
+  type ResourceJournalPage,
+  type ResourceJournalQuery,
+} from "../resource/ResourceJournal.js";
+import type { ResourceCursor } from "../resource/ResourceCursor.js";
 
 /**
  * An in-memory {@link IStore} that keeps its resources in RAM (port of C#
  * `MemoryStore`). Resources are addressed by their stored link path, or by
  * `$<id>` for a direct instance-id lookup.
  */
-export class MemoryStore implements IStore {
+export class MemoryStore implements IStore, IResourceJournalStore {
   instance?: Instance;
 
   private readonly resources = new Map<number, IResource>();
   private readonly destroyHandlers: DestroyedEvent[] = [];
+
+  constructor(private readonly journalStore: IResourceJournalStore = new ResourceJournalBuffer()) {}
+
+  openJournal(resource: IResource, resourceKey: string, proposedCursor: ResourceCursor): ResourceCursor {
+    return this.journalStore.openJournal(resource, resourceKey, proposedCursor);
+  }
+
+  appendJournalEntry(resource: IResource, entry: ResourceJournalEntry, retain: boolean): boolean {
+    return this.journalStore.appendJournalEntry(resource, entry, retain);
+  }
+
+  queryJournal(resource: IResource, query?: ResourceJournalQuery): ResourceJournalPage {
+    return this.journalStore.queryJournal(resource, query);
+  }
+
+  removeJournal(resource: IResource): void {
+    this.journalStore.removeJournal(resource);
+  }
 
   handle(_operation: ResourceOperation): AsyncReply<boolean> {
     return AsyncReply.fromResult(true);
@@ -58,6 +84,7 @@ export class MemoryStore implements IStore {
       for (const r of this.resources.values()) {
         if (this.link(r) === path) {
           this.resources.delete(r.instance!.id);
+          this.removeJournal(r);
           return AsyncReply.fromResult(true);
         }
       }
@@ -65,7 +92,9 @@ export class MemoryStore implements IStore {
     }
 
     if (resourceOrPath.instance?.store !== this) return AsyncReply.fromResult(false);
-    return AsyncReply.fromResult(this.resources.delete(resourceOrPath.instance.id));
+    const removed = this.resources.delete(resourceOrPath.instance.id);
+    if (removed) this.removeJournal(resourceOrPath);
+    return AsyncReply.fromResult(removed);
   }
 
   move(resource: IResource, newPath: string): AsyncReply<boolean> {

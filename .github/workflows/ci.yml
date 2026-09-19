@@ -1,0 +1,50 @@
+name: Esiur TypeScript parity
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  conformance:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out esiur-ts
+        uses: actions/checkout@v4
+        with:
+          path: esiur-ts
+
+      - name: Check out esiur-dotnet reference runtime
+        uses: actions/checkout@v4
+        with:
+          repository: esiur/esiur-dotnet
+          path: esiur-dotnet
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: esiur-ts/package-lock.json
+
+      - name: Set up .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Install dependencies
+        run: npm ci
+        working-directory: esiur-ts
+
+      - name: Run parity, fuzz, interop, and package gates
+        run: npm run check:release
+        working-directory: esiur-ts
+
+      - name: Audit runtime and development dependencies
+        run: npm audit
+        working-directory: esiur-ts

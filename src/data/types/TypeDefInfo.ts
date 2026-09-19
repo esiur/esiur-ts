@@ -5,6 +5,7 @@ import type { PropertyDefInfo } from "./PropertyDefInfo.js";
 import type { FunctionDefInfo } from "./FunctionDefInfo.js";
 import type { EventDefInfo } from "./EventDefInfo.js";
 import type { ConstantDefInfo } from "./ConstantDefInfo.js";
+import { t } from "../descriptors.js";
 
 /**
  * Wire-format shape of a type definition (port of C# `TypeDefInfo`), the
@@ -14,12 +15,12 @@ import type { ConstantDefInfo } from "./ConstantDefInfo.js";
  * as a server, which is out of today's client-focused scope.
  */
 export class TypeDefInfo extends IndexedStructure {
-  @Index(0x00) version = 0;
-  @Index(0x01) id = 0;
+  @Index(0x00, t.i32) version = 0;
+  @Index(0x01, t.u64) id = 0n;
   @Index(0x02) name = "";
   @Index(0x03) namespace: string | undefined;
-  @Index(0x04) kind: TypeDefKind = TypeDefKind.Resource;
-  @Index(0x05) parent: number | undefined;
+  @Index(0x04, t.u8) kind: TypeDefKind = TypeDefKind.Resource;
+  @Index(0x05, t.u64) parent: bigint | undefined;
   @Index(0x06) properties: PropertyDefInfo[] | undefined;
   @Index(0x07) functions: FunctionDefInfo[] | undefined;
   @Index(0x08) events: EventDefInfo[] | undefined;
@@ -30,5 +31,5 @@ export class TypeDefInfo extends IndexedStructure {
   @Index(0x22) example: unknown;
   @Index(0x23) category: string | undefined;
   @Index(0x24) since: string | undefined;
-  @Index(0x25) annotations: Map<string, string> | undefined;
+  @Index(0x25, t.map(t.string, t.string)) annotations: Map<string, string> | undefined;
 }

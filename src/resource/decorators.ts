@@ -19,6 +19,7 @@ const TEMPLATE = Symbol.for("esiur.template");
 const RATE_CONTROL_POLICIES = Symbol.for("esiur.ratePolicies");
 const RESOURCE_MANAGER_TYPES = Symbol.for("esiur.resourceManagerTypes");
 const AUTO_DELIVERED_EVENTS = Symbol.for("esiur.autoDeliveredEvents");
+const HISTORICAL_MEMBERS = Symbol.for("esiur.historicalMembers");
 const REMOTE = Symbol.for("esiur.remote");
 
 interface PendingMember {
@@ -164,6 +165,19 @@ export function AutoDelivered() {
   };
 }
 
+/** Retain an exported property/event so disconnected consumers can replay it. */
+export function Historical() {
+  return function (_value: unknown, context: ClassMemberDecoratorContext): void {
+    if (context.kind !== "field" && context.kind !== "accessor")
+      throw new Error(
+        `@Historical cannot be applied to a ${context.kind} ('${String(context.name)}').`,
+      );
+    ownArray<string>(context.metadata as MetaBag, HISTORICAL_MEMBERS).push(
+      String(context.name),
+    );
+  };
+}
+
 /**
  * Associates a registered manager implementation with a resource type (port
  * of C#'s `[PermissionsManager<T>]`/`[RateControlManager<T>]`/
@@ -213,13 +227,21 @@ export function getTypeDef(ctor: Function): TypeDef {
   const pending = (meta[MEMBERS] as PendingMember[] | undefined) ?? [];
   const ratePolicies = meta[RATE_CONTROL_POLICIES] as Map<string, string> | undefined;
   const autoDeliveredEvents = new Set((meta[AUTO_DELIVERED_EVENTS] as string[] | undefined) ?? []);
+  const historicalMembers = new Set((meta[HISTORICAL_MEMBERS] as string[] | undefined) ?? []);
   let propertyIndex = 0;
   let functionIndex = 0;
   let eventIndex = 0;
 
   const members: MemberTemplate[] = pending.map((m) => {
     if (m.kind === MemberType.Property) {
-      const t = new PropertyTemplate(m.name, propertyIndex++, m.type);
+      const t = new PropertyTemplate(
+        m.name,
+        propertyIndex++,
+        m.type,
+        false,
+        undefined,
+        historicalMembers.has(m.name),
+      );
       t.ratePolicyName = ratePolicies?.get(m.name);
       return t;
     }
@@ -243,6 +265,7 @@ export function getTypeDef(ctor: Function): TypeDef {
       m.type,
       undefined,
       !autoDeliveredEvents.has(m.name),
+      historicalMembers.has(m.name),
     );
   });
 

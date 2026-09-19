@@ -32,6 +32,10 @@ import {
   Char16,
 } from "./widths.js";
 import * as S from "./DataSerializer.js";
+import {
+  ensureRemoteCollectionCount,
+  ensureRemotePacketSize,
+} from "./ParserGuard.js";
 
 /**
  * Self-describing value codec (port of C# `Codec`). Encodes a value to its
@@ -77,17 +81,26 @@ export function composeInternal(
     case "bigint":
       return S.int64Composer(value);
     case "string":
-      return S.stringComposer(value);
+      return S.stringComposer(value, connection);
   }
 
   if (value instanceof Date) return S.dateTimeComposer(value);
   if (value instanceof Uuid) return S.uuidComposer(value);
   if (value instanceof Decimal128) return S.decimal128Composer(value);
-  if (value instanceof Uint8Array) return S.rawDataComposer(value);
+  if (value instanceof Uint8Array) return S.rawDataComposer(value, connection);
   if (value instanceof TypedList) return typedListComposer(value, warehouse, connection);
   if (value instanceof TypedMap) return typedMapComposer(value, warehouse, connection);
   if (value instanceof TypedTuple) return tupleComposer(value, warehouse, connection);
   if (value instanceof Map) return mapComposer(value, warehouse, connection);
+
+  // Resource/record/enum hooks must see collection values before a bare JS
+  // array falls back to the generic List encoding. In particular,
+  // IResource[] is a ResourceList on the EP wire and materializes as an
+  // IResource[] in dotnet rather than object[].
+  for (const fn of structuredComposers) {
+    const tdu = fn(value, warehouse, connection);
+    if (tdu) return tdu;
+  }
 
   // A bare JS array becomes a dynamic, self-describing List (each element keeps
   // its own type tag). Typed Gvwie arrays are produced from explicit typed-list
@@ -105,13 +118,6 @@ export function composeInternal(
   if (value instanceof TypeDefInfo) return S.typeDefComposer(value, warehouse, connection);
   if (value instanceof IndexedStructure)
     return S.structureComposer(value, warehouse, connection);
-
-  // Records, enums and other registered structured types are handled by the
-  // resource layer through hooks, keeping `data/` independent of it.
-  for (const fn of structuredComposers) {
-    const tdu = fn(value, warehouse, connection);
-    if (tdu) return tdu;
-  }
 
   throw new Error(
     `Codec.compose: serialization for ${describe(value)} is not supported.`,
@@ -140,7 +146,9 @@ export function compose(
   warehouse: unknown = null,
   connection: unknown = null,
 ): Uint8Array {
-  return composeInternal(value, warehouse, connection).composed;
+  const composed = composeInternal(value, warehouse, connection).composed;
+  ensureRemotePacketSize(connection, composed.length);
+  return composed;
 }
 
 /**
@@ -156,8 +164,10 @@ function listComposer(
 ): Tdu {
   const parts: Uint8Array[] = [];
   let previous: Tdu | null = null;
+  let count = 0;
 
   for (const el of value) {
+    ensureRemoteCollectionCount(connection, ++count, 8);
     const tdu = composeInternal(el, warehouse, connection);
     if (previous && tdu.matchType(previous)) {
       const d = tdu.composed.subarray(tdu.contentOffset);
@@ -204,24 +214,38 @@ function typedArrayComposer(
   warehouse: unknown,
   connection: unknown,
 ): Uint8Array {
+  ensureRemoteCollectionCount(connection, values.length, typedArrayElementSize(element));
+  let composed: Uint8Array;
   switch (element.identifier) {
     case TruIdentifier.Int16:
-      return GroupInt16Codec.encode(values as number[]);
+      composed = GroupInt16Codec.encode(values as number[]);
+      break;
     case TruIdentifier.Int32:
-      return GroupInt32Codec.encode(values as number[]);
+      composed = GroupInt32Codec.encode(values as number[]);
+      break;
     case TruIdentifier.Int64:
-      return GroupInt64Codec.encode(values as bigint[]);
+      composed = GroupInt64Codec.encode(values as bigint[]);
+      break;
     case TruIdentifier.UInt16:
-      return GroupUInt16Codec.encode(values as number[]);
+      composed = GroupUInt16Codec.encode(values as number[]);
+      break;
     case TruIdentifier.UInt32:
-      return GroupUInt32Codec.encode(values as number[]);
+      composed = GroupUInt32Codec.encode(values as number[]);
+      break;
     case TruIdentifier.UInt64:
-      return GroupUInt64Codec.encode(values as bigint[]);
+      composed = GroupUInt64Codec.encode(values as bigint[]);
+      break;
     default: {
       const parts: Uint8Array[] = [];
       let previous: Tdu | null = null;
       for (const v of values) {
-        const tdu = composeInternal(v, warehouse, connection);
+        // JavaScript numbers do not retain their declared wire width. A typed
+        // collection does, so compose primitive values using the collection's
+        // target TRU instead of letting the generic number composer choose a
+        // signed/narrowed representation. This is especially important for
+        // IndexedStructure keys (`TypedMap<u8, dynamic>`): .NET materializes
+        // those keys as byte[], and cannot unbox a signed Int8 as a UInt8.
+        const tdu = composeTypedPrimitive(v, element, warehouse, connection);
         if (tdu.tduClass === TduClass.Typed && tdu.metadata && element.match(tdu.metadata as Tru)) {
           // Element's type matches the declared element type: strip its metadata.
           const d = tdu.composed.subarray(tdu.contentOffset);
@@ -234,9 +258,57 @@ function typedArrayComposer(
         }
         previous = tdu;
       }
-      return merge(...parts);
+      composed = merge(...parts);
+      break;
     }
   }
+  return composed;
+}
+
+function typedArrayElementSize(element: Tru): number {
+  switch (element.identifier) {
+    case TruIdentifier.Int16:
+    case TruIdentifier.UInt16:
+      return 2;
+    case TruIdentifier.Int32:
+    case TruIdentifier.UInt32:
+      return 4;
+    case TruIdentifier.Int64:
+    case TruIdentifier.UInt64:
+      return 8;
+    default:
+      return 8;
+  }
+}
+
+function composeTypedPrimitive(
+  value: unknown,
+  target: Tru,
+  warehouse: unknown,
+  connection: unknown,
+): Tdu {
+  switch (target.identifier) {
+    case TruIdentifier.UInt8:
+      return S.uint8Composer(requireNumber(value, "UInt8"));
+    case TruIdentifier.Int8:
+      return S.int8Composer(requireNumber(value, "Int8"));
+    case TruIdentifier.Char:
+      return S.char16Composer(requireNumber(value, "Char"));
+    default:
+      return composeInternal(value, warehouse, connection);
+  }
+}
+
+function requireNumber(value: unknown, target: string): number {
+  const candidate =
+    value != null && typeof value === "object" && "value" in value
+      ? (value as { value: unknown }).value
+      : value;
+  if (typeof candidate !== "number" || !Number.isFinite(candidate))
+    throw new TypeError(
+      `Typed ${target} values must be finite numbers; received ${describe(value)}.`,
+    );
+  return candidate;
 }
 
 /** Compose an explicitly-typed map as a Typed TDU (`TypedMap<key,value>`). */
@@ -371,11 +443,19 @@ export async function parseAsyncTdu(
   tdu: ParsedTdu,
   warehouse: unknown,
   remoteResolver: RemoteTypeDefResolver | undefined,
-  requestSequence: readonly number[] | null,
+  requestSequence: readonly bigint[] | null,
 ): Promise<unknown> {
   switch (tdu.tduClass) {
     case TduClass.Fixed:
-      // Fixed-class values are always primitives; no async resolution is ever needed.
+      if (
+        tdu.identifier === TduIdentifier.LocalResource8 ||
+        tdu.identifier === TduIdentifier.RemoteResource8 ||
+        tdu.identifier === TduIdentifier.LocalResource16 ||
+        tdu.identifier === TduIdentifier.RemoteResource16 ||
+        tdu.identifier === TduIdentifier.LocalResource32 ||
+        tdu.identifier === TduIdentifier.RemoteResource32
+      )
+        return D.resourceReferenceParserAsync(tdu, warehouse, remoteResolver, requestSequence);
       return fixedParsers[tdu.exponent][tdu.index](tdu, warehouse);
     case TduClass.Dynamic:
       return dynamicAsyncParsers[tdu.index](tdu, warehouse, remoteResolver, requestSequence);
@@ -394,7 +474,7 @@ export async function parseAsync(
   offset: number,
   warehouse: unknown,
   remoteResolver: RemoteTypeDefResolver | undefined,
-  requestSequence: readonly number[] | null,
+  requestSequence: readonly bigint[] | null,
 ): Promise<{ value: unknown; length: number }> {
   const tdu = await ParsedTdu.parseAsync(
     data,

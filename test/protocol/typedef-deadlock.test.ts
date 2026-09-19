@@ -17,14 +17,14 @@ describe("EpConnection.fetchTypeDef", () => {
 
     connection.sendRequest = ((action: EpPacketRequest, ...args: unknown[]) => {
       expect(action).toBe(EpPacketRequest.TypeDefById);
-      const id = Number(args[0]);
+      const id = Number((args[0] as { value: bigint }).value);
       requested.push(id);
       const payload = payloads.get(id);
       if (!payload) throw new Error(`Unexpected TypeDef request ${id}.`);
       return AsyncReply.fromResult(payload);
     }) as EpConnection["sendRequest"];
 
-    const a = await connection.fetchTypeDef(1);
+    const a = await connection.fetchTypeDef(1n);
     const bRef = a.properties[0].valueType;
 
     expect(requested).toEqual([1, 2]);
@@ -33,11 +33,11 @@ describe("EpConnection.fetchTypeDef", () => {
     const b = (bRef as TruTypeDef).typeDef;
     const aRef = b.properties[0].valueType;
 
-    expect(b.id).toBe(2);
+    expect(b.id).toBe(2n);
     expect(aRef).toBeInstanceOf(TruTypeDef);
     expect((aRef as TruTypeDef).typeDef).toBe(a);
 
-    await expect(connection.fetchTypeDef(2) as PromiseLike<unknown>).resolves.toBe(b);
+    await expect(connection.fetchTypeDef(2n) as PromiseLike<unknown>).resolves.toBe(b);
     expect(requested).toEqual([1, 2]);
   });
 });

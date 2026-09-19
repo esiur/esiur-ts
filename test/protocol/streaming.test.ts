@@ -1,5 +1,6 @@
 import { describe, it, expect, vi } from "vitest";
 import { EpConnection } from "../../src/protocol/EpConnection.js";
+import { EpResource } from "../../src/protocol/EpResource.js";
 import { EpServer } from "../../src/protocol/EpServer.js";
 import { Warehouse } from "../../src/resource/Warehouse.js";
 import { MemoryStore } from "../../src/stores/MemoryStore.js";
@@ -20,6 +21,19 @@ class Counter extends Resource {
     } finally {
       this.cleanedUp = true;
     }
+  }
+}
+
+class NamedResource extends Resource {
+  @Export(t.string) accessor label = "";
+}
+
+class ResourceStream extends Resource {
+  resources: NamedResource[] = [];
+
+  @Export(t.resource, [], { streamMode: StreamMode.Pull })
+  async *readResources(): AsyncGenerator<NamedResource> {
+    for (const resource of this.resources) yield resource;
   }
 }
 
@@ -114,5 +128,36 @@ describe("Streaming (PullStream / TerminateExecution / HaltExecution / ResumeExe
 
     client.close();
     await server.close();
+  });
+
+  it("resolves resource-valued chunks in order before completing the stream", async () => {
+    const wh = new Warehouse();
+    wh.registerManager(new AllowManager(), true);
+    await wh.put("sys", new MemoryStore());
+    const first = await wh.put("sys/first", new NamedResource());
+    first.label = "first";
+    const second = await wh.put("sys/second", new NamedResource());
+    second.label = "second";
+    const source = await wh.put("sys/resource-stream", new ResourceStream());
+    source.resources = [first, second];
+    await wh.open();
+    const server = await EpServer.listen({ port: 0, warehouse: wh });
+    const client = await EpConnection.connect(`ws://127.0.0.1:${server.port}`);
+    const index = wh.getTypeDef(ResourceStream).getFunctionByName("readResources")!.index;
+
+    const received: Array<EpResource & { label: string }> = [];
+    const stream = client.invokeStream<EpResource & { label: string }>(
+      StreamMode.Pull,
+      source.instance!.id,
+      index,
+    );
+    for await (const resource of stream) received.push(resource);
+
+    expect(received.every((resource) => resource instanceof EpResource)).toBe(true);
+    expect(received.map((resource) => resource.label)).toEqual(["first", "second"]);
+
+    client.close();
+    await server.close();
+    await wh.close();
   });
 });
