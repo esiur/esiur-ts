@@ -93,15 +93,22 @@ describe("anonymous handshake", () => {
     });
     const raw = new WebSocket(`ws://127.0.0.1:${server.port}`, "EP");
 
-    await new Promise<void>((resolve, reject) => {
-      raw.once("open", () => resolve());
-      raw.once("error", reject);
-    });
-    await new Promise<void>((resolve) => raw.once("close", () => resolve()));
+    const closed = new Promise<void>((resolve) => raw.once("close", () => resolve()));
+    try {
+      await new Promise<void>((resolve, reject) => {
+        raw.once("open", () => resolve());
+        raw.once("error", reject);
+      });
+      await closed;
 
-    expect(server.connections.size).toBe(0);
-    await server.close();
-    await wh.close();
+      // Client and server close callbacks run independently. Wait for the
+      // server's close notification as well before checking admission cleanup.
+      await expect.poll(() => server.connections.size, { timeout: 1_000 }).toBe(0);
+    } finally {
+      raw.terminate();
+      await server.close();
+      await wh.close();
+    }
   });
 
   it("rejects oversized WebSocket messages before packet parsing", async () => {
