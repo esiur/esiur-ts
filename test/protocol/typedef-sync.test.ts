@@ -3,6 +3,7 @@ import { t } from "../../src/data/descriptors.js";
 import { EpConnection } from "../../src/protocol/EpConnection.js";
 import { EpServer } from "../../src/protocol/EpServer.js";
 import { EpResource } from "../../src/protocol/EpResource.js";
+import { EpPacketRequest } from "../../src/net/packets/EpPacketRequest.js";
 import { EpMemberUnavailableError } from "../../src/protocol/EpMemberUnavailableError.js";
 import type { TypeDef } from "../../src/resource/template.js";
 import { Export } from "../../src/resource/decorators.js";
@@ -288,6 +289,59 @@ describe("TypeDef sync", () => {
     await second.server.close();
   });
 
+  it("asks for the node's definition in the same flight as the attach of a compiled stub", async () => {
+    const v1 = probeV1();
+    ProbeStub.typeDef = new Warehouse().getTypeDef(v1);
+    const served = await node(async (warehouse) => {
+      await warehouse.put("sys/probe", new v1());
+    });
+
+    const client = await EpConnection.connect(`ws://127.0.0.1:${served.server.port}`, new Warehouse(), {
+      domain: "typedef-sync-pipelined",
+    });
+    const events = recordRequests(client);
+    const stub = (await client.get("sys/probe", ProbeStub)) as unknown as ProbeStub;
+    expect(stub.level).toBe(5);
+
+    // Both requests were on the wire before either was answered: binding the stub by name costs
+    // no round trip on top of the attach, and the by-id fetch is not needed afterwards.
+    const at = (event: string) => events.indexOf(event);
+    expect(at("send AttachResource")).toBeGreaterThanOrEqual(0);
+    expect(at("send TypeDefByResourceId")).toBeGreaterThanOrEqual(0);
+    expect(at("send TypeDefByResourceId")).toBeLessThan(at("reply AttachResource"));
+    expect(at("send AttachResource")).toBeLessThan(at("reply TypeDefByResourceId"));
+    expect(events).not.toContain("send TypeDefById");
+
+    client.close();
+    await served.server.close();
+  });
+
+  it("needs no definition request for a compiled stub once the connection validated its cache", async () => {
+    const v1 = probeV1();
+    ProbeStub.typeDef = new Warehouse().getTypeDef(v1);
+    const served = await node(async (warehouse) => {
+      await warehouse.put("sys/probe", new v1());
+    });
+    const url = `ws://127.0.0.1:${served.server.port}`;
+    const warehouse = new Warehouse();
+    const domain = "typedef-sync-warm-stub";
+
+    const first = await EpConnection.connect(url, warehouse, { domain });
+    expect(((await first.get("sys/probe", ProbeStub)) as unknown as ProbeStub).level).toBe(5);
+    first.close();
+
+    // The second connection validates the cache while it is established.
+    const second = await EpConnection.connect(url, warehouse, { domain });
+    const events = recordRequests(second);
+    const stub = (await second.get("sys/probe", ProbeStub)) as unknown as ProbeStub;
+    expect(stub.level).toBe(5);
+    expect(await stub.echo(7)).toBe(7);
+    expect(events.filter((event) => /^send TypeDef/.test(event))).toEqual([]);
+
+    second.close();
+    await served.server.close();
+  });
+
   it("fails with a clear error for a member the node removed", async () => {
     const v1 = probeV1();
     const contract = new Warehouse().getTypeDef(v1);
@@ -327,6 +381,19 @@ describe("TypeDef sync", () => {
     await third.server.close();
   });
 });
+
+/** Records "send <request>" and "reply <request>" in the order they happen on a connection. */
+function recordRequests(connection: EpConnection): string[] {
+  const events: string[] = [];
+  const send = connection.sendRequest.bind(connection) as (...args: unknown[]) => AsyncReply;
+  connection.sendRequest = ((action: EpPacketRequest, ...rest: unknown[]) => {
+    events.push(`send ${EpPacketRequest[action]}`);
+    const reply = send(action, ...rest);
+    reply.onReady(() => events.push(`reply ${EpPacketRequest[action]}`));
+    return reply;
+  }) as EpConnection["sendRequest"];
+  return events;
+}
 
 async function waitFor(predicate: () => boolean, timeoutMs = 1500): Promise<void> {
   const deadline = Date.now() + timeoutMs;

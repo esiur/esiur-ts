@@ -13,7 +13,8 @@
 - Compiled stubs and templates bind by name: `EpResource` gains `_FunctionIndex`,
   `_PropertyIndex`, `_EventIndex`, `_PropertyValue` and the `_EmitEventByName` override point.
   Attaching with a template or stub class fetches the node's current definition (once per type
-  per connection) and keeps the template as `expectedTypeDef`; a member the node removed fails
+  per connection, in the same flight as the attach request) and keeps the template as
+  `expectedTypeDef`; a member the node removed fails
   with `EpMemberUnavailableError` (function call, property get/set, event subscription).
 - Connection establishment waits at most `EpConnection.typeDefSyncTimeoutMs` (15 s) for a node
   that predates `SyncTypeDefs`, then drops the cache and carries on.
@@ -23,8 +24,9 @@
 
 - Use matching 3.2 runtimes on both ends to benefit from the cache; an older node ignores the
   request and the cache is dropped after the timeout.
-- Attaching with a template (`attach(id, template)` or a stub class) now makes one extra
-  `TypeDefById` request per type and connection unless the definition is already cached.
+- Attaching with a template (`attach(id, template)` or a stub class) now also asks for the node's
+  definition once per type and connection. The request travels together with the attach request,
+  so it adds no round trip, and it is skipped when the connection already holds the definition.
 
 ## 3.1.0
 

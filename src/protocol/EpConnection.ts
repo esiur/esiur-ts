@@ -314,6 +314,11 @@ export class EpConnection extends NetworkConnection {
   private readonly neededTypeDefs = new Map<bigint, RemoteTypeDef>();
   /** Fully parsed remote TypeDefs (type id to definition). */
   private readonly cachedTypeDefs = new Map<bigint, RemoteTypeDef>();
+  /**
+   * Definition requests sent together with the attach of a resource that has a compiled
+   * contract (contract class name to request), so concurrent attaches of one contract share one.
+   */
+  private readonly nodeDefinitionRequests = new Map<string, Promise<RemoteTypeDef | undefined>>();
   /** In-flight TypeDef fetches, used to share work and detect recursive cycles. */
   private readonly typeDefRequests = new Map<bigint, TypeDefFetchRequestInfo>();
   /** Wait-for graph for in-flight remote TypeDef parsing. */
@@ -1859,6 +1864,9 @@ export class EpConnection extends NetworkConnection {
         let ctor = resolved.ctor;
         // The contract compiled client code was built against, when the caller supplied one.
         let contract = resolved.typeDef;
+        // The node's definition decides how the contract binds; it is requested now so it
+        // travels in the same flight as the attach instead of after its reply.
+        const nodeDefinition = contract ? this.requestNodeDefinition(instanceId, contract) : undefined;
         if (!typeDef) {
           const remoteTypeDef = await this.fetchTypeDefByResourceId(instanceId);
           typeDef = remoteTypeDef.template;
@@ -1872,6 +1880,7 @@ export class EpConnection extends NetworkConnection {
           ctor,
           sequence,
           contract,
+          nodeDefinition,
         );
         this.finishResourceAttach(instanceId);
         reply.trigger(resource);
@@ -1902,6 +1911,7 @@ export class EpConnection extends NetworkConnection {
     ctor?: EpResourceConstructor<T>,
     requestSequence: readonly bigint[] = [BigInt(instanceId)],
     contract?: TypeDef,
+    nodeDefinition?: Promise<RemoteTypeDef | undefined>,
   ): Promise<EpResource & Record<string, any>> {
     const reply = await this.sendRequest(EpPacketRequest.AttachResource, instanceId);
       // Reply: [typeDefId, generation, revision, link, hops, propertyValues]. The
@@ -1923,7 +1933,14 @@ export class EpConnection extends NetworkConnection {
       let applicationTypeDef = typeDef;
       if (contract && typeDef === contract) {
         try {
-          wire = (await this.fetchTypeDef(typeDefId, null)).template;
+          // Known to this connection (validated by SyncTypeDefs or fetched earlier), else the
+          // one requested together with the attach, else asked for by id now.
+          let node = this.cachedTypeDefs.get(typeDefId);
+          if (!node) {
+            const early = await nodeDefinition;
+            node = early && early.id === typeDefId ? early : await this.fetchTypeDef(typeDefId, null);
+          }
+          wire = node.template;
           applicationTypeDef = adaptContract(contract, wire);
         } catch {
           wire = typeDef;
@@ -1952,6 +1969,37 @@ export class EpConnection extends NetworkConnection {
 
       this.attachedResources.set(instanceId, resource);
       return EpResource.createProxy(resource);
+  }
+
+  /**
+   * Asks the node for the definition of a resource that is attached with a compiled contract,
+   * in the same flight as the attach request, so binding the contract by name costs no extra
+   * round trip. Nothing is asked when this connection already holds a definition of that name
+   * (validated by `SyncTypeDefs`, or fetched earlier). Concurrent attaches of one contract share
+   * one request. Never rejects: without the definition the contract is used as it always was.
+   */
+  private requestNodeDefinition(
+    instanceId: number,
+    contract: TypeDef,
+  ): Promise<RemoteTypeDef | undefined> | undefined {
+    const name = contract.className;
+    if (!name) return undefined;
+    for (const known of this.cachedTypeDefs.values()) if (known.name === name) return undefined;
+
+    const shared = this.nodeDefinitionRequests.get(name);
+    if (shared) return shared;
+
+    const request = (async () => {
+      try {
+        return await this.fetchTypeDefByResourceId(instanceId);
+      } catch {
+        return undefined;
+      }
+    })().finally(() => {
+      this.nodeDefinitionRequests.delete(name);
+    });
+    this.nodeDefinitionRequests.set(name, request);
+    return request;
   }
 
   private finishResourceAttach(instanceId: number): void {
