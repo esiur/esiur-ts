@@ -8,6 +8,9 @@ import type { IResource, IResourceContext } from "../resource/IResource.js";
 import type { IDynamicResource } from "../resource/IDynamicResource.js";
 import { ResourceOperation } from "../resource/ResourceOperation.js";
 import { ResourceCursor } from "../resource/ResourceCursor.js";
+import type { TypeDefLayout } from "./TypeDefSync.js";
+import { EpMemberUnavailableError } from "./EpMemberUnavailableError.js";
+import { adaptContract } from "./contractBinding.js";
 import type { ResourceJournalPage, ResourceJournalQuery } from "../resource/ResourceJournal.js";
 import type { EpConnection } from "./EpConnection.js";
 
@@ -94,6 +97,29 @@ export class EpResource implements IResource, IDynamicResource {
   private readonly reconciling = new Set<number>();
   private readonly subscriptionWaiters = new Map<number, AsyncReply<this>[]>();
 
+  /**
+   * The contract compiled client code was built against (a generated stub's definition, or the
+   * template the application attached with). `typeDef` is what the node serves now; a member the
+   * contract names that `typeDef` lacks fails with {@link EpMemberUnavailableError}.
+   */
+  expectedTypeDef?: TypeDef;
+
+  /**
+   * @internal The definition the node serves, which the stored values and event/listener
+   * indexes are keyed by. It is `typeDef` itself unless the application attached with a
+   * contract, in which case `typeDef` is that contract with the node's indexes.
+   */
+  remoteTemplate?: TypeDef;
+
+  /** @internal Set when the node no longer serves this resource's type (docs/typedef-sync.md). */
+  definitionRemoved = false;
+
+  /**
+   * Set when the definition changed in place: the next reattach must transfer every property,
+   * because the cursor this resource holds describes the old member layout.
+   */
+  needsFullReattach = false;
+
   typeDefId?: bigint;
   age = 0;
   cursor = ResourceCursor.empty();
@@ -158,12 +184,12 @@ export class EpResource implements IResource, IDynamicResource {
     if (name.startsWith(":")) {
       const propertyName = name.slice(1);
       const property = this.typeDef.getPropertyByName(propertyName);
-      if (!property) throw new Error(`Unknown property "${propertyName}".`);
+      if (!property) throw this.missingMember(propertyName, "property", `Unknown property "${propertyName}".`);
       getOrCreate(this.propertyListeners, property.index).add(callback);
       return this;
     }
     const event = this.typeDef.getEventByName(name);
-    if (!event) throw new Error(`Unknown event "${name}".`);
+    if (!event) throw this.missingMember(name, "event", `Unknown event "${name}".`);
     getOrCreate(this.eventListeners, event.index).add(callback);
     if (event.subscribable || event.historical) this.reconcileSubscription(event.index);
     return this;
@@ -178,7 +204,7 @@ export class EpResource implements IResource, IDynamicResource {
       return reply;
     }
     const event = this.typeDef.getEventByName(name);
-    if (!event) throw new Error(`Unknown event "${name}".`);
+    if (!event) throw this.missingMember(name, "event", `Unknown event "${name}".`);
     getOrCreate(this.eventListeners, event.index).add(callback);
     if (event.subscribable || event.historical)
       this.reconcileSubscription(event.index, reply);
@@ -193,7 +219,7 @@ export class EpResource implements IResource, IDynamicResource {
     callback: (value: unknown) => void,
   ): AsyncReply<this> {
     const event = this.typeDef.getEventByName(name);
-    if (!event) throw new Error(`Unknown event "${name}".`);
+    if (!event) throw this.missingMember(name, "event", `Unknown event "${name}".`);
     if (!event.historical) throw new Error(`Event "${name}" is not historical.`);
     this.eventCursors.set(event.index, after);
     const reply = new AsyncReply<this>();
@@ -322,6 +348,58 @@ export class EpResource implements IResource, IDynamicResource {
 
   set ResourceDefinition(value: TypeDef) {
     this.typeDef = value;
+  }
+
+  /**
+   * The cursor to reattach with. A cursor no node generation matches makes the node answer with
+   * a full property snapshot, which a resource whose definition changed needs.
+   */
+  get reattachCursor(): ResourceCursor {
+    return this.needsFullReattach ? ResourceCursor.empty() : this.cursor;
+  }
+
+  /**
+   * @internal Re-keys everything this resource stores by member index after its definition
+   * changed in place (docs/typedef-sync.md). Member names are the identity: values, listeners
+   * and event cursors follow their member to its new index; members that no longer exist are
+   * dropped.
+   */
+  rebindDefinition(previous: TypeDefLayout, template: TypeDef): void {
+    const oldValues = this.properties.slice();
+    const oldCache = new Map(this.cache);
+    const oldAges = new Map(this.propertyAges);
+    const oldDates = new Map(this.propertyModificationDates);
+    const oldCursors = new Map(this.propertyCursors);
+
+    // The `properties` array is aliased by generated stubs, so it is refilled in place.
+    this.properties.length = 0;
+    this.cache.clear();
+    this.propertyAges.clear();
+    this.propertyModificationDates.clear();
+    this.propertyCursors.clear();
+
+    for (const property of template.properties) {
+      const oldIndex = previous.properties.get(property.name);
+      if (oldIndex === undefined) continue;
+      if (oldIndex < oldValues.length) this.properties[property.index] = oldValues[oldIndex];
+      if (oldCache.has(oldIndex)) this.cache.set(property.index, oldCache.get(oldIndex));
+      if (oldAges.has(oldIndex)) this.propertyAges.set(property.index, oldAges.get(oldIndex)!);
+      if (oldDates.has(oldIndex))
+        this.propertyModificationDates.set(property.index, oldDates.get(oldIndex));
+      if (oldCursors.has(oldIndex))
+        this.propertyCursors.set(property.index, oldCursors.get(oldIndex)!);
+    }
+
+    remapKeys(this.propertyListeners, previous.properties, (name) => template.getPropertyByName(name)?.index);
+    remapKeys(this.eventListeners, previous.events, (name) => template.getEventByName(name)?.index);
+    remapKeys(this.eventCursors, previous.events, (name) => template.getEventByName(name)?.index);
+    // Rebuilt by the reattach that follows (`resubscribeAfterReconnect`).
+    this.subscribedEvents.clear();
+    this.reconciling.clear();
+
+    this.remoteTemplate = template;
+    this.typeDef = this.expectedTypeDef ? adaptContract(this.expectedTypeDef, template) : template;
+    this.needsFullReattach = true;
   }
 
   /** @internal Initialize an instance created from a generated subclass. */
@@ -459,6 +537,73 @@ export class EpResource implements IResource, IDynamicResource {
     this._EmitEventByIndex(index, value);
   }
 
+  // ---- name based member binding for compiled stubs -----------------------
+  //
+  // A stub is compiled against the member indexes of the definition it was generated from; the
+  // node may have renumbered or extended its type since (docs/typedef-sync.md). Stubs pass their
+  // generated index only as a fast path: when the current definition still has that name at that
+  // index nothing is looked up. A member that no longer exists throws EpMemberUnavailableError.
+
+  /** The current index of the function `name` (`generatedIndex` is the fast path). */
+  protected _FunctionIndex(name: string, generatedIndex: number): number {
+    if (this.definitionRemoved) throw this.missingMember(name, "function");
+    const atIndex = this.typeDef.getFunctionByIndex(generatedIndex);
+    if (atIndex?.name === name) return generatedIndex;
+    const byName = this.typeDef.getFunctionByName(name);
+    if (!byName) throw this.missingMember(name, "function");
+    return byName.index;
+  }
+
+  /** The current index of the property `name` (`generatedIndex` is the fast path). */
+  protected _PropertyIndex(name: string, generatedIndex: number): number {
+    if (this.definitionRemoved) throw this.missingMember(name, "property");
+    const atIndex = this.typeDef.getPropertyByIndex(generatedIndex);
+    if (atIndex?.name === name) return generatedIndex;
+    const byName = this.typeDef.getPropertyByName(name);
+    if (!byName) throw this.missingMember(name, "property");
+    return byName.index;
+  }
+
+  /** The current index of the event `name` (`generatedIndex` is the fast path). */
+  protected _EventIndex(name: string, generatedIndex: number): number {
+    if (this.definitionRemoved) throw this.missingMember(name, "event");
+    const atIndex = this.typeDef.getEventByIndex(generatedIndex);
+    if (atIndex?.name === name) return generatedIndex;
+    const byName = this.typeDef.getEventByName(name);
+    if (!byName) throw this.missingMember(name, "event");
+    return byName.index;
+  }
+
+  /** The cached value of the property `name`, resolved by name. */
+  protected _PropertyValue<T = unknown>(name: string, generatedIndex: number): T {
+    return this.properties[this._PropertyIndex(name, generatedIndex)] as T;
+  }
+
+  /** @internal The error for a member the current definition lacks. */
+  missingMember(name: string, kind: string, fallback?: string): Error {
+    // Without a compiled contract an unknown name is just an unknown name.
+    if (this.expectedTypeDef === undefined && !this.definitionRemoved && fallback !== undefined)
+      return new Error(fallback);
+    return new EpMemberUnavailableError(
+      this.typeDef.className,
+      name,
+      kind,
+      this.definitionRemoved ? "the type no longer exists" : undefined,
+    );
+  }
+
+  /**
+   * @internal Names the compiled contract expects that the current definition no longer has, by
+   * kind. Used by the ergonomic proxy to fail with a clear error instead of `undefined`.
+   */
+  unavailableKind(name: string): "function" | "property" | undefined {
+    const expected = this.expectedTypeDef;
+    if (!expected) return undefined;
+    if (expected.getFunctionByName(name) && !this.typeDef.getFunctionByName(name)) return "function";
+    if (expected.getPropertyByName(name) && !this.typeDef.getPropertyByName(name)) return "property";
+    return undefined;
+  }
+
   /** Invoke a remote function by index. Used by generated EpResource stubs. */
   protected _Invoke(index: number, args: unknown = []): AsyncReply {
     return this.requireConnection().invokeWithArguments(this.instanceId, index, normalizeArguments(args));
@@ -493,8 +638,17 @@ export class EpResource implements IResource, IDynamicResource {
     return reply as AsyncReply<void>;
   }
 
-  /** Override point for generated typed event dispatch. */
-  protected _EmitEventByIndex(_index: number, _value: unknown): void {
+  /**
+   * Override point for generated typed event dispatch. Stubs that dispatch by name override
+   * {@link _EmitEventByName} instead, which survives a renumbered definition.
+   */
+  protected _EmitEventByIndex(index: number, value: unknown): void {
+    const event = this.typeDef.getEventByIndex(index);
+    if (event) this._EmitEventByName(event.name, value);
+  }
+
+  /** Override point for generated typed event dispatch by event name. */
+  protected _EmitEventByName(_name: string, _value: unknown): void {
     /* generated subclasses may override */
   }
 
@@ -590,6 +744,13 @@ const proxyHandler: ProxyHandler<EpResource> = {
       }
       const pt = target.typeDef.getPropertyByName(prop);
       if (pt) return target.getResourceProperty(pt.index);
+
+      const unavailable = target.unavailableKind(prop);
+      if (unavailable === "function")
+        return (): never => {
+          throw target.missingMember(prop, "function");
+        };
+      if (unavailable === "property") throw target.missingMember(prop, "property");
     }
     return Reflect.get(target, prop, receiver);
   },
@@ -601,6 +762,7 @@ const proxyHandler: ProxyHandler<EpResource> = {
         target.setResourceProperty(pt.index, value);
         return true;
       }
+      if (target.unavailableKind(prop) === "property") throw target.missingMember(prop, "property");
     }
     return Reflect.set(target, prop, value, receiver);
   },
@@ -618,4 +780,21 @@ function isTypeDef(value: unknown): value is TypeDef {
 
 function normalizeArguments(args: unknown): unknown {
   return args == null ? [] : args;
+}
+
+/** Re-keys a member-index keyed map through the member names of the previous layout. */
+function remapKeys<T>(
+  map: Map<number, T>,
+  previous: Map<string, number>,
+  newIndexOf: (name: string) => number | undefined,
+): void {
+  if (map.size === 0) return;
+  const oldNames = new Map([...previous].map(([name, index]) => [index, name]));
+  const entries = [...map];
+  map.clear();
+  for (const [oldIndex, value] of entries) {
+    const name = oldNames.get(oldIndex);
+    const newIndex = name === undefined ? undefined : newIndexOf(name);
+    if (newIndex !== undefined) map.set(newIndex, value);
+  }
 }

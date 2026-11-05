@@ -15,6 +15,8 @@ export enum EpPacketRequest {
   LinkTypeDefs = 0xc,
   Token = 0xd,
   GetResourceIdByLink = 0xe,
+  /** Validate a client's cached TypeDefs by name and signature (see docs/typedef-sync.md). */
+  SyncTypeDefs = 0xf,
   // Manage
   AttachResource = 0x10,
   ReattachResource = 0x11,

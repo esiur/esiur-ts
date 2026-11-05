@@ -25,6 +25,8 @@ export class TypeDefInfo extends IndexedStructure {
   @Index(0x07) functions: FunctionDefInfo[] | undefined;
   @Index(0x08) events: EventDefInfo[] | undefined;
   @Index(0x09) constants: ConstantDefInfo[] | undefined;
+  /** Id-independent hash of the definition, used to validate cached definitions. */
+  @Index(0x0a, t.u64) signature: bigint | undefined;
 
   @Index(0x20) usage: string | undefined;
   @Index(0x21) description: string | undefined;

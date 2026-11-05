@@ -74,6 +74,17 @@ import {
   type RemotePropertyValue,
 } from "./EpResource.js";
 import { RemoteTypeDef } from "./RemoteTypeDef.js";
+import {
+  TypeDefCacheEntry,
+  readTypeDefSyncInfo,
+  type TypeDefLayout,
+  type TypeDefSyncInfo,
+} from "./TypeDefSync.js";
+import { toIndexedMap } from "../data/IndexedStructureCodec.js";
+import type { TypeDefInfo } from "../data/types/TypeDefInfo.js";
+import { computeTypeDefSignature, localTypeDefSignature } from "./typeDefSigning.js";
+import { adaptContract } from "./contractBinding.js";
+import { TypedMap } from "../data/descriptors.js";
 import { ServerInvocationContext, isIterableResult } from "./ServerInvocationContext.js";
 import { normalizeEsiurEndpoint } from "./EpProtocol.js";
 import {
@@ -528,6 +539,8 @@ export class EpConnection extends NetworkConnection {
     this.assign(socket);
     await socket.connect(socketUrl);
     await this.whenReady();
+    // Validate cached definitions before anything depends on their ids (docs/typedef-sync.md).
+    await this.syncTypeDefCache();
   }
 
   /**
@@ -1425,6 +1438,107 @@ export class EpConnection extends NetworkConnection {
     return this.fetchTypeDef(typeDefId, null);
   }
 
+  /** How long connection establishment waits for the node to answer `SyncTypeDefs`. */
+  static typeDefSyncTimeoutMs = 15_000;
+
+  /**
+   * Validates the warehouse's cached definitions for this domain with the node and brings the
+   * cache and this connection's id map in line with the answer. Never fails: a cache the node
+   * could not validate is dropped and definitions are fetched lazily, as without a cache.
+   */
+  private async syncTypeDefCache(): Promise<void> {
+    const warehouse = this.warehouse;
+    if (!warehouse) return;
+
+    const domain = this.domain;
+    const cached = warehouse
+      .getCachedRemoteTypeDefs(domain)
+      .filter((definition) => definition.id !== 0n && definition.name !== "");
+    if (cached.length === 0) return;
+
+    const entries = cached.map((definition) => {
+      const entry = new TypeDefCacheEntry();
+      entry.id = definition.id;
+      entry.name = definition.name;
+      entry.kind = definition.kind;
+      entry.version = definition.version;
+      entry.signature = definition.signature;
+      return toIndexedMap(entry);
+    });
+
+    try {
+      // Bounded: a node that predates the request ignores it, and connection establishment must
+      // not wait forever for an answer that never comes.
+      const reply = await withTimeout(
+        this.sendRequest(EpPacketRequest.SyncTypeDefs, entries),
+        EpConnection.typeDefSyncTimeoutMs,
+        "The node did not answer SyncTypeDefs.",
+      );
+      await this.applyTypeDefSync(cached, readTypeDefSyncInfo(reply));
+    } catch {
+      warehouse.clearRemoteTypeDefs(domain);
+      this.cachedTypeDefs.clear();
+    }
+  }
+
+  private async applyTypeDefSync(
+    requested: RemoteTypeDef[],
+    info: TypeDefSyncInfo,
+  ): Promise<void> {
+    const warehouse = this.warehouse!;
+    const moves: Array<readonly [bigint, bigint]> = [
+      ...info.moved.map((move) => [move.oldId, move.newId] as const),
+      ...info.updated.map((update) => [update.oldId, update.newId] as const),
+    ];
+
+    // Layouts and templates of the definitions about to change in place, taken before the change.
+    const before = new Map<RemoteTypeDef, { layout: TypeDefLayout; template: TypeDef }>();
+    const targets: Array<{ definition: RemoteTypeDef; definitionBytes: Uint8Array; newId: bigint }> = [];
+    for (const update of info.updated) {
+      const definition = requested.find((candidate) => candidate.id === update.oldId);
+      if (!definition) continue;
+      before.set(definition, { layout: definition.captureLayout(), template: definition.template });
+      targets.push({ definition, definitionBytes: update.definition, newId: update.newId });
+    }
+
+    // Resources whose type the node no longer serves; their compiled members then fail clearly.
+    const removedTemplates = new Set(
+      requested.filter((definition) => info.removed.includes(definition.id)).map((d) => d.template),
+    );
+
+    warehouse.applyRemoteTypeDefIdChanges(this.domain, requested, info.removed, moves);
+
+    // This connection's id map is exactly the validated definitions under the ids the node uses
+    // now. Built before any definition is parsed, so references between definitions resolve to
+    // the existing objects and never need an id patch.
+    this.cachedTypeDefs.clear();
+    for (const definition of warehouse.getCachedRemoteTypeDefs(this.domain))
+      this.cachedTypeDefs.set(definition.id, definition);
+
+    await Promise.all(
+      targets.map(({ definition, definitionBytes, newId }) =>
+        RemoteTypeDef.parseAsyncInto(
+          definition,
+          definitionBytes,
+          this.warehouse,
+          this.valueResolver,
+          [newId],
+        ),
+      ),
+    );
+
+    // Resources already attached (a reconnect keeps them) follow their members by name.
+    for (const resource of this.attachedResources.values()) {
+      if (resource.remoteTemplate && removedTemplates.has(resource.remoteTemplate))
+        resource.definitionRemoved = true;
+      for (const [definition, previous] of before) {
+        if ((resource.remoteTemplate ?? resource.typeDef) !== previous.template) continue;
+        resource.rebindDefinition(previous.layout, definition.template);
+        break;
+      }
+    }
+  }
+
   /** Batch-resolve full class names to their remote TypeDef ids. */
   getTypeDefIds(fullNames: string[]): AsyncReply<bigint[]> {
     return this.sendRequest(EpPacketRequest.TypeDefIdsByNames, fullNames).then((reply) => {
@@ -1546,6 +1660,7 @@ export class EpConnection extends NetworkConnection {
       );
       this.cachedTypeDefs.set(typeDefId, typeDef);
       if (typeDef.id !== typeDefId) this.cachedTypeDefs.set(typeDef.id, typeDef);
+      this.warehouse?.cacheRemoteTypeDef(this.domain, typeDef);
       return typeDef;
     } finally {
       this.typeDefRequests.delete(typeDefId);
@@ -1742,10 +1857,13 @@ export class EpConnection extends NetworkConnection {
       try {
         let typeDef = resolved.typeDef;
         let ctor = resolved.ctor;
+        // The contract compiled client code was built against, when the caller supplied one.
+        let contract = resolved.typeDef;
         if (!typeDef) {
           const remoteTypeDef = await this.fetchTypeDefByResourceId(instanceId);
           typeDef = remoteTypeDef.template;
           ctor ??= this.findProxyType(remoteTypeDef) as EpResourceConstructor<T> | undefined;
+          if (ctor) contract = getGeneratedTypeDef(ctor, this.warehouse);
         }
 
         const resource = await this.attachWithTypeDef(
@@ -1753,6 +1871,7 @@ export class EpConnection extends NetworkConnection {
           typeDef,
           ctor,
           sequence,
+          contract,
         );
         this.finishResourceAttach(instanceId);
         reply.trigger(resource);
@@ -1782,6 +1901,7 @@ export class EpConnection extends NetworkConnection {
     typeDef: TypeDef,
     ctor?: EpResourceConstructor<T>,
     requestSequence: readonly bigint[] = [BigInt(instanceId)],
+    contract?: TypeDef,
   ): Promise<EpResource & Record<string, any>> {
     const reply = await this.sendRequest(EpPacketRequest.AttachResource, instanceId);
       // Reply: [typeDefId, generation, revision, link, hops, propertyValues]. The
@@ -1794,7 +1914,24 @@ export class EpConnection extends NetworkConnection {
       const hops = asNumber(list[4]);
       const raw = list[5] as Uint8Array | undefined;
 
-      const resource = this.createAttachedResource(instanceId, typeDef, ctor, {
+      // A compiled contract (template or stub) carries the member indexes of the definition it was
+      // generated from. What the node serves now decides the indexes and the layout of the values
+      // it sends; the contract keeps its own names, so a renumbered member still binds (by name)
+      // and a removed one fails with a clear error (docs/typedef-sync.md). Without the node's
+      // definition (it may not allow viewing it) the contract is used as it always was.
+      let wire = typeDef;
+      let applicationTypeDef = typeDef;
+      if (contract && typeDef === contract) {
+        try {
+          wire = (await this.fetchTypeDef(typeDefId, null)).template;
+          applicationTypeDef = adaptContract(contract, wire);
+        } catch {
+          wire = typeDef;
+          applicationTypeDef = typeDef;
+        }
+      }
+
+      const resource = this.createAttachedResource(instanceId, applicationTypeDef, ctor, {
         typeDefId,
         age: Number(cursor.revision),
         cursor,
@@ -1805,8 +1942,10 @@ export class EpConnection extends NetworkConnection {
       // the graph can now resolve to this placeholder instead of awaiting the
       // same attachment forever.
       this.neededResources.set(instanceId, resource);
+      resource.remoteTemplate = wire;
+      if (contract) resource.expectedTypeDef = contract;
       if (raw) {
-        const snapshots = await this.parsePropertyValueArray(raw, typeDef, requestSequence);
+        const snapshots = await this.parsePropertyValueArray(raw, wire, requestSequence);
         for (const pv of snapshots)
           resource.setPropertySnapshot(pv.index, pv.age, pv.date, pv.value);
       }
@@ -1930,6 +2069,7 @@ export class EpConnection extends NetworkConnection {
         resource.applyDelta(
           await this.parsePropertyValueMap(raw, [BigInt(resolvedId)]),
         );
+      resource.needsFullReattach = false;
 
       if (resolvedId !== oldId) {
         // Only evict oldId's entry if it still points to this resource —
@@ -2129,7 +2269,7 @@ export class EpConnection extends NetworkConnection {
     const stats = { restored: 0, failed: 0 };
     for (const resource of resources) {
       try {
-        await this.reattach(resource.link || resource.instanceId, resource.cursor, resource);
+        await this.reattach(resource.link || resource.instanceId, resource.reattachCursor, resource);
         resource.resubscribeAfterReconnect();
         stats.restored++;
       } catch (e) {
@@ -2351,6 +2491,9 @@ export class EpConnection extends NetworkConnection {
           return;
         case EpPacketRequest.TypeDefIdsByNames:
           void this.epRequestTypeDefIdsByNames(callbackId, tdu);
+          return;
+        case EpPacketRequest.SyncTypeDefs:
+          void this.epRequestSyncTypeDefs(callbackId, tdu);
           return;
         case EpPacketRequest.Query:
           void this.epRequestQueryResources(callbackId, tdu);
@@ -2697,6 +2840,124 @@ export class EpConnection extends NetworkConnection {
   }
 
   /** Server handler: compose and reply with a registered TypeDef by its numeric id. */
+  private typeDefInfoWithSignature(td: ITypeDef & { kind: TypeDefKind; template: TypeDef }): TypeDefInfo {
+    const info = typeDefInfoFromTypeDef(td.id, td.kind, td.template);
+    info.signature =
+      td instanceof LocalTypeDef
+        ? localTypeDefSignature(td, this.warehouse!)
+        : computeTypeDefSignature(td.kind, td.template, this.warehouse!);
+    return info;
+  }
+
+  // Validates a client's cached definitions by name and signature, answering with only the
+  // differences. See docs/typedef-sync.md.
+  private async epRequestSyncTypeDefs(callbackId: number, tdu: PlainTdu | null): Promise<void> {
+    if (!tdu || !this.warehouse) {
+      this.sendError(ErrorType.Management, callbackId, ExceptionCode.ParseError);
+      return;
+    }
+
+    try {
+      const value = this.decode(tdu);
+      const items: unknown[] = value === undefined || value === null ? [] : Array.isArray(value) ? value : [];
+      // A cache larger than the whole registry is not a cache.
+      if (items.length > 65536) throw new RangeError("The TypeDef cache list is too large.");
+
+      const moved: Array<[bigint, bigint]> = [];
+      const removed: bigint[] = [];
+      const updated: Array<[bigint, bigint, Uint8Array]> = [];
+      this.ensureServedTypeDefs();
+
+      for (const item of items) {
+        if (!(item instanceof Map)) throw new TypeError("A TypeDef cache entry must be an indexed map.");
+        const id = asBigInt(item.get(0));
+        const name = String(item.get(1) ?? "");
+        const signature = asBigInt(item.get(4) ?? 0n);
+
+        const served = this.warehouse.getLocalTypeDefByName(name);
+        if (!(served instanceof LocalTypeDef) || !this.isTypeDefViewAllowed()) {
+          removed.push(id);
+          continue;
+        }
+
+        if (localTypeDefSignature(served, this.warehouse) === signature) {
+          if (served.id !== id) moved.push([id, served.id]);
+          continue;
+        }
+
+        updated.push([
+          id,
+          served.id,
+          compose(this.typeDefInfoWithSignature(served), this.warehouse, this),
+        ]);
+      }
+
+      const indexed = (entries: Array<[number, unknown]>) => new TypedMap(t.u8, t.dynamic, entries);
+      this.sendReply(
+        EpPacketReply.Completed,
+        callbackId,
+        indexed([
+          [0, moved.map(([oldId, newId]) => indexed([[0, u64(oldId)], [1, u64(newId)]]))],
+          [1, removed.map((id) => u64(id))],
+          [
+            2,
+            updated.map(([oldId, newId, definition]) =>
+              indexed([[0, u64(oldId)], [1, u64(newId)], [2, definition]]),
+            ),
+          ],
+        ]),
+      );
+    } catch (error) {
+      this.sendError(
+        ErrorType.Management,
+        callbackId,
+        ExceptionCode.ParseError,
+        error instanceof Error ? error.message : String(error),
+      );
+    }
+  }
+
+  // A definition is registered lazily, on first use, so a node that has not been asked about a
+  // class yet does not know its name. Register the classes of the hosted resources and, through
+  // their signatures, every record and enum their members refer to, so the names a client cached
+  // are answered from the whole contract and not from whatever happened to be used already.
+  private ensureServedTypeDefs(): void {
+    const warehouse = this.warehouse!;
+    warehouse.registerHostedTypeDefs();
+    let known = -1;
+    for (let pass = 0; pass < 8; pass++) {
+      const definitions = warehouse.localTypeDefList();
+      if (definitions.length === known) break;
+      known = definitions.length;
+      for (const definition of definitions)
+        if (definition instanceof LocalTypeDef) localTypeDefSignature(definition, warehouse);
+    }
+  }
+
+  // Same permission as TypeDefById, evaluated without replying so a batch can drop single entries.
+  private isTypeDefViewAllowed(): boolean {
+    if (!this.warehouse) return true;
+    try {
+      const evaluation = this.warehouse.evaluateManagers(
+        new ResourceManagerContext(
+          this.warehouse,
+          this,
+          this.getAuthenticationSession(),
+          null,
+          null,
+          ActionType.ViewTypeDef,
+          this,
+          [],
+          null,
+          false,
+        ),
+      );
+      return evaluation.isAllowed && evaluation.delay <= 0;
+    } catch {
+      return false;
+    }
+  }
+
   private async epRequestTypeDefById(callbackId: number, tdu: PlainTdu | null): Promise<void> {
     if (!tdu || !this.warehouse) {
       this.sendError(ErrorType.Management, callbackId, ExceptionCode.ParseError);
@@ -2729,6 +2990,7 @@ export class EpConnection extends NetworkConnection {
       return;
 
     const info = typeDefInfoFromTypeDef(local.id, local.kind, local.template);
+    info.signature = localTypeDefSignature(local, this.warehouse);
     this.sendReply(EpPacketReply.Completed, callbackId, compose(info, this.warehouse, this));
   }
 
@@ -2774,6 +3036,7 @@ export class EpConnection extends NetworkConnection {
     }
 
     const info = typeDefInfoFromTypeDef(id, kind, resource.instance.definition);
+    info.signature = computeTypeDefSignature(kind, resource.instance.definition, this.warehouse);
     this.sendReply(EpPacketReply.Completed, callbackId, compose(info, this.warehouse, this));
   }
 
@@ -2894,7 +3157,7 @@ export class EpConnection extends NetworkConnection {
     const closure = new Map<bigint, LocalTypeDef>();
     collectTypeDefDependencies(local, closure);
     const payloads = [...closure.values()].map((td) =>
-      compose(typeDefInfoFromTypeDef(td.id, td.kind, td.template), this.warehouse, this),
+      compose(this.typeDefInfoWithSignature(td), this.warehouse, this),
     );
     this.sendReply(EpPacketReply.Completed, callbackId, payloads);
   }
@@ -4144,6 +4407,22 @@ function validateEndpoint(value: string): string {
   if (!url.hostname) throw new Error(`Invalid EP endpoint: ${value}`);
 
   return value;
+}
+
+/** Rejects when `work` does not settle within `ms` (a non-positive `ms` waits indefinitely). */
+async function withTimeout<T>(work: PromiseLike<T>, ms: number, message: string): Promise<T> {
+  if (!(ms > 0)) return await work;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      work,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error(message)), ms);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 }
 
 function isThenable(value: unknown): value is PromiseLike<unknown> {

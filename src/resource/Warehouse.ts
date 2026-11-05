@@ -11,6 +11,7 @@ import { LocalTypeDef } from "./typedef.js";
 import { Record } from "./records.js";
 import type { EnumType } from "./enums.js";
 import { EpConnection, type EpConnectionOptions } from "../protocol/EpConnection.js";
+import type { RemoteTypeDef } from "../protocol/RemoteTypeDef.js";
 import { normalizeEsiurEndpoint } from "../protocol/EpProtocol.js";
 import type { EpResourceConstructor } from "../protocol/EpResource.js";
 import type { IAuthenticationProvider } from "../security/IAuthenticationProvider.js";
@@ -76,6 +77,12 @@ export class Warehouse {
   private readonly typeDefsByCtor = new Map<Function, ITypeDef>();
   private readonly typeDefsByEnum = new Map<EnumType, ITypeDef>();
   private typeDefCounter = 0n;
+  /**
+   * Remote definitions kept between connections: domain, then full class name. They are only
+   * valid once the serving node has validated them (`SyncTypeDefs`, docs/typedef-sync.md),
+   * because a node renumbers its type ids when it restarts.
+   */
+  private readonly remoteTypeDefCache = new Map<string, Map<string, RemoteTypeDef>>();
   private readonly authenticationProviders = new Map<string, IAuthenticationProvider>();
   private readonly encryptionProviders = new Map<string, IEncryptionProvider>();
   private readonly resourceManagers = new Map<Function, IResourceManager>();
@@ -529,11 +536,77 @@ export class Warehouse {
     return typeDef;
   }
 
+  /** @internal Remember a remote definition for later connections to the same domain. */
+  cacheRemoteTypeDef(domain: string, typeDef: RemoteTypeDef): void {
+    if (!typeDef.name) return;
+    let byName = this.remoteTypeDefCache.get(domain);
+    if (!byName) {
+      byName = new Map();
+      this.remoteTypeDefCache.set(domain, byName);
+    }
+    byName.set(typeDef.name, typeDef);
+  }
+
+  /** @internal The definitions cached for a remote domain. */
+  getCachedRemoteTypeDefs(domain: string): RemoteTypeDef[] {
+    return [...(this.remoteTypeDefCache.get(domain)?.values() ?? [])];
+  }
+
+  /**
+   * @internal Applies the id changes a node reported for a domain's cached definitions.
+   * `requested` is the list that was sent; ids are resolved against it before any id changes,
+   * so a permutation of ids cannot pick the wrong definition.
+   */
+  applyRemoteTypeDefIdChanges(
+    domain: string,
+    requested: readonly RemoteTypeDef[],
+    removed: readonly bigint[],
+    moves: ReadonlyArray<readonly [bigint, bigint]>,
+  ): void {
+    const byOldId = new Map(requested.map((definition) => [definition.id, definition]));
+    const cache = this.remoteTypeDefCache.get(domain);
+
+    for (const id of removed) {
+      const definition = byOldId.get(id);
+      if (!definition) continue;
+      cache?.delete(definition.name);
+      definition.markRemoved();
+    }
+
+    const moving = moves.flatMap(([oldId, newId]) => {
+      const definition = byOldId.get(oldId);
+      return definition ? [[definition, newId] as const] : [];
+    });
+    for (const [definition, newId] of moving) definition.setId(newId);
+  }
+
+  /** @internal Forget every cached definition of a domain (the node could not validate them). */
+  clearRemoteTypeDefs(domain: string): void {
+    this.remoteTypeDefCache.delete(domain);
+  }
+
   /** Resolve a type definition by its numeric id. */
   getLocalTypeDefById(id: bigint): ITypeDef {
     const td = this.typeDefs.get(id);
     if (!td) throw new Error(`TypeDef ${id} not found.`);
     return td;
+  }
+
+  /**
+   * @internal Registers the type definitions of the classes of the resources hosted here. A
+   * definition is otherwise registered lazily, on first use, so a node that has not been asked
+   * about a class yet does not know its name.
+   */
+  registerHostedTypeDefs(): void {
+    for (const resource of this.resources.values()) {
+      const ctor = resource.constructor as Function | undefined;
+      if (ctor && ctor !== Object) this.getLocalTypeDefByType(ctor);
+    }
+  }
+
+  /** @internal The registered local definitions (a snapshot). */
+  localTypeDefList(): ITypeDef[] {
+    return [...this.typeDefs.values()];
   }
 
   /** Resolve a type definition registered on this warehouse by its class name. */

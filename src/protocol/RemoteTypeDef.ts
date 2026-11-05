@@ -20,6 +20,7 @@ import { PropertyDefFlags } from "../data/types/PropertyDefFlags.js";
 import { FunctionDefFlags } from "../data/types/FunctionDefFlags.js";
 import { EventDefFlags } from "../data/types/EventDefFlags.js";
 import { ArgumentDefFlags } from "../data/types/ArgumentDefFlags.js";
+import type { TypeDefLayout } from "./TypeDefSync.js";
 import {
   ArgumentTemplate,
   ConstantTemplate,
@@ -142,6 +143,8 @@ export interface RemoteTypeDefSnapshot {
 }
 
 export interface RemoteTypeDefMetadata {
+  /** The signature the serving node sent with this definition (docs/typedef-sync.md). */
+  signature?: bigint;
   namespace?: string;
   usage?: string;
   description?: string;
@@ -155,6 +158,8 @@ export class RemoteTypeDef implements ITypeDef {
 
   private cachedProperties: TypeDefProperty[] = [];
   private _id = 0n;
+  private _signature = 0n;
+  private _removed = false;
   private _kind = TypeDefKind.Resource;
   private _name = "";
   private _version = 0;
@@ -173,6 +178,41 @@ export class RemoteTypeDef implements ITypeDef {
 
   get id(): bigint {
     return this._id;
+  }
+
+  /** Id-independent hash the serving node sent with this definition; zero when unknown. */
+  get signature(): bigint {
+    return this._signature;
+  }
+
+  /**
+   * True when the serving node no longer has (or no longer shows) this definition. Resources
+   * already using it keep the object; members that depended on it fail with a clear error.
+   */
+  get removed(): boolean {
+    return this._removed;
+  }
+
+  /** @internal The node renumbered its types: this definition now has another id. */
+  setId(id: bigint): void {
+    this._id = id;
+  }
+
+  /** @internal */
+  markRemoved(): void {
+    this._removed = true;
+  }
+
+  /**
+   * @internal The member name to index mapping right now. Taken before a definition is updated
+   * in place, so state keyed by index can follow its member to the new index.
+   */
+  captureLayout(): TypeDefLayout {
+    return {
+      properties: new Map(this._remoteProperties.map((p) => [p.name, p.index])),
+      functions: new Map(this._remoteFunctions.map((f) => [f.name, f.index])),
+      events: new Map(this._remoteEvents.map((e) => [e.name, e.index])),
+    };
   }
 
   get kind(): TypeDefKind {
@@ -249,6 +289,8 @@ export class RemoteTypeDef implements ITypeDef {
     metadata: RemoteTypeDefMetadata = {},
   ): void {
     this._id = id;
+    this._signature = metadata.signature ?? 0n;
+    this._removed = false;
     this._kind = kind;
     this._name = name;
     this._version = version;
@@ -724,6 +766,7 @@ function applyInfo(target: RemoteTypeDef, info: TypeDefInfo): void {
     events,
     constants,
     {
+      signature: info.signature,
       namespace: info.namespace,
       usage: info.usage,
       description: info.description,

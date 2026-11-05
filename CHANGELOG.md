@@ -1,5 +1,31 @@
 # Release notes
 
+## Unreleased (3.2.0)
+
+- **Breaking protocol change: TypeDef cache synchronization.** The `Warehouse` keeps remote
+  definitions by domain and class name, and `EpConnection` validates them during connection
+  establishment (also after an automatic reconnect, before resources are reattached) with the
+  new `SyncTypeDefs` request (0xF). Cached definitions are updated in place, attached resources
+  rebind by member name, and the connection starts with its type-id map built, saving a
+  `TypeDefById` round trip per type. `TypeDefInfo.signature` (index 0x0A) is an id-independent
+  hash of the definition. A TypeScript node answers `SyncTypeDefs` too. See
+  `docs/typedef-sync.md`.
+- Compiled stubs and templates bind by name: `EpResource` gains `_FunctionIndex`,
+  `_PropertyIndex`, `_EventIndex`, `_PropertyValue` and the `_EmitEventByName` override point.
+  Attaching with a template or stub class fetches the node's current definition (once per type
+  per connection) and keeps the template as `expectedTypeDef`; a member the node removed fails
+  with `EpMemberUnavailableError` (function call, property get/set, event subscription).
+- Connection establishment waits at most `EpConnection.typeDefSyncTimeoutMs` (15 s) for a node
+  that predates `SyncTypeDefs`, then drops the cache and carries on.
+- Add a dependency-free synchronous SHA-256 (`src/data/sha256.ts`) for the signature.
+
+### Migration notes
+
+- Use matching 3.2 runtimes on both ends to benefit from the cache; an older node ignores the
+  request and the cache is dropped after the timeout.
+- Attaching with a template (`attach(id, template)` or a stub class) now makes one extra
+  `TypeDefById` request per type and connection unless the definition is already cached.
+
 ## 3.1.0
 
 - Preserve complete TypeDef/member metadata and exact 64-bit identifiers.

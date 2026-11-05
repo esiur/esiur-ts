@@ -1,4 +1,5 @@
 import { TruIdentifier } from "./TruIdentifier.js";
+import { isComputingTypeDefSignature, name64 } from "./typeDefSignature.js";
 import { merge } from "./DC.js";
 import * as DC from "./DC.js";
 import { registerTruParser, registerTruParserAsync } from "./ParsedTdu.js";
@@ -246,6 +247,15 @@ export class TruTypeDef extends Tru {
   }
 
   override compose(): Uint8Array {
+    if (isComputingTypeDefSignature()) {
+      // Signature mode: a reference is the hash of the referenced name, written with the widest
+      // identifier, so the result never depends on a TypeDef id or its width.
+      return merge(
+        Uint8Array.of((this.nullable ? 0x80 : 0) | TruIdentifier.LocalType64),
+        DC.uint64ToBytes(name64(this.typeDef.name)),
+      );
+    }
+
     const id = this.typeDef.id;
     let idBytes: Uint8Array;
     switch (this.identifier) {

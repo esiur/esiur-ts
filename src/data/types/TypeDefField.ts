@@ -10,6 +10,8 @@ export enum TypeDefField {
   Functions = 0x07,
   Events = 0x08,
   Constants = 0x09,
+  /** Id-independent hash of the definition; see docs/typedef-sync.md. */
+  Signature = 0x0a,
   Usage = 0x20,
   Description = 0x21,
   Example = 0x22,

@@ -13,6 +13,8 @@ import type { TypeDef } from "./template.js";
  */
 export class LocalTypeDef implements ITypeDef {
   private cachedProperties?: TypeDefProperty[];
+  /** @internal Id-independent signature, computed on first use (see protocol/typeDefSigning). */
+  signature?: bigint;
 
   constructor(
     readonly id: bigint,

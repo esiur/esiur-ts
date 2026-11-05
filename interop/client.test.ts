@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { EpConnection } from "../src/protocol/EpConnection.js";
+import { Warehouse } from "../src/resource/Warehouse.js";
 import { ResourceId } from "../src/data/ResourceId.js";
 import { Resource } from "../src/resource/Resource.js";
 import {
@@ -27,6 +28,18 @@ class HelloStub extends Resource {
     return "";
   }
   @Export(t.string) @Historical() ping: EventSource<string> = event<string>();
+}
+
+// The same contract as HelloStub, but declared in another order: every member index here differs
+// from the C# node's. Binding is by name (ignoring the camelCase/PascalCase difference), so it must
+// still work against the real node.
+class ReorderedHelloStub extends Resource {
+  @Export(t.string) @Historical() ping: EventSource<string> = event<string>();
+  @Export(t.string, [t.string]) sayHi(_msg: string): string {
+    return "";
+  }
+  @Export(t.string) accessor label = "";
+  @Export(t.i32) @Historical() accessor counts = 0;
 }
 
 /**
@@ -99,6 +112,58 @@ describe("cross-language: TS client ↔ C# Esiur server", () => {
     expect(res.counts).toBe(initialCounts + 1);
 
     client.close();
+  }, 15000);
+
+  it("binds a contract with different member indexes by name against the C# node", async () => {
+    const client = await EpConnection.connect(endpoint);
+    const rid = (await client.getResourceIdByLink("sys/hello")) as ResourceId;
+
+    const res = (await client.attach(rid.id, getTemplate(ReorderedHelloStub))) as Record<
+      string,
+      unknown
+    > & {
+      counts: number;
+      label: string;
+      sayHi: (m: string) => PromiseLike<string>;
+    };
+
+    // Every index in the contract is wrong for the node; names decide.
+    expect(res.label).toBe("Hello from C#");
+    expect(typeof res.counts).toBe("number");
+    const before = res.counts;
+    expect(await res.sayHi("Zamil")).toBe("Welcome, Zamil");
+    await waitFor(() => res.counts === before + 1);
+
+    client.close();
+  }, 15000);
+
+  it("keeps type definitions between connections: SyncTypeDefs against the C# node", async () => {
+    const warehouse = new Warehouse();
+    const options = { domain: "ts-interop-sync" };
+
+    const first = await EpConnection.connect(endpoint, warehouse, options);
+    // The dynamic definition comes from the C# node, so its member names are PascalCase.
+    const hello = (await first.get("sys/hello")) as unknown as { Label: string };
+    expect(hello.Label).toBe("Hello from C#");
+    const cached = warehouse.getCachedRemoteTypeDefs(options.domain);
+    expect(cached.length).toBeGreaterThan(0);
+    // The C# node sends the id-independent signature with every definition it serves.
+    for (const definition of cached) expect(definition.signature).not.toBe(0n);
+    const signatures = new Map(cached.map((definition) => [definition.name, definition.signature]));
+
+    // A second connection on the same warehouse validates the cache during establishment: it
+    // knows the definitions before any is fetched, and the node did not report any as changed.
+    const second = await EpConnection.connect(endpoint, warehouse, options);
+    expect(second.enableRuntimeMetrics().cachedTypeDefinitions).toBeGreaterThanOrEqual(cached.length);
+    for (const definition of warehouse.getCachedRemoteTypeDefs(options.domain)) {
+      expect(definition.removed).toBe(false);
+      expect(definition.signature).toBe(signatures.get(definition.name));
+    }
+    const helloAgain = (await second.get("sys/hello")) as unknown as { Label: string };
+    expect(helloAgain.Label).toBe("Hello from C#");
+
+    first.close();
+    second.close();
   }, 15000);
 
   it("receives the complete dotnet TypeDef member metadata surface", async () => {

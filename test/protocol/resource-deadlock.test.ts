@@ -19,6 +19,9 @@ describe("EpConnection cyclic resource attachment", () => {
     const requestCounts = new Map<number, number>();
 
     connection.sendRequest = ((action: EpPacketRequest, ...args: unknown[]) => {
+      // Attaching with a supplied contract also asks for the node's current definition; this
+      // transport cannot serve one, so attach falls back to the contract (and counts only attaches).
+      if (action === EpPacketRequest.TypeDefById) return unavailableDefinition();
       expect(action).toBe(EpPacketRequest.AttachResource);
       const id = Number(args[0]);
       requestCounts.set(id, (requestCounts.get(id) ?? 0) + 1);
@@ -51,6 +54,7 @@ describe("EpConnection cyclic resource attachment", () => {
     let requests = 0;
 
     connection.sendRequest = ((action: EpPacketRequest) => {
+      if (action === EpPacketRequest.TypeDefById) return unavailableDefinition();
       expect(action).toBe(EpPacketRequest.AttachResource);
       requests++;
       return transportReply;
@@ -69,7 +73,8 @@ describe("EpConnection cyclic resource attachment", () => {
     const connection = new EpConnection();
     const attempts: AsyncReply[] = [];
 
-    connection.sendRequest = (() => {
+    connection.sendRequest = ((action: EpPacketRequest) => {
+      if (action === EpPacketRequest.TypeDefById) return unavailableDefinition();
       const reply = new AsyncReply();
       attempts.push(reply);
       return reply;
@@ -85,6 +90,12 @@ describe("EpConnection cyclic resource attachment", () => {
     await expect(Promise.resolve(second)).resolves.toMatchObject({ instanceId: 9 });
   });
 });
+
+function unavailableDefinition(): AsyncReply {
+  const reply = new AsyncReply();
+  reply.triggerError(new AsyncException(0, 1, "definition unavailable"));
+  return reply;
+}
 
 function resourceProperty(peerId: number): Uint8Array {
   return merge(
