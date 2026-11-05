@@ -56,6 +56,15 @@ class ProbeB extends Resource {
   @Export(t.string) accessor beta = "one";
 }
 
+class ProbeC extends Resource {
+  @Export(t.i32) accessor gamma = 3;
+
+  @Export(t.string, [t.string])
+  shout(text: string): string {
+    return text.toUpperCase();
+  }
+}
+
 // Two builds of the same service share a class name (each in its own function, so the bundler
 // does not rename one of them); the second one added members in front, which shifts every index.
 function probeV1() {
@@ -435,6 +444,80 @@ describe("TypeDef sync", () => {
       "TypeDefById",
       "TypeDefByResourceId",
     ]);
+
+    client.close();
+    await served.server.close();
+  });
+
+  it("attaches many resources at the same time, asking for each type once", async () => {
+    const served = await node(async (warehouse) => {
+      await warehouse.put("sys/a1", new ProbeA());
+      await warehouse.put("sys/a2", new ProbeA());
+      await warehouse.put("sys/b1", new ProbeB());
+      await warehouse.put("sys/b2", new ProbeB());
+      await warehouse.put("sys/c1", new ProbeC());
+      await warehouse.put("sys/c2", new ProbeC());
+    });
+
+    const client = await EpConnection.connect(`ws://127.0.0.1:${served.server.port}`, new Warehouse(), {
+      domain: "typedef-sync-concurrent",
+    });
+    const events = recordRequests(client);
+    const resources = (await Promise.all(
+      ["a1", "a2", "b1", "b2", "c1", "c2"].map((name) => client.get(`sys/${name}`)),
+    )) as unknown as Array<Record<string, unknown>>;
+
+    expect([resources[0].alpha, resources[1].alpha]).toEqual([1, 1]);
+    expect([resources[2].beta, resources[3].beta]).toEqual(["one", "one"]);
+    expect([resources[4].gamma, resources[5].gamma]).toEqual([3, 3]);
+    expect(await (resources[4] as { shout(text: string): Promise<string> }).shout("up")).toBe("UP");
+
+    // Six attaches share one definition request per type, however they interleave.
+    const sent = sentRequests(events);
+    const count = (name: string) => sent.filter((request) => request === name).length;
+    expect(count("AttachResource")).toBe(6);
+    expect(count("TypeDefById")).toBe(3);
+    expect(count("TypeDefByResourceId")).toBe(0);
+
+    client.close();
+    await served.server.close();
+  });
+
+  it("attaches several contracts at the same time, each binding by name", async () => {
+    // One contract per service, as a compiled client has, built from builds the node no longer runs.
+    const contractA = new Warehouse().getTypeDef(ProbeA);
+    const contractB = new Warehouse().getTypeDef(ProbeB);
+    const contractC = new Warehouse().getTypeDef(ProbeC);
+    const served = await node(async (warehouse) => {
+      // Registering in another order renumbers every type on this node.
+      warehouse.getLocalTypeDefByType(ProbeC);
+      warehouse.getLocalTypeDefByType(ProbeB);
+      await warehouse.put("sys/a", new ProbeA());
+      await warehouse.put("sys/b", new ProbeB());
+      await warehouse.put("sys/c", new ProbeC());
+    });
+
+    const client = await EpConnection.connect(`ws://127.0.0.1:${served.server.port}`, new Warehouse(), {
+      domain: "typedef-sync-concurrent-contracts",
+    });
+    const events = recordRequests(client);
+    const [a, b, c] = (await Promise.all([
+      client.get("sys/a", contractA),
+      client.get("sys/b", contractB),
+      client.get("sys/c", contractC),
+    ])) as unknown as Array<Record<string, unknown>>;
+
+    expect(a.alpha).toBe(1);
+    expect(b.beta).toBe("one");
+    expect(c.gamma).toBe(3);
+    expect(await (c as { shout(text: string): Promise<string> }).shout("ok")).toBe("OK");
+
+    // Each contract's definition travels with its attach; nothing is fetched twice or by id.
+    const sent = sentRequests(events);
+    const count = (name: string) => sent.filter((request) => request === name).length;
+    expect(count("AttachResource")).toBe(3);
+    expect(count("TypeDefByResourceId")).toBe(3);
+    expect(count("TypeDefById")).toBe(0);
 
     client.close();
     await served.server.close();
