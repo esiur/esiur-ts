@@ -75,7 +75,8 @@ describe("EpResource as IResource — relay through a third node", () => {
     const connectionToA = await EpConnection.connect(`ws://127.0.0.1:${serverA.port}`);
     connectionToA.warehouse = whB;
 
-    // No TypeDef supplied — drives the real TypeDefByResourceId round trip.
+    // No TypeDef supplied — A hosts the resource, so its attach reply names a type id that
+    // TypeDefById resolves.
     const viaB = (await connectionToA.get("sys/counter")) as unknown as RelayProxy;
     const rawFromA = connectionToA.getAttachedResource(viaB.instanceId)!;
     expect(rawFromA.instance).toBeUndefined(); // not yet relayed
@@ -86,10 +87,11 @@ describe("EpResource as IResource — relay through a third node", () => {
     const serverB = await EpServer.listen({ port: 0, warehouse: whB });
 
     // Node C: connects only to B, never to A directly. Also no TypeDef
-    // supplied here — this is the harder case for TypeDefByResourceId,
-    // since the resource behind "sys/relay" is a *relayed* EpResource with
-    // no LocalTypeDef of its own on B (exercises the typeDefId-forwarding
-    // path in epRequestTypeDefByResourceId).
+    // supplied here — this is the harder case: the resource behind
+    // "sys/relay" is a *relayed* EpResource with no LocalTypeDef of its own
+    // on B, so B's attach reply reports type id 0 and C asks for the
+    // definition through the resource (the typeDefId-forwarding path in
+    // epRequestTypeDefByResourceId).
     const connectionToB = await EpConnection.connect(`ws://127.0.0.1:${serverB.port}`);
     const viaC = (await connectionToB.get("sys/relay")) as unknown as RelayProxy;
     const attachedAt = viaC.cursor;

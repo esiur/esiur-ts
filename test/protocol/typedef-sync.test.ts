@@ -11,7 +11,9 @@ import { Resource } from "../../src/resource/Resource.js";
 import { Warehouse } from "../../src/resource/Warehouse.js";
 import { MemoryStore } from "../../src/stores/MemoryStore.js";
 import type { IPermissionsManager } from "../../src/security/permissions/IPermissionsManager.js";
+import { ActionType } from "../../src/security/permissions/ActionType.js";
 import { Ruling } from "../../src/security/permissions/Ruling.js";
+import type { IResource } from "../../src/resource/IResource.js";
 import { sha256 } from "../../src/data/sha256.js";
 import { name64 } from "../../src/data/typeDefSignature.js";
 import { computeTypeDefSignature } from "../../src/protocol/typeDefSigning.js";
@@ -27,6 +29,19 @@ class AllowAllPermissionsManager implements IPermissionsManager {
   readonly settings = undefined;
   applicable(): Ruling {
     return Ruling.Allowed;
+  }
+  initialize(): boolean {
+    return true;
+  }
+}
+
+// Allows everything except viewing a definition without a resource, which is what a request by
+// type id is: a node may let a peer view a definition only through a resource it may attach to.
+class ResourceOnlyDefinitionsManager implements IPermissionsManager {
+  readonly managerCategory = "permissions" as const;
+  readonly settings = undefined;
+  applicable(resource: IResource | null, _session: unknown, action: ActionType): Ruling {
+    return action === ActionType.ViewTypeDef && resource === null ? Ruling.Denied : Ruling.Allowed;
   }
   initialize(): boolean {
     return true;
@@ -95,9 +110,13 @@ class ProbeStub extends EpResource {
   }
 }
 
-async function node(register: (warehouse: Warehouse) => Promise<void>, port = 0) {
+async function node(
+  register: (warehouse: Warehouse) => Promise<void>,
+  port = 0,
+  manager: IPermissionsManager = new AllowAllPermissionsManager(),
+) {
   const warehouse = new Warehouse();
-  warehouse.registerManager(new AllowAllPermissionsManager(), true);
+  warehouse.registerManager(manager, true);
   await warehouse.put("sys", new MemoryStore());
   await register(warehouse);
   await warehouse.open();
@@ -342,6 +361,85 @@ describe("TypeDef sync", () => {
     await served.server.close();
   });
 
+  it("attaches first and asks for a definition by id only when the connection lacks it", async () => {
+    const served = await node(async (warehouse) => {
+      await warehouse.put("sys/a", new ProbeA());
+      await warehouse.put("sys/a2", new ProbeA());
+    });
+
+    const client = await EpConnection.connect(`ws://127.0.0.1:${served.server.port}`, new Warehouse(), {
+      domain: "typedef-sync-attach-order",
+    });
+    const events = recordRequests(client);
+    const first = (await client.get("sys/a")) as unknown as { alpha: number };
+    const second = (await client.get("sys/a2")) as unknown as { alpha: number };
+    expect([first.alpha, second.alpha]).toEqual([1, 1]);
+
+    // The first resource of a type names it in the attach reply and the definition is fetched
+    // once, by id; the second resource of that type finds it in the connection's map.
+    expect(sentRequests(events)).toEqual([
+      "GetResourceIdByLink",
+      "AttachResource",
+      "TypeDefById",
+      "GetResourceIdByLink",
+      "AttachResource",
+    ]);
+
+    client.close();
+    await served.server.close();
+  });
+
+  it("needs no definition request for a plain attach once the connection validated its cache", async () => {
+    const served = await node(async (warehouse) => {
+      await warehouse.put("sys/a", new ProbeA());
+    });
+    const url = `ws://127.0.0.1:${served.server.port}`;
+    const warehouse = new Warehouse();
+    const domain = "typedef-sync-warm-attach";
+
+    const first = await EpConnection.connect(url, warehouse, { domain });
+    expect(((await first.get("sys/a")) as unknown as { alpha: number }).alpha).toBe(1);
+    first.close();
+
+    // The second connection validates the cache while it is established; the definition it
+    // seeded is what the attach reply's type id finds.
+    const second = await EpConnection.connect(url, warehouse, { domain });
+    const events = recordRequests(second);
+    const resource = (await second.get("sys/a")) as unknown as { alpha: number };
+    expect(resource.alpha).toBe(1);
+    expect(sentRequests(events)).toEqual(["GetResourceIdByLink", "AttachResource"]);
+
+    second.close();
+    await served.server.close();
+  });
+
+  it("asks through the resource when the node does not serve the definition by id", async () => {
+    const served = await node(
+      async (warehouse) => {
+        await warehouse.put("sys/a", new ProbeA());
+      },
+      0,
+      new ResourceOnlyDefinitionsManager(),
+    );
+
+    const client = await EpConnection.connect(`ws://127.0.0.1:${served.server.port}`, new Warehouse(), {
+      domain: "typedef-sync-resource-only",
+    });
+    const events = recordRequests(client);
+    const resource = (await client.get("sys/a")) as unknown as { alpha: number };
+    expect(resource.alpha).toBe(1);
+
+    expect(sentRequests(events)).toEqual([
+      "GetResourceIdByLink",
+      "AttachResource",
+      "TypeDefById",
+      "TypeDefByResourceId",
+    ]);
+
+    client.close();
+    await served.server.close();
+  });
+
   it("fails with a clear error for a member the node removed", async () => {
     const v1 = probeV1();
     const contract = new Warehouse().getTypeDef(v1);
@@ -381,6 +479,11 @@ describe("TypeDef sync", () => {
     await third.server.close();
   });
 });
+
+/** The names of the requests in a recording, in the order they were sent. */
+function sentRequests(events: string[]): string[] {
+  return events.filter((event) => event.startsWith("send ")).map((event) => event.slice(5));
+}
 
 /** Records "send <request>" and "reply <request>" in the order they happen on a connection. */
 function recordRequests(connection: EpConnection): string[] {

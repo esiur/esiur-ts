@@ -1860,24 +1860,18 @@ export class EpConnection extends NetworkConnection {
 
     void (async () => {
       try {
-        let typeDef = resolved.typeDef;
-        let ctor = resolved.ctor;
-        // The contract compiled client code was built against, when the caller supplied one.
-        let contract = resolved.typeDef;
-        // The node's definition decides how the contract binds; it is requested now so it
-        // travels in the same flight as the attach instead of after its reply.
+        // The contract compiled client code was built against, when the caller supplied one. Its
+        // definition of the node's type is requested now, so it travels in the same flight as the
+        // attach instead of after its reply.
+        const contract = resolved.typeDef;
         const nodeDefinition = contract ? this.requestNodeDefinition(instanceId, contract) : undefined;
-        if (!typeDef) {
-          const remoteTypeDef = await this.fetchTypeDefByResourceId(instanceId);
-          typeDef = remoteTypeDef.template;
-          ctor ??= this.findProxyType(remoteTypeDef) as EpResourceConstructor<T> | undefined;
-          if (ctor) contract = getGeneratedTypeDef(ctor, this.warehouse);
-        }
 
+        // Without a contract the reply to the attach names the type, and the definition comes from
+        // this connection's cache or, on a miss, from the node (see `attachWithTypeDef`).
         const resource = await this.attachWithTypeDef(
           instanceId,
-          typeDef,
-          ctor,
+          resolved.typeDef,
+          resolved.ctor,
           sequence,
           contract,
           nodeDefinition,
@@ -1905,9 +1899,15 @@ export class EpConnection extends NetworkConnection {
     return reply;
   }
 
+  /**
+   * Attaches to a resource. The attach request goes first and its reply names the resource's type
+   * by id (as the .NET client does); the definition is then taken from this connection's own map,
+   * which the `SyncTypeDefs` validation seeded and earlier fetches filled, and the node is asked
+   * only on a miss. `typeDef` is the contract compiled client code was built against, if any.
+   */
   private async attachWithTypeDef<T extends EpResource>(
     instanceId: number,
-    typeDef: TypeDef,
+    typeDef: TypeDef | undefined,
     ctor?: EpResourceConstructor<T>,
     requestSequence: readonly bigint[] = [BigInt(instanceId)],
     contract?: TypeDef,
@@ -1918,33 +1918,42 @@ export class EpConnection extends NetworkConnection {
       // 6th element is a RawData blob of (age, date, value) self-describing TDUs,
       // one triple per property in index order.
       const list = reply as unknown[];
-      const typeDefId = asBigInt(list[0]);
+      let typeDefId = asBigInt(list[0]);
       const cursor = cursorFromWire(list[1], list[2]);
       const link = String(list[3] ?? "");
       const hops = asNumber(list[4]);
       const raw = list[5] as Uint8Array | undefined;
 
-      // A compiled contract (template or stub) carries the member indexes of the definition it was
-      // generated from. What the node serves now decides the indexes and the layout of the values
-      // it sends; the contract keeps its own names, so a renumbered member still binds (by name)
-      // and a removed one fails with a clear error (docs/typedef-sync.md). Without the node's
-      // definition (it may not allow viewing it) the contract is used as it always was.
-      let wire = typeDef;
-      let applicationTypeDef = typeDef;
-      if (contract && typeDef === contract) {
-        try {
-          // Known to this connection (validated by SyncTypeDefs or fetched earlier), else the
-          // one requested together with the attach, else asked for by id now.
-          let node = this.cachedTypeDefs.get(typeDefId);
-          if (!node) {
-            const early = await nodeDefinition;
-            node = early && early.id === typeDefId ? early : await this.fetchTypeDef(typeDefId, null);
+      let wire: TypeDef;
+      let applicationTypeDef: TypeDef;
+      if (!typeDef) {
+        // No contract: the node's definition is the type of the resource.
+        const node = await this.resolveAttachedTypeDef(instanceId, typeDefId);
+        typeDefId = node.id;
+        typeDef = node.template;
+        wire = typeDef;
+        applicationTypeDef = typeDef;
+        ctor ??= this.findProxyType(node) as EpResourceConstructor<T> | undefined;
+        if (ctor) contract = getGeneratedTypeDef(ctor, this.warehouse);
+      } else {
+        wire = typeDef;
+        applicationTypeDef = typeDef;
+        // A compiled contract (template or stub) carries the member indexes of the definition it
+        // was generated from. What the node serves now decides the indexes and the layout of the
+        // values it sends; the contract keeps its own names, so a renumbered member still binds
+        // (by name) and a removed one fails with a clear error (docs/typedef-sync.md). Without
+        // the node's definition (it may not allow viewing it) the contract is used as it always
+        // was.
+        if (contract && typeDef === contract) {
+          try {
+            const node = await this.resolveAttachedTypeDef(instanceId, typeDefId, nodeDefinition);
+            typeDefId = node.id;
+            wire = node.template;
+            applicationTypeDef = adaptContract(contract, wire);
+          } catch {
+            wire = typeDef;
+            applicationTypeDef = typeDef;
           }
-          wire = node.template;
-          applicationTypeDef = adaptContract(contract, wire);
-        } catch {
-          wire = typeDef;
-          applicationTypeDef = typeDef;
         }
       }
 
@@ -1969,6 +1978,49 @@ export class EpConnection extends NetworkConnection {
 
       this.attachedResources.set(instanceId, resource);
       return EpResource.createProxy(resource);
+  }
+
+  /**
+   * The definition of the type a freshly attached resource reports. This connection's map has it
+   * when `SyncTypeDefs` validated it or an earlier fetch brought it, so only a miss asks the node:
+   * by type id, and through the resource when the node does not serve the type by id (a node
+   * reports id 0 for a resource it relays, which has no type id of its own, and may allow viewing
+   * a definition through the resource but not by id).
+   *
+   * `requestedWithAttach` is a by-resource request already made together with the attach; it is
+   * not repeated when it failed.
+   */
+  private async resolveAttachedTypeDef(
+    instanceId: number,
+    typeDefId: bigint,
+    requestedWithAttach?: Promise<RemoteTypeDef | undefined>,
+  ): Promise<RemoteTypeDef> {
+    const identified = typeDefId !== 0n;
+    if (identified) {
+      const known = this.cachedTypeDefs.get(typeDefId);
+      if (known) return known;
+    }
+
+    if (requestedWithAttach) {
+      const early = await requestedWithAttach;
+      if (early && (!identified || early.id === typeDefId)) return early;
+    }
+
+    if (identified) {
+      try {
+        return await this.fetchTypeDef(typeDefId, null);
+      } catch (error) {
+        if (requestedWithAttach) throw error;
+      }
+    } else if (requestedWithAttach) {
+      throw new AsyncException(
+        ErrorType.Management,
+        ExceptionCode.TypeDefNotFound,
+        "The node did not provide the definition of the resource.",
+      );
+    }
+
+    return await this.fetchTypeDefByResourceId(instanceId);
   }
 
   /**
@@ -2684,6 +2736,16 @@ export class EpConnection extends NetworkConnection {
     return null;
   }
 
+  /**
+   * The type id this node reports for a resource it serves. A relayed resource (an `EpResource`)
+   * has no type id of this node's own, so it reports 0 and the peer asks for the definition
+   * through the resource (`TypeDefByResourceId`) instead of looking the id up here.
+   */
+  private reportedTypeDefId(resource: IResource): bigint {
+    if (resource instanceof EpResource) return 0n;
+    return this.warehouse!.getLocalTypeDefByType(resource.constructor).id;
+  }
+
   /** Server handler: send current property values and subscribe the peer to changes. */
   private async epRequestAttachResource(callbackId: number, tdu: PlainTdu | null): Promise<void> {
     if (!tdu || !this.warehouse) {
@@ -2728,13 +2790,13 @@ export class EpConnection extends NetworkConnection {
       if (!instance) return;
       const head = instance.cursor;
       const propertyValues = this.composePropertyValueArray(instanceId);
-      const typeDef = this.warehouse.getLocalTypeDefByType(resource.constructor);
+      const typeDefId = this.reportedTypeDefId(resource);
 
       this.subscribeToInstance(instanceId);
       this.sendReply(
         EpPacketReply.Completed,
         callbackId,
-        u64(typeDef.id),
+        u64(typeDefId),
         head.generation.data,
         u64(head.revision),
         instance.link ?? "",
@@ -2832,7 +2894,7 @@ export class EpConnection extends NetworkConnection {
       )
         return;
 
-      const typeDef = this.warehouse.getLocalTypeDefByType(resource.constructor);
+      const typeDefId = this.reportedTypeDefId(resource);
       const head = instance.cursor;
       const reset = !requestedCursor.generation.equals(head.generation);
       const propertyValues = this.composePropertyValueMap(
@@ -2847,7 +2909,7 @@ export class EpConnection extends NetworkConnection {
         EpPacketReply.Completed,
         callbackId,
         resolvedId,
-        u64(typeDef.id),
+        u64(typeDefId),
         head.generation.data,
         u64(head.revision),
         instance.link ?? "",

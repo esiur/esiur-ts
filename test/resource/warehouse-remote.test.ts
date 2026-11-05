@@ -70,9 +70,8 @@ describe("Warehouse remote EP get", () => {
     const server = await EpServer.listen({ port: 0, warehouse: serverWh });
     const clientWh = new Warehouse();
 
-    // No TypeDef supplied here — this drives EpConnection.get's real
-    // TypeDefByResourceId round trip (now answered server-side; see
-    // EpConnection.ts's epRequestTypeDefByResourceId).
+    // No TypeDef supplied here — EpConnection.get attaches first, then fetches the definition
+    // the attach reply names (TypeDefById), as the .NET client does.
     const connection = await EpConnection.connect(`ws://127.0.0.1:${server.port}`, clientWh);
 
     const res = (await connection.get("sys/greeter")) as unknown as {

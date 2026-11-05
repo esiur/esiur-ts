@@ -10,6 +10,15 @@
   `TypeDefById` round trip per type. `TypeDefInfo.signature` (index 0x0A) is an id-independent
   hash of the definition. A TypeScript node answers `SyncTypeDefs` too. See
   `docs/typedef-sync.md`.
+- Attaching without a contract attaches first and takes the definition from the connection's map
+  by the type id in the attach reply, asking the node (`TypeDefById`) only on a miss, which is the
+  order the .NET client always used. It used to ask for the definition through the resource
+  (`TypeDefByResourceId`) before every attach, so a cache validated by `SyncTypeDefs` saved
+  nothing and every attach of a service downloaded its definition again. Five service attaches
+  over 80 ms round trips take 0.92 s instead of 1.37 s on a validated connection (10 requests
+  instead of 15); a cold connection is unchanged. A node that does not serve the type by id is
+  asked through the resource, and a TypeScript node reports type id 0 for a resource it relays
+  (which has no type id of its own), so the client asks through the resource there too.
 - Compiled stubs and templates bind by name: `EpResource` gains `_FunctionIndex`,
   `_PropertyIndex`, `_EventIndex`, `_PropertyValue` and the `_EmitEventByName` override point.
   Attaching with a template or stub class fetches the node's current definition (once per type
